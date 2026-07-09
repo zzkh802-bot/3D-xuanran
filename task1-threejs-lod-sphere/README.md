@@ -2,6 +2,8 @@
 
 ## 运行
 
+不要直接双击 `index.html`；这个页面使用 Three.js ES module 和 JSON import，需要通过本地 Vite 服务访问。
+
 ```powershell
 npm install
 npm run dev

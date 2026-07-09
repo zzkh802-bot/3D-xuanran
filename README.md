@@ -18,6 +18,8 @@ npm run dev
 
 运行后打开：`http://127.0.0.1:5173`
 
+不要直接双击 `index.html`，需要通过上面的 Vite 本地服务访问。
+
 ## 任务二：棋盘位图识别与标定
 
 目录：`task2-chessboard-calibration`
