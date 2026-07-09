@@ -1,0 +1,1223 @@
+import os
+import sys
+import numpy as np
+import time
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+from scipy.spatial import KDTree, ConvexHull
+from matplotlib.path import Path
+
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+import warnings
+
+warnings.filterwarnings('ignore')
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SUPPORT_DIR = os.path.join(SCRIPT_DIR, '实习资料')
+if SUPPORT_DIR not in sys.path:
+    sys.path.insert(0, SUPPORT_DIR)
+
+from saddle_and_mark_from_m import (
+    imread_gray, compute_gradients, create_correlation_patch,
+    filter_image_with_templates_fft, non_maximum_suppression_fast,
+    find_modes_mean_shift, edge_orientations_fast, refine_corners_vectorized,
+    corner_correlation_score, score_corners_batch, measure_blur_level,
+    merge_close_points, adjust_orientation_handedness,
+    compute_homography, get_little_four_P_py, grow_chessboard_region,
+    get_mark_cord as get_mark_cord_m
+)
+
+
+# ===================== 新增：共线性计算工具函数 =====================
+def calculate_collinearity_residual(points):
+    """
+    计算点集的共线性残差（越小越共线）
+    :param points: (N,2) 像素坐标点集
+    :return: 平均残差（越小共线性越好）
+    """
+    if len(points) < 2:
+        return 0.0
+    # 最小二乘拟合直线 y = kx + b（处理垂直线特殊情况）
+    x = points[:, 0]
+    y = points[:, 1]
+    x_mean = np.mean(x)
+    y_mean = np.mean(y)
+
+    # 计算斜率k和截距b
+    numerator = np.sum((x - x_mean) * (y - y_mean))
+    denominator = np.sum((x - x_mean) ** 2)
+    if denominator < 1e-12:  # 垂直线
+        k = np.inf
+        b = x_mean
+        # 残差为x到垂直线的距离
+        residuals = np.abs(x - b)
+    else:
+        k = numerator / denominator
+        b = y_mean - k * x_mean
+        # 残差为点到直线的垂直距离
+        residuals = np.abs(k * x - y + b) / np.sqrt(k ** 2 + 1)
+
+    return np.mean(residuals)
+
+
+def evaluate_collinearity_consistency(existing_pts, new_pt, grid_dir):
+    """
+    评估新增点与现有同方向网格点的共线性一致性
+    :param existing_pts: (N,2) 现有同方向网格点
+    :param new_pt: (2,) 新增点坐标
+    :param grid_dir: 网格方向（0=水平/左右, 1=垂直/上下）
+    :return: 一致性评分（越高越一致，范围[0,1]）
+    """
+    if len(existing_pts) < 2:
+        return 1.0  # 现有点数不足，默认一致
+
+    # 拼接现有点和新增点
+    test_pts = np.vstack([existing_pts, new_pt])
+
+    # 按网格方向筛选：水平方向按y分组，垂直方向按x分组
+    if grid_dir == 0:  # 水平/左右方向（同y坐标）
+        # 取现有点的y均值作为基准
+        ref_y = np.mean(existing_pts[:, 1])
+        # 筛选y接近基准的点（容错1.5像素）
+        mask = np.isclose(test_pts[:, 1], ref_y, atol=1.5)
+        collinear_pts = test_pts[mask]
+    else:  # 垂直/上下方向（同x坐标）
+        ref_x = np.mean(existing_pts[:, 0])
+        mask = np.isclose(test_pts[:, 0], ref_x, atol=1.5)
+        collinear_pts = test_pts[mask]
+
+    # 计算共线性残差
+    residual = calculate_collinearity_residual(collinear_pts)
+    # 转换为评分（残差越小评分越高）
+    max_residual = 5.0  # 最大容忍残差（像素）
+    score = max(0.0, 1.0 - residual / max_residual)
+
+    return score
+
+
+def evaluate_local_grid_alignment(existing_local_pts, new_local_pt, anchor_local_pt,
+                                  grid_dir, ref_len=0):
+    """Score whether a new point stays on the expected local grid line."""
+    if existing_local_pts is None or len(existing_local_pts) == 0:
+        return 1.0
+
+    perpendicular_axis = 1 if grid_dir == 0 else 0
+    travel_axis = 0 if grid_dir == 0 else 1
+    tolerance = max(2.5, ref_len * 0.16) if ref_len > 0 else 3.0
+
+    perp_error = abs(new_local_pt[perpendicular_axis] - anchor_local_pt[perpendicular_axis])
+    perp_score = np.exp(-0.5 * (perp_error / (tolerance + 1e-12)) ** 2)
+
+    if ref_len <= 0:
+        return float(perp_score)
+
+    step = abs(new_local_pt[travel_axis] - anchor_local_pt[travel_axis])
+    step_error = abs(step - ref_len)
+    step_score = np.exp(-0.5 * (step_error / (ref_len * 0.22 + 1e-12)) ** 2)
+    return float(0.72 * perp_score + 0.28 * step_score)
+
+
+def normalize_image_for_corners(img_gray):
+    """Percentile normalization reduces background drift before corner detection."""
+    lo, hi = np.percentile(img_gray, [1.0, 99.0])
+    if hi - lo < 1e-8:
+        return (img_gray - img_gray.min()) / (img_gray.max() - img_gray.min() + 1e-8)
+    return np.clip((img_gray - lo) / (hi - lo), 0, 1)
+
+
+# ===================== 原有函数：新增共线性校验逻辑 =====================
+def build_local_frame(center_pt, v1, v2):
+    """构建以center_pt为原点、v1为x轴、正交化v2为y轴的局部坐标系"""
+    v1_u = v1 / (np.linalg.norm(v1) + 1e-12)
+    v2_proj = v2 - np.dot(v2, v1_u) * v1_u
+    v2_u = v2_proj / (np.linalg.norm(v2_proj) + 1e-12)
+    R = np.array([v1_u, v2_u])  # 2x2
+    return R, center_pt
+
+
+def transform_points(points, R, center_pt):
+    """将点集变换到局部坐标系"""
+    return (points - center_pt) @ R.T
+
+
+def grow_neighbor(xc0, used_mask, center_idx, direction_vec, ref_len=0,
+                  original_pts=None, grid_dir=0):
+    """
+    在局部坐标系 xc0 中，从 center_idx 沿方向 direction_vec 寻找下一个点。
+    新增：结合像素共线性一致性评分筛选最优点
+    :param original_pts: (N,2) 原始像素坐标点集（用于共线性计算）
+    :param grid_dir: 网格方向（0=水平/左右, 1=垂直/上下）
+    :return: 候选索引，若找不到返回 -1。
+    """
+    center = xc0[center_idx]
+    vecs = xc0 - center
+    dists = np.linalg.norm(vecs, axis=1)
+    # 投影（带符号）
+    proj = vecs @ direction_vec
+    cos_angle = proj / (dists + 1e-12)
+    # 方向约束：夹角小（cos > 0.95）且沿正方向
+    mask_dir = (cos_angle > 0.95) & (proj > 0)
+    # 排除自身和已使用点
+    mask_avail = ~used_mask
+    mask_avail[center_idx] = False
+    mask = mask_dir & mask_avail
+    if ref_len > 0:
+        ratio = dists / (ref_len + 1e-12)
+        mask &= (ratio > 0.7) & (ratio < 1.35)
+    candidates = np.where(mask)[0]
+    if len(candidates) == 0:
+        return -1
+
+    # 1. 基础评分（夹角+距离）
+    if ref_len > 1e-6:
+        dist_scores = np.clip(
+            1.0 - np.abs(dists[candidates] - ref_len) / (ref_len * 0.35 + 1e-12),
+            0.0, 1.0
+        )
+    else:
+        scale = np.percentile(dists[candidates], 25) + 1e-12
+        dist_scores = 1.0 / (1.0 + dists[candidates] / scale)
+    base_scores = np.clip(cos_angle[candidates], 0.0, 1.0) * dist_scores
+
+    # 2. 新增：共线性一致性评分
+    collinear_scores = np.ones_like(base_scores)
+    existing_local_pts = xc0[used_mask]
+    for i, cand_idx in enumerate(candidates):
+        collinear_scores[i] = evaluate_local_grid_alignment(
+            existing_local_pts, xc0[cand_idx], center, grid_dir, ref_len
+        )
+    if False and original_pts is not None and len(original_pts) > 0:
+        # 提取现有同方向点（center_idx对应的原始点）
+        existing_pts = original_pts[np.where(~used_mask)[0]]
+        for i, cand_idx in enumerate(candidates):
+            new_pt = original_pts[cand_idx]
+            collinear_scores[i] = evaluate_collinearity_consistency(
+                existing_pts, new_pt, grid_dir
+            )
+
+    # 3. 综合评分（基础评分*共线性评分）
+    final_scores = base_scores * collinear_scores
+    best = candidates[np.argmax(final_scores)]
+
+    return best
+
+
+def assign_grid_coords(adj_matrix, start_idx):
+    """
+    根据邻接矩阵 (Nx4，列序：左、右、上、下，-1 表示无连接) 分配网格坐标。
+    返回 (N,2) 数组，若发生冲突则返回 None。
+    """
+    n = adj_matrix.shape[0]
+    coords = np.full((n, 2), np.nan)
+    coords[start_idx] = [0, 0]
+    queue = [start_idx]
+    while queue:
+        cur = queue.pop(0)
+        r, c = coords[cur]
+        # 左 (0) -> c-1
+        left = adj_matrix[cur, 0]
+        if left != -1:
+            nc = np.array([r, c - 1])
+            if np.isnan(coords[left, 0]):
+                coords[left] = nc
+                queue.append(left)
+            elif not np.array_equal(coords[left], nc):
+                return None
+        right = adj_matrix[cur, 1]
+        if right != -1:
+            nc = np.array([r, c + 1])
+            if np.isnan(coords[right, 0]):
+                coords[right] = nc
+                queue.append(right)
+            elif not np.array_equal(coords[right], nc):
+                return None
+        up = adj_matrix[cur, 2]
+        if up != -1:
+            nc = np.array([r - 1, c])
+            if np.isnan(coords[up, 0]):
+                coords[up] = nc
+                queue.append(up)
+            elif not np.array_equal(coords[up], nc):
+                return None
+        down = adj_matrix[cur, 3]
+        if down != -1:
+            nc = np.array([r + 1, c])
+            if np.isnan(coords[down, 0]):
+                coords[down] = nc
+                queue.append(down)
+            elif not np.array_equal(coords[down], nc):
+                return None
+    return coords
+
+
+def chessboardsgrow_py(points, directions, scores, img_shape, max_boards=3):
+    """
+    移植自 chessboardsgrow0802.m，返回棋盘格列表。
+    新增：每次生长后校验新增点的像素共线性一致性
+    directions: Nx4 (v1x,v1y,v2x,v2y)
+    scores: 每个鞍点的响应值，用于种子排序。
+    """
+    N = len(points)
+    if N == 0:
+        return []
+    # 种子按响应值降序
+    seed_order = np.argsort(scores)[::-1]
+    used_global = set()
+    chessboards = []
+    for seed_rank, seed_idx in enumerate(seed_order[:300]):
+        if len(chessboards) >= max_boards:
+            break
+        if seed_idx in used_global:
+            continue
+        v1 = directions[seed_idx, :2]
+        v2 = directions[seed_idx, 2:4]
+        # 构建局部正交坐标系
+        v1_u = v1 / (np.linalg.norm(v1) + 1e-12)
+        v2_proj = v2 - np.dot(v2, v1_u) * v1_u
+        v2_u = v2_proj / (np.linalg.norm(v2_proj) + 1e-12)
+        R = np.array([v1_u, v2_u])  # 行向量：x轴，y轴
+        center = points[seed_idx]
+        xc0 = (points - center) @ R.T  # Nx2 局部坐标
+        # 初始化棋盘格数据结构
+        board = []
+        glob_to_loc = {}
+        board.append(seed_idx)
+        glob_to_loc[seed_idx] = 0
+        adj = -np.ones((1, 4), dtype=int)  # 左、右、上、下
+        grow_queue = [(0, 0), (0, 1), (0, 2), (0, 3)]
+        fail = False
+        while grow_queue and not fail:
+            bid, d = grow_queue.pop(0)
+            if adj[bid, d] != -1:
+                continue
+            gid = board[bid]
+            center0 = xc0[gid]
+            # 方向向量 + 网格方向（用于共线性计算）
+            if d == 0:  # 左
+                dir_vec = np.array([-1.0, 0.0])
+                grid_dir = 0  # 水平方向
+            elif d == 1:  # 右
+                dir_vec = np.array([1.0, 0.0])
+                grid_dir = 0  # 水平方向
+            elif d == 2:  # 上
+                dir_vec = np.array([0.0, -1.0])
+                grid_dir = 1  # 垂直方向
+            else:  # 下
+                dir_vec = np.array([0.0, 1.0])
+                grid_dir = 1  # 垂直方向
+            ref_len = 0
+            for nd in range(4):
+                nid = adj[bid, nd]
+                if nid != -1:
+                    ngid = board[nid]
+                    ref_len = np.linalg.norm(xc0[ngid] - center0)
+                    break
+            used_mask = np.zeros(N, dtype=bool)
+            for g in board:
+                used_mask[g] = True
+
+            # 生长邻居：传入原始点和网格方向，用于共线性筛选
+            next_gid = grow_neighbor(
+                xc0, used_mask, gid, dir_vec, ref_len,
+                original_pts=points, grid_dir=grid_dir
+            )
+            if next_gid == -1:
+                continue
+
+            # 新增：校验新增点与现有网格的共线性一致性
+            existing_board_pts = points[board]  # 现有棋盘格点（像素坐标）
+            new_pt = points[next_gid]
+            collinearity_score = evaluate_collinearity_consistency(
+                existing_board_pts, new_pt, grid_dir
+            )
+            # 共线性一致性阈值（可调整）
+            collinearity_thresh = 0.52
+            if collinearity_score < collinearity_thresh:
+                print(f"  跳过共线性不一致的点（评分：{collinearity_score:.2f} < {collinearity_thresh}）")
+                continue  # 跳过不一致的点
+
+            if next_gid not in glob_to_loc:
+                new_bid = len(board)
+                board.append(next_gid)
+                glob_to_loc[next_gid] = new_bid
+                adj = np.vstack([adj, -np.ones((1, 4), dtype=int)])
+                for nd in range(4):
+                    grow_queue.append((new_bid, nd))
+            else:
+                new_bid = glob_to_loc[next_gid]
+            adj[bid, d] = new_bid
+            opp_d = d + 1 if d % 2 == 0 else d - 1
+            adj[new_bid, opp_d] = bid
+        if fail or len(board) < 9:
+            continue
+        grid_coords = assign_grid_coords(adj, 0)
+        if grid_coords is None:
+            continue
+        valid = ~np.isnan(grid_coords[:, 0])
+        if np.sum(valid) < 4:
+            continue
+        world_local = grid_coords * 15.0
+        img_local = points[board]
+        img_pts = img_local[valid]
+        world_pts = world_local[valid]
+        # ---------- 手性自动修正 ----------
+        if len(img_pts) >= 3:
+            p0, p1, p2 = img_pts[:3]
+            img_cross = np.cross(p1 - p0, p2 - p0)
+            w0, w1, w2 = world_pts[:3]
+            world_cross = np.cross(w1 - w0, w2 - w0)
+            if img_cross * world_cross < 0:
+                # 交换 X/Y 轴（行列互换）修正手性
+                world_pts = world_pts[:, [1, 0]]
+                w0, w1, w2 = world_pts[:3]
+                if np.cross(w1 - w0, w2 - w0) * img_cross <= 0:
+                    # 交换后仍不一致，丢弃
+                    continue
+        # ---------------------------------
+        used_indices = set(board)
+        H = compute_homography(world_pts, img_pts)
+        if H is not None:
+            chessboards.append((img_pts, world_pts, H, used_indices))
+            used_global.update(used_indices)
+    return chessboards
+
+
+# ===================== 原有函数（保持不变） =====================
+def compute_reprojection_error(H, xy, uv):
+    if xy.shape[1] == 2:
+        xy_hom = np.hstack([xy, np.ones((xy.shape[0], 1))])
+    else:
+        xy_hom = xy
+    uv_proj_hom = (H @ xy_hom.T).T
+    uv_proj = uv_proj_hom[:, :2] / uv_proj_hom[:, 2, np.newaxis]
+    errors = np.linalg.norm(uv_proj - uv, axis=1)
+    mean_error = np.mean(errors)
+    return errors, mean_error
+
+
+def _unique_world_points(img_pts, world_pts):
+    world_rounded = np.round(world_pts, 2)
+    _, unique_idx = np.unique(world_rounded, axis=0, return_index=True)
+    unique_idx = np.sort(unique_idx)
+    return img_pts[unique_idx], world_pts[unique_idx]
+
+
+def _bbox_overlap_ratio(a_pts, b_pts):
+    if len(a_pts) == 0 or len(b_pts) == 0:
+        return 0.0
+    a_min = np.min(a_pts, axis=0)
+    a_max = np.max(a_pts, axis=0)
+    b_min = np.min(b_pts, axis=0)
+    b_max = np.max(b_pts, axis=0)
+    inter_min = np.maximum(a_min, b_min)
+    inter_max = np.minimum(a_max, b_max)
+    inter = np.maximum(0.0, inter_max - inter_min)
+    inter_area = float(inter[0] * inter[1])
+    a_area = float(np.prod(np.maximum(0.0, a_max - a_min)))
+    b_area = float(np.prod(np.maximum(0.0, b_max - b_min)))
+    return inter_area / max(1e-6, min(a_area, b_area))
+
+
+def _is_duplicate_board(img_pts, used_idx, boards, overlap_thresh=0.68):
+    used_idx = set(used_idx)
+    for exist_img, _, _, exist_used in boards:
+        exist_used = set(exist_used)
+        if used_idx and exist_used:
+            common = len(used_idx & exist_used)
+            if common > 0.45 * min(len(used_idx), len(exist_used)):
+                return True
+        if _bbox_overlap_ratio(img_pts, exist_img) > overlap_thresh:
+            return True
+    return False
+
+
+def legacy_homography_chessboardsgrow_py(points, directions, scores, img_shape, max_boards=3):
+    """Fallback growth: seed a small quad, then expand through homography projections."""
+    if len(points) == 0:
+        return []
+    dirs = np.stack([directions[:, :2], directions[:, 2:4]], axis=1)
+    seed_order = np.argsort(scores)[::-1]
+    boards = []
+    used_global = set()
+    for seed_idx in seed_order[:min(260, len(seed_order))]:
+        seed_idx = int(seed_idx)
+        if seed_idx in used_global:
+            continue
+        try:
+            _, quad_idx = get_little_four_P_py(points, dirs, seed_idx, img_shape)
+        except Exception:
+            continue
+        if quad_idx is None:
+            continue
+        try:
+            img_pts, world_pts, H, used_idx = grow_chessboard_region(
+                points, dirs, quad_idx, max_iter=80, dist_thresh=5.0
+            )
+        except Exception:
+            continue
+        if len(img_pts) < 9:
+            continue
+        img_pts, world_pts = _unique_world_points(img_pts, world_pts)
+        if len(img_pts) < 9:
+            continue
+        H = compute_homography(world_pts, img_pts)
+        if H is None:
+            continue
+        used_idx = set(used_idx)
+        if _is_duplicate_board(img_pts, used_idx, boards):
+            continue
+        boards.append((img_pts, world_pts, H, used_idx))
+        used_global.update(used_idx)
+        if len(boards) >= max_boards:
+            break
+    return boards
+
+
+def find_chessboard_candidates(points, directions, scores, img_shape, max_boards=3):
+    primary = chessboardsgrow_py(points, directions, scores, img_shape, max_boards=max_boards)
+    legacy = legacy_homography_chessboardsgrow_py(
+        points, directions, scores, img_shape, max_boards=max_boards
+    )
+    if legacy:
+        print(f"  旧单应生长候选 {len(legacy)} 个")
+    return primary + legacy
+
+
+def _point_line_residuals(pts):
+    if len(pts) < 3:
+        return np.zeros(len(pts))
+    centered = pts - np.mean(pts, axis=0)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    direction = vh[0]
+    normal = np.array([-direction[1], direction[0]])
+    return np.abs(centered @ normal)
+
+
+def grid_line_residuals(img_pts, world_pts):
+    residual_sum = np.zeros(len(img_pts), dtype=float)
+    residual_count = np.zeros(len(img_pts), dtype=float)
+    rounded = np.round(world_pts / 15.0).astype(int)
+    for axis in (0, 1):
+        for value in np.unique(rounded[:, axis]):
+            idx = np.where(rounded[:, axis] == value)[0]
+            if len(idx) < 4:
+                continue
+            residual_sum[idx] += _point_line_residuals(img_pts[idx])
+            residual_count[idx] += 1
+    residuals = np.zeros(len(img_pts), dtype=float)
+    valid = residual_count > 0
+    residuals[valid] = residual_sum[valid] / residual_count[valid]
+    return residuals, valid
+
+
+def chessboard_line_residual_summary(img_pts, world_pts):
+    img_pts, world_pts = _unique_world_points(img_pts, world_pts)
+    if len(img_pts) < 4:
+        return 1e9, 1e9, 99
+    rounded = np.round(world_pts / 15.0).astype(int)
+    medians = []
+    maxes = []
+    for axis in (0, 1):
+        for value in np.unique(rounded[:, axis]):
+            idx = np.where(rounded[:, axis] == value)[0]
+            if len(idx) < 4:
+                continue
+            residuals = _point_line_residuals(img_pts[idx])
+            medians.append(float(np.median(residuals)))
+            maxes.append(float(np.max(residuals)))
+    if not medians:
+        return 1e9, 1e9, 99
+    medians = np.asarray(medians, dtype=float)
+    maxes = np.asarray(maxes, dtype=float)
+    return float(np.percentile(medians, 90)), float(np.max(maxes)), int(np.sum(medians > 6.0))
+
+
+def filter_chessboard_line_outliers(img_pts, world_pts, threshold=7.5, min_points=9):
+    img_pts, world_pts = _unique_world_points(img_pts, world_pts)
+    residuals, valid = grid_line_residuals(img_pts, world_pts)
+    keep = ~valid | (residuals <= threshold)
+    if np.sum(keep) < min_points:
+        return img_pts, world_pts, compute_homography(world_pts, img_pts)
+    removed = np.sum(~keep)
+    if removed > 0:
+        print(f"  最终行列离群点剔除 {removed} 个")
+    return img_pts[keep], world_pts[keep], compute_homography(world_pts[keep], img_pts[keep])
+
+
+def _project_world_points(H, world_pts):
+    if H is None or len(world_pts) == 0:
+        return None
+    xy = np.column_stack([world_pts[:, 0], world_pts[:, 1], np.ones(len(world_pts))])
+    uv_h = (H @ xy.T).T
+    valid = np.abs(uv_h[:, 2]) > 1e-9
+    projected = np.full((len(world_pts), 2), np.nan, dtype=float)
+    projected[valid] = uv_h[valid, :2] / uv_h[valid, 2, np.newaxis]
+    return projected
+
+
+def _projected_grid_spacing(projected, x_units, y_units):
+    if projected is None or len(projected) == 0:
+        return 20.0
+    grid = projected.reshape(len(y_units), len(x_units), 2)
+    distances = []
+    if len(x_units) > 1:
+        diff_x = np.linalg.norm(np.diff(grid, axis=1), axis=2)
+        distances.extend(diff_x[np.isfinite(diff_x)].ravel())
+    if len(y_units) > 1:
+        diff_y = np.linalg.norm(np.diff(grid, axis=0), axis=2)
+        distances.extend(diff_y[np.isfinite(diff_y)].ravel())
+    if not distances:
+        return 20.0
+    return float(np.median(distances))
+
+
+def _trim_sparse_border_grid(img_pts, world_pts, min_fill=0.45, min_points=9):
+    img_pts, world_pts = _unique_world_points(img_pts, world_pts)
+    if len(img_pts) < min_points:
+        return img_pts, world_pts
+    original_img = img_pts
+    original_world = world_pts
+    changed = True
+    while changed and len(img_pts) >= min_points:
+        changed = False
+        snapped = np.round(world_pts / 15.0).astype(int)
+        cols = np.unique(snapped[:, 0])
+        rows = np.unique(snapped[:, 1])
+        if len(cols) < 2 or len(rows) < 2:
+            break
+        keep = np.ones(len(img_pts), dtype=bool)
+        min_row_count = max(4, int(np.ceil(len(cols) * min_fill)))
+        min_col_count = max(4, int(np.ceil(len(rows) * min_fill)))
+        for row in (rows[0], rows[-1]):
+            idx = np.where(snapped[:, 1] == row)[0]
+            if len(idx) < min_row_count:
+                keep[idx] = False
+        for col in (cols[0], cols[-1]):
+            idx = np.where(snapped[:, 0] == col)[0]
+            if len(idx) < min_col_count:
+                keep[idx] = False
+        if np.sum(keep) < min_points:
+            return original_img, original_world
+        if np.sum(keep) < len(img_pts):
+            img_pts = img_pts[keep]
+            world_pts = world_pts[keep]
+            changed = True
+    return img_pts, world_pts
+
+
+def complete_chessboard_from_candidates(img_pts, world_pts, candidate_pts, min_points=9, expand_margin=1):
+    img_pts, world_pts = _unique_world_points(img_pts, world_pts)
+    candidate_pts = np.asarray(candidate_pts, dtype=float)
+    if len(img_pts) < 4 or len(candidate_pts) < min_points:
+        return img_pts, world_pts, compute_homography(world_pts, img_pts)
+
+    snapped = np.round(world_pts / 15.0).astype(int)
+    margin = max(0, int(expand_margin))
+    x_units = np.arange(np.min(snapped[:, 0]) - margin, np.max(snapped[:, 0]) + margin + 1)
+    y_units = np.arange(np.min(snapped[:, 1]) - margin, np.max(snapped[:, 1]) + margin + 1)
+    if len(x_units) < 2 or len(y_units) < 2:
+        return img_pts, world_pts, compute_homography(world_pts, img_pts)
+
+    xx, yy = np.meshgrid(x_units, y_units)
+    grid_world = np.column_stack([xx.ravel() * 15.0, yy.ravel() * 15.0])
+    tree = KDTree(candidate_pts)
+
+    best_img = img_pts
+    best_world = world_pts
+    H = compute_homography(world_pts, img_pts)
+    if H is None:
+        return img_pts, world_pts, H
+
+    for _ in range(3):
+        projected = _project_world_points(H, grid_world)
+        if projected is None:
+            break
+        finite = np.isfinite(projected).all(axis=1)
+        if np.sum(finite) < min_points:
+            break
+
+        spacing = _projected_grid_spacing(projected, x_units, y_units)
+        match_threshold = max(6.0, min(18.0, spacing * 0.42))
+        k = min(4, len(candidate_pts))
+        dists, idxs = tree.query(projected[finite], k=k)
+        if k == 1:
+            dists = dists[:, np.newaxis]
+            idxs = idxs[:, np.newaxis]
+
+        finite_grid_idx = np.where(finite)[0]
+        proposals = []
+        for local_i, grid_i in enumerate(finite_grid_idx):
+            for neighbor_i in range(k):
+                dist = float(dists[local_i, neighbor_i])
+                if dist <= match_threshold:
+                    proposals.append((dist, int(grid_i), int(idxs[local_i, neighbor_i])))
+
+        proposals.sort(key=lambda item: item[0])
+        used_grid = set()
+        used_candidate = set()
+        matched_grid = []
+        matched_candidate = []
+        for _, grid_i, cand_i in proposals:
+            if grid_i in used_grid or cand_i in used_candidate:
+                continue
+            used_grid.add(grid_i)
+            used_candidate.add(cand_i)
+            matched_grid.append(grid_i)
+            matched_candidate.append(cand_i)
+
+        if len(matched_grid) < max(min_points, int(len(img_pts) * 0.82)):
+            break
+
+        new_world = grid_world[np.array(matched_grid)]
+        new_img = candidate_pts[np.array(matched_candidate)]
+        new_H = compute_homography(new_world, new_img)
+        if new_H is None:
+            break
+        best_img, best_world, H = new_img, new_world, new_H
+
+    order = np.lexsort([best_world[:, 0], best_world[:, 1]])
+    best_img = best_img[order]
+    best_world = best_world[order]
+    best_img, best_world = _trim_sparse_border_grid(best_img, best_world, min_points=min_points)
+    H = compute_homography(best_world, best_img)
+    if len(best_img) != len(img_pts):
+        print(f"  单应网格重建 {len(img_pts)} -> {len(best_img)} 个交叉点")
+    return best_img, best_world, H
+
+
+def adjust_skipped_grid_axis(img_pts, world_pts, candidate_pts, min_inside=4):
+    img_pts, world_pts = _unique_world_points(img_pts, world_pts)
+    candidate_pts = np.asarray(candidate_pts, dtype=float)
+    if len(img_pts) < 9 or len(candidate_pts) <= len(img_pts):
+        return img_pts, world_pts, compute_homography(world_pts, img_pts)
+
+    polygon, _ = get_chessboard_polygon(img_pts)
+    if polygon is None:
+        return img_pts, world_pts, compute_homography(world_pts, img_pts)
+
+    inside = polygon.contains_points(candidate_pts)
+    tree = KDTree(img_pts)
+    nearest_dist, _ = tree.query(candidate_pts, k=1)
+    unused = candidate_pts[inside & (nearest_dist > 3.0)]
+    if len(unused) < min_inside:
+        return img_pts, world_pts, compute_homography(world_pts, img_pts)
+
+    units = world_pts / 15.0
+    units = units - np.min(units, axis=0)
+    best = None
+    for axis in (0, 1):
+        trial_units = units.copy()
+        trial_units[:, axis] *= 2.0
+        H_img_to_grid = compute_homography(img_pts, trial_units)
+        if H_img_to_grid is None:
+            continue
+        projected = _project_world_points(H_img_to_grid, unused)
+        if projected is None:
+            continue
+        max_units = np.max(trial_units, axis=0)
+        close_count = 0
+        errors = []
+        for point in projected:
+            if not np.isfinite(point).all():
+                continue
+            rounded = np.round(point).astype(int)
+            if np.any(rounded < -1) or rounded[0] > max_units[0] + 1 or rounded[1] > max_units[1] + 1:
+                continue
+            if rounded[axis] % 2 != 1:
+                continue
+            err = float(np.linalg.norm(point - rounded))
+            if err < 0.28:
+                close_count += 1
+                errors.append(err)
+        if close_count >= max(min_inside, int(len(unused) * 0.35)):
+            score = close_count / (np.median(errors) + 1e-6)
+            if best is None or score > best[0]:
+                best = (score, axis, trial_units)
+
+    if best is None:
+        return img_pts, world_pts, compute_homography(world_pts, img_pts)
+
+    _, axis, adjusted_units = best
+    adjusted_units = adjusted_units - np.min(adjusted_units, axis=0)
+    adjusted_world = adjusted_units * 15.0
+    print(f"  跳格修正: {'X/列' if axis == 0 else 'Y/行'} 轴加密")
+    return img_pts, adjusted_world, compute_homography(adjusted_world, img_pts)
+
+
+def get_mark_cord(xc, corner, xy1, uv1, HH0, nn, spij3, spij7, jilu, xcsp, Im0, mm, img_gray):
+    try:
+        return get_mark_cord_m(xc, corner, xy1, uv1, HH0, nn, spij3, spij7, jilu, xcsp, Im0, mm)
+    except Exception as exc:
+        print(f"  警告: 标记点识别失败，保留棋盘格结果: {exc}")
+        return xy1, uv1, jilu
+
+
+
+def sort_chessboard_points(img_pts, world_pts):
+    world_rounded = np.round(world_pts, 2)
+    _, unique_idx = np.unique(world_rounded, axis=0, return_index=True)
+    img_clean = img_pts[unique_idx]
+    world_clean = world_pts[unique_idx]
+    sort_idx = np.lexsort([world_clean[:, 0], world_clean[:, 1]])
+    return img_clean[sort_idx], world_clean[sort_idx]
+
+
+def draw_chessboard_grid(ax, img_pts, world_pts):
+    img_s, world_s = sort_chessboard_points(img_pts, world_pts)
+    unique_y = np.unique(np.round(world_s[:, 1], 2))
+    unique_x = np.unique(np.round(world_s[:, 0], 2))
+    H = compute_homography(world_s, img_s)
+    x_min, x_max = float(np.min(unique_x)), float(np.max(unique_x))
+    y_min, y_max = float(np.min(unique_y)), float(np.max(unique_y))
+
+    def project_segment(world_segment):
+        if H is None:
+            return None
+        projected = _project_world_points(H, np.asarray(world_segment, dtype=float))
+        if projected is None or not np.isfinite(projected).all():
+            return None
+        return projected
+
+    def fit_grid_segment(pts, grid_values):
+        if len(pts) < 2:
+            return None
+        order = np.argsort(grid_values)
+        pts = pts[order]
+        residuals = _point_line_residuals(pts)
+        if len(pts) >= 4:
+            med = np.median(residuals)
+            mad = np.median(np.abs(residuals - med)) + 1e-6
+            inliers = residuals <= max(4.0, med + 3.0 * mad)
+            pts_fit = pts[inliers] if np.sum(inliers) >= 2 else pts
+        else:
+            pts_fit = pts
+        centered = pts_fit - np.mean(pts_fit, axis=0)
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        direction = vh[0]
+        t = centered @ direction
+        p0 = np.mean(pts_fit, axis=0) + np.min(t) * direction
+        p1 = np.mean(pts_fit, axis=0) + np.max(t) * direction
+        return np.vstack([p0, p1])
+
+    def line_angle(segment):
+        delta = segment[1] - segment[0]
+        return np.arctan2(delta[1], delta[0]) % np.pi
+
+    def angle_diff(a, b):
+        diff = abs(a - b)
+        return min(diff, np.pi - diff)
+
+    def plot_segment(segment):
+        span = np.ptp(segment, axis=0)
+        color = '#d83b32' if span[1] > span[0] else '#1f73d8'
+        ax.plot(segment[:, 0], segment[:, 1], color=color, linewidth=2, alpha=0.9, zorder=4)
+
+    row_records = []
+    col_records = []
+    for y in unique_y:
+        mask = np.isclose(np.round(world_s[:, 1], 2), y)
+        segment = fit_grid_segment(img_s[mask], world_s[mask, 0])
+        if segment is not None:
+            row_records.append((y, segment))
+    for x in unique_x:
+        mask = np.isclose(np.round(world_s[:, 0], 2), x)
+        segment = fit_grid_segment(img_s[mask], world_s[mask, 1])
+        if segment is not None:
+            col_records.append((x, segment))
+
+    row_angles = [line_angle(seg) for _, seg in row_records if np.ptp(seg, axis=0)[0] >= np.ptp(seg, axis=0)[1]]
+    col_angles = [line_angle(seg) for _, seg in col_records if np.ptp(seg, axis=0)[1] > np.ptp(seg, axis=0)[0]]
+    row_med = np.median(row_angles) if row_angles else None
+    col_med = np.median(col_angles) if col_angles else None
+    angle_limit = np.deg2rad(5.0)
+    force_project_rows = False
+    force_project_cols = False
+    if row_med is not None and row_angles:
+        row_spread = np.percentile([angle_diff(a, row_med) for a in row_angles], 90)
+        force_project_rows = row_spread > angle_limit
+    if col_med is not None and col_angles:
+        col_spread = np.percentile([angle_diff(a, col_med) for a in col_angles], 90)
+        force_project_cols = col_spread > angle_limit
+
+    for y, segment in row_records:
+        use_segment = segment
+        if force_project_rows or (row_med is not None and angle_diff(line_angle(segment), row_med) > angle_limit):
+            projected = project_segment([[x_min, y], [x_max, y]])
+            if projected is not None:
+                use_segment = projected
+        plot_segment(use_segment)
+
+    for x, segment in col_records:
+        use_segment = segment
+        if force_project_cols or (col_med is not None and angle_diff(line_angle(segment), col_med) > angle_limit):
+            projected = project_segment([[x, y_min], [x, y_max]])
+            if projected is not None:
+                use_segment = projected
+        plot_segment(use_segment)
+
+
+def plot_chessboard_edge(ax, img_pts, color='red', linewidth=2, linestyle='--'):
+    return
+
+
+def get_chessboard_polygon(img_pts):
+    if len(img_pts) < 3:
+        return None, None
+    try:
+        hull = ConvexHull(img_pts)
+        hull_pts = img_pts[hull.vertices]
+        return Path(hull_pts), hull_pts
+    except:
+        min_x, min_y = np.min(img_pts, axis=0)
+        max_x, max_y = np.max(img_pts, axis=0)
+        rect = np.array([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
+        return Path(rect), rect
+
+
+def find_inside_saddle_points(polygon_path, all_saddle_pts, chess_used_idx):
+    if polygon_path is None or len(all_saddle_pts) == 0:
+        return np.array([]), np.array([])
+    inside = polygon_path.contains_points(all_saddle_pts)
+    all_idx = np.arange(len(all_saddle_pts))
+    mask = inside & ~np.isin(all_idx, list(chess_used_idx))
+    return all_saddle_pts[mask], all_idx[mask]
+
+
+def validate_chessboard_grid_alignment(world_pts, max_deviation=1.5):
+    if len(world_pts) < 4:
+        return False, 1e9
+    snapped = np.round(world_pts / 15.0) * 15.0
+    dev = np.linalg.norm(world_pts - snapped, axis=1)
+    median_dev = np.median(dev)
+    if np.max(dev) > max_deviation * 1.5:
+        return False, median_dev
+    if median_dev > max_deviation:
+        return False, median_dev
+    ux = np.unique(snapped[:, 0])
+    uy = np.unique(snapped[:, 1])
+    if len(ux) < 2 or len(uy) < 2:
+        return False, median_dev
+    return True, median_dev
+
+
+def calculate_chessboard_quality(img_pts, world_pts):
+    if len(img_pts) < 4:
+        return 0
+    H = compute_homography(world_pts, img_pts)
+    if H is None:
+        return 0
+    _, mean_e = compute_reprojection_error(H, world_pts, img_pts)
+    p90_line, _, bad_groups = chessboard_line_residual_summary(img_pts, world_pts)
+    snapped = np.round(world_pts / 15.0).astype(int)
+    grid_cells = len(np.unique(snapped[:, 0])) * len(np.unique(snapped[:, 1]))
+    fill_ratio = len(img_pts) / max(1, grid_cells)
+    fill_ratio = float(np.clip(fill_ratio, 0.0, 1.0))
+
+    reproj_penalty = np.exp(-0.5 * (mean_e / 3.0) ** 2)
+    line_penalty = np.exp(-0.5 * (p90_line / 4.0) ** 2)
+    bad_group_penalty = 1.0 / (1.0 + bad_groups)
+    score = len(img_pts) * (0.55 + 0.45 * fill_ratio)
+    score *= reproj_penalty * line_penalty * bad_group_penalty
+    return float(score)
+
+
+def prepare_chessboard_candidate(img_pts, world_pts, candidate_pts, H=None):
+    clean_img, clean_world, clean_H = filter_chessboard_line_outliers(
+        img_pts, world_pts, threshold=7.5
+    )
+    p90_line, _, bad_groups = chessboard_line_residual_summary(clean_img, clean_world)
+    if len(clean_img) < 120 and p90_line < 2.0 and bad_groups == 0:
+        adj_img, adj_world, adj_H = adjust_skipped_grid_axis(
+            clean_img, clean_world, candidate_pts, min_inside=3
+        )
+        adj_p90, _, adj_bad = chessboard_line_residual_summary(adj_img, adj_world)
+        old_quality = calculate_chessboard_quality(clean_img, clean_world)
+        new_quality = calculate_chessboard_quality(adj_img, adj_world)
+        if adj_bad == 0 and adj_p90 <= max(2.0, p90_line + 0.5) and new_quality >= old_quality * 0.65:
+            return adj_img, adj_world, adj_H if adj_H is not None else clean_H
+    return clean_img, clean_world, clean_H if clean_H is not None else H
+
+
+def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
+    global img_path_glob
+    img_path_glob = img_path
+    print(f"\n{'=' * 60}")
+    print(f"处理图片: {os.path.basename(img_path)}")
+    print(f"{'=' * 60}")
+    img_gray = imread_gray(img_path)
+    img_gray = gaussian_filter(img_gray, sigma=0.5)
+    blur_var = measure_blur_level(img_gray)
+    tau_nms = 0.02 if blur_var < 50 else 0.025
+    tau_score = 0.03 if blur_var < 50 else 0.04
+    h, w = img_gray.shape
+    nn = [h, w]
+    mm = h
+    jj3, ii3 = np.meshgrid(np.arange(-3, 4), np.arange(-3, 4), indexing='xy')
+    spij3 = (ii3.ravel(order='F') * h + jj3.ravel(order='F')).astype(int)
+    jj7, ii7 = np.meshgrid(np.arange(-7, 8), np.arange(-7, 8), indexing='xy')
+    spij7 = (ii7.ravel(order='F') * h + jj7.ravel(order='F')).astype(int)
+    Im0 = img_gray.ravel(order='F')
+    t0 = time.time()
+    angle_map, mag_map, img_du, img_dv = compute_gradients(img_gray)
+    img_norm = normalize_image_for_corners(img_gray)
+    radius_list = [4, 8, 12]
+    corner_map = filter_image_with_templates_fft(img_norm, radius_list)
+    corners_init = non_maximum_suppression_fast(corner_map, n=3, tau=tau_nms, margin=5)
+    if len(corners_init) == 0:
+        print("警告: 未检测到候选点，跳过")
+        return True, img_path
+    MAX_CANDIDATES = 3000
+    if len(corners_init) > MAX_CANDIDATES:
+        resp_vals = corner_map[corners_init[:, 1].astype(int), corners_init[:, 0].astype(int)]
+        idx = np.argsort(resp_vals)[-MAX_CANDIDATES:]
+        corners_init = corners_init[idx]
+    refined_p, refined_v1, refined_v2 = refine_corners_vectorized(
+        img_du, img_dv, angle_map, mag_map, corners_init, r=10, img_gray=img_norm)
+    if len(refined_p) == 0:
+        print("警告: 精化后无有效点，跳过")
+        return True, img_path
+    scores = score_corners_batch(img_norm, mag_map, refined_p, refined_v1, refined_v2, radius_list)
+    keep = scores >= tau_score
+    final_points = refined_p[keep]
+    final_v1 = refined_v1[keep]
+    final_v2 = refined_v2[keep]
+    final_scores = scores[keep]
+    if len(final_points) == 0:
+        print("警告: 评分过滤后无点，跳过")
+        return True, img_path
+    dirs_array = np.stack([final_v1, final_v2], axis=1)
+    raw_points = final_points
+    raw_scores = final_scores
+    final_points, dirs_array = merge_close_points(
+        final_points, dirs_array, final_scores, dist_thresh=8.0, ratio=0.5
+    )
+    score_tree = KDTree(raw_points)
+    _, score_idx = score_tree.query(final_points, k=1)
+    final_scores = raw_scores[score_idx]
+    final_v1 = dirs_array[:, 0]
+    final_v2 = dirs_array[:, 1]
+    final_v1, final_v2 = adjust_orientation_handedness(final_v1, final_v2)
+    print(f"鞍点检测耗时: {time.time() - t0:.2f} 秒")
+    corner = {'v1': final_v1, 'v2': final_v2}
+    xcsp = np.round(final_points[:, 0]).astype(int) * h + np.round(final_points[:, 1]).astype(int)
+    # ========== 替换为 MATLAB 风格棋盘格生长 ==========
+    points = final_points.copy()
+    # 替换原来的调用
+    dirs = np.column_stack([final_v1, final_v2])
+    found_chessboards_raw = find_chessboard_candidates(points, dirs, final_scores, img_gray.shape, max_boards=3)
+    if not found_chessboards_raw:
+        print("未找到有效棋盘格")
+        return False, img_path
+    # 将 raw 结果转换为原有格式：质量评分 + 重叠过滤
+    scored_boards = []
+    for img_pts, world_pts, H, used_idx in found_chessboards_raw:
+        img_pts, world_pts, H = prepare_chessboard_candidate(img_pts, world_pts, final_points, H)
+        # 世界坐标原点归零
+        world_pts = world_pts - np.min(world_pts, axis=0)
+        # 网格规整度验证
+        valid, med_dev = validate_chessboard_grid_alignment(world_pts)
+        if not valid:
+            print(f"  ✗ 丢弃棋盘格 (偏差 {med_dev:.2f})")
+            continue
+        quality = calculate_chessboard_quality(img_pts, world_pts)
+        p90_line, worst_line, bad_groups = chessboard_line_residual_summary(img_pts, world_pts)
+        print(f"  候选棋盘: 点数 {len(img_pts)}, 线残差p90 {p90_line:.2f}, 最大残差 {worst_line:.2f}, 异常组 {bad_groups}, 质量 {quality:.2f}")
+        scored_boards.append((img_pts, world_pts, H, used_idx, quality))
+    # 按质量降序，取前2个不重叠的
+    scored_boards.sort(key=lambda x: x[4], reverse=True)
+    final_two = []
+    used_world_ranges = []
+    for img_pts, world_pts, H, used_idx, qual in scored_boards:
+        # 重叠检查（世界坐标范围）
+        x_min, x_max = np.min(world_pts[:, 0]), np.max(world_pts[:, 0])
+        y_min, y_max = np.min(world_pts[:, 1]), np.max(world_pts[:, 1])
+        area = (x_max - x_min) * (y_max - y_min)
+        overlap = False
+        for (ox_min, ox_max, oy_min, oy_max) in used_world_ranges:
+            inter_x = max(0, min(x_max, ox_max) - max(x_min, ox_min))
+            inter_y = max(0, min(y_max, oy_max) - max(y_min, oy_min))
+            if inter_x * inter_y > 0.2 * area:
+                overlap = True
+                break
+        if not overlap and len(final_two) < 2:
+            final_two.append((img_pts, world_pts, H, used_idx, qual))
+            used_world_ranges.append((x_min, x_max, y_min, y_max))
+        if len(final_two) == 2:
+            break
+    cleaned_final_two = []
+    for img_pts, world_pts, H, used_idx, qual in final_two:
+        clean_img, clean_world, clean_H = complete_chessboard_from_candidates(img_pts, world_pts, final_points)
+        cleaned_final_two.append((clean_img, clean_world, clean_H if clean_H is not None else H, used_idx, qual))
+    final_two = cleaned_final_two
+    # 提取左右数据以适配原有 get_mark_cord 逻辑
+    xy1_left = uv1_left = None
+    xy1_right = uv1_right = None
+    jilu_left = jilu_right = []
+    if len(final_two) >= 1:
+        img_l, world_l, H_l, _, _ = final_two[0]
+        xy1_left = np.column_stack([world_l, np.ones(len(world_l))])
+        uv1_left = np.column_stack([img_l, np.ones(len(img_l))])
+        xy1_left, uv1_left, jilu_left = get_mark_cord(
+            final_points, corner, xy1_left, uv1_left, H_l,
+            nn, spij3, spij7, [], xcsp, Im0, mm, img_gray)
+    if len(final_two) >= 2:
+        img_r, world_r, H_r, _, _ = final_two[1]
+        xy1_right = np.column_stack([world_r, np.ones(len(world_r))])
+        uv1_right = np.column_stack([img_r, np.ones(len(img_r))])
+        xy1_right, uv1_right, jilu_right = get_mark_cord(
+            final_points, corner, xy1_right, uv1_right, H_r,
+            nn, spij3, spij7, [], xcsp, Im0, mm, img_gray)
+
+    def _check_handedness(pts, tol=1e-6):
+        """
+        从点集中选择一个非退化三角形，返回叉积符号。
+        若所有点共线或点数不足，返回 0（无效）。
+        """
+        if pts is None or len(pts) < 3:
+            return 0
+        p0 = pts[0, :2]
+        # 寻找第二个点，使向量长度 > tol
+        for i in range(1, len(pts)):
+            v1 = pts[i, :2] - p0
+            if np.linalg.norm(v1) > tol:
+                break
+        else:
+            return 0
+        # 寻找第三个点，使与 p0, p1 形成非零面积
+        for j in range(i + 1, len(pts)):
+            v2 = pts[j, :2] - p0
+            cross = v1[0] * v2[1] - v1[1] * v2[0]
+            if abs(cross) > tol:
+                return np.sign(cross)
+        return 0
+
+    # ========================================
+    # ### 修改部分 1：移除旋向不一致导致的程序中止逻辑 ###
+    # ========================================
+    def check_handedness_ok(xy, uv, board_name):
+        if xy is None or uv is None:
+            return True
+        s_xy = _check_handedness(xy)
+        s_uv = _check_handedness(uv)
+        if s_xy == 0 or s_uv == 0 or s_xy != s_uv:
+            print(f"  警告: {board_name} 旋向异常 (xy {s_xy}, uv {s_uv})，已记录但不中止程序")
+            return False
+        return True
+
+    # 仅检查并提示，不影响程序继续
+    left_ok = check_handedness_ok(xy1_left, uv1_left, "左棋盘格")
+    right_ok = check_handedness_ok(xy1_right, uv1_right, "右棋盘格")
+
+    # 始终返回 True，让程序继续
+    is_all_consistent = True
+    # ========================================
+    # ### 修改部分 1 结束 ###
+    # ========================================
+
+    # ---------- 可视化 ----------
+    plt.figure(figsize=(12, 10))
+    ax = plt.gca()
+    ax.imshow(img_gray, cmap='gray')
+    ax.plot(points[:, 0], points[:, 1], 'yo', markersize=3, alpha=0.3, label='鞍点')
+    for idx, (im, wo, _, _, _) in enumerate(final_two):
+        ax.plot(im[:, 0], im[:, 1], 'w+', markersize=8, label=f'棋盘格{idx + 1}')
+        draw_chessboard_grid(ax, im, wo)
+        ax.plot(im[:, 0], im[:, 1], 'w+', markersize=9, markeredgewidth=1.6,
+                label=f'棋盘格{idx + 1}', zorder=8)
+    colors = {1: 'r', 2: 'm', 3: 'c', 4: 'orange'}
+    for rec in jilu_left:
+        ax.plot(rec[1], rec[2], 'o', color=colors.get(rec[0], 'w'), markersize=6, markeredgecolor='k')
+        ax.text(rec[1] + 5, rec[2] - 5, str(rec[0]), color='white', fontsize=10, weight='bold',
+                bbox=dict(facecolor='black', alpha=0.5))
+    for rec in jilu_right:
+        ax.plot(rec[1], rec[2], 'o', color=colors.get(rec[0], 'w'), markersize=6, markeredgecolor='k')
+        ax.text(rec[1] + 5, rec[2] - 5, str(rec[0]), color='white', fontsize=10, weight='bold',
+                bbox=dict(facecolor='black', alpha=0.5))
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys())
+    ax.set_title(f'{os.path.basename(img_path)}\n红=水平边 蓝=垂直边')
+    ax.set_title(f'{os.path.basename(img_path)}\n红=竖向边  蓝=横向边  白色十字=交叉点')
+    ax.axis('off')
+    plt.tight_layout()
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        out_name = os.path.splitext(os.path.basename(img_path))[0] + '_detect.png'
+        plt.savefig(os.path.join(save_dir, out_name), dpi=160, bbox_inches='tight')
+    if show:
+        plt.show()
+        time.sleep(2)
+    plt.close()
+    return is_all_consistent, img_path
+
+
+if False and __name__ == '__main__':
+    img_folder = r'C:\Users\30772\Documents\2022nov1111'
+    supported_ext = ('.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff')
+    img_list = [os.path.join(img_folder, f) for f in os.listdir(img_folder)
+                if f.lower().endswith(supported_ext)]
+    img_list.sort()
+    if not img_list:
+        print(f"文件夹 {img_folder} 下未找到图片")
+        sys.exit(1)
+    print(f"找到 {len(img_list)} 张图片，开始处理...")
+    for img_path in img_list[0:]:
+        is_consistent, path = process_single_image(img_path)
+
+        # ========================================
+        # ### 修改部分 2：移除主循环中的程序中止逻辑 ###
+        # ========================================
+        # 即使 is_consistent 为 False，也只打印提示，不调用 sys.exit(1)
+        if not is_consistent:
+            print(f"\n{'!' * 60}")
+            print(f"警告: 旋向不一致，跳过当前图片继续处理: {os.path.basename(path)}")
+            print(f"{'!' * 60}")
+        # ========================================
+        # ### 修改部分 2 结束 ###
+        # ========================================
+
+    print(f"\n{'=' * 60}")
+    print("所有图片处理完毕。")
+    print(f"{'=' * 60}")
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='棋盘位图高精度识别与调试图输出')
+    parser.add_argument('--img-folder', default=os.path.join(SCRIPT_DIR, '实习资料', '2022nov1111'),
+                        help='图片文件夹，默认使用仓库内的 实习资料/2022nov1111')
+    parser.add_argument('--limit', type=int, default=0, help='最多处理多少张，0 表示全部')
+    parser.add_argument('--start', type=int, default=0, help='从排序后的第几张开始处理')
+    parser.add_argument('--no-show', action='store_true', help='不弹出 Matplotlib 窗口')
+    parser.add_argument('--save-dir', default=os.path.join(SCRIPT_DIR, '识别结果'),
+                        help='调试图保存目录')
+    args = parser.parse_args()
+
+    img_folder = args.img_folder
+    supported_ext = ('.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff')
+    img_list = [os.path.join(img_folder, f) for f in os.listdir(img_folder)
+                if f.lower().endswith(supported_ext)]
+    img_list.sort()
+    img_list = img_list[args.start:]
+    if args.limit > 0:
+        img_list = img_list[:args.limit]
+    if not img_list:
+        print(f"文件夹 {img_folder} 下未找到图片")
+        sys.exit(1)
+    print(f"找到 {len(img_list)} 张图片，开始处理...")
+    for img_path in img_list:
+        is_consistent, path = process_single_image(
+            img_path,
+            show=not args.no_show,
+            save_dir=args.save_dir
+        )
+        if not is_consistent:
+            print(f"\n{'!' * 60}")
+            print(f"警告: 旋向不一致，跳过当前图片继续处理: {os.path.basename(path)}")
+            print(f"{'!' * 60}")
+
+    print(f"\n{'=' * 60}")
+    print("所有图片处理完毕。")
+    print(f"{'=' * 60}")

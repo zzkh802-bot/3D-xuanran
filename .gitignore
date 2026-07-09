@@ -1,0 +1,4 @@
+task1-threejs-lod-sphere/node_modules/
+task1-threejs-lod-sphere/dist/
+**/__pycache__/
+*.pyc
