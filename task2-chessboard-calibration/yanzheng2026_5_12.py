@@ -924,6 +924,157 @@ def prepare_chessboard_candidate(img_pts, world_pts, candidate_pts, H=None):
     return clean_img, clean_world, clean_H if clean_H is not None else H
 
 
+# ===================== 单应矩阵传播：推算第二个棋盘格 =====================
+def propagate_chessboard_by_homography(first_img_pts, first_world_pts, first_H,
+                                        candidate_pts, grid_spacing=15.0,
+                                        min_points=6):
+    """
+    利用已识别棋盘格的单应矩阵，正向投影预测第二棋盘格的位置，再匹配候选点。
+
+    策略：不依赖反向投影+网格对齐（外推误差大），而是：
+    1. 在第一棋盘格世界网格的四周扩展搜索窗口
+    2. 用 H 将扩展网格点投影到图像空间
+    3. KDTree 搜索每个投影点附近的候选点
+    4. 若命中数足够，构建第二棋盘格
+
+    :param first_img_pts:  第一个棋盘格的图像坐标 (N,2)
+    :param first_world_pts: 第一个棋盘格的世界坐标 (N,2)，已归零
+    :param first_H:        第一个棋盘格的单应矩阵 (3,3) world->image
+    :param candidate_pts:  所有鞍点图像坐标 (M,2)
+    :param grid_spacing:   棋盘格单元间距 mm
+    :param min_points:     最少需要的网格点数
+    :return: (img_pts, world_pts, H, used_indices) 或 None
+    """
+    if first_H is None or len(candidate_pts) < min_points:
+        return None
+
+    # 1. 解析第一棋盘格的网格行列范围
+    snapped1 = np.round(first_world_pts / grid_spacing).astype(int)
+    col_min, col_max = int(np.min(snapped1[:, 0])), int(np.max(snapped1[:, 0]))
+    row_min, row_max = int(np.min(snapped1[:, 1])), int(np.max(snapped1[:, 1]))
+    n_cols1 = col_max - col_min + 1
+    n_rows1 = row_max - row_min + 1
+
+    print(f"  [传播] 第一棋盘: {n_cols1}列×{n_rows1}行, "
+          f"范围 col[{col_min},{col_max}] row[{row_min},{row_max}]")
+
+    # 2. 构建候选点 KDTree
+    tree = KDTree(candidate_pts)
+
+    # 3. 四方向扩展搜索（+X, -X, +Y, -Y），每种方向多个间隙
+    best_result = None
+
+    for axis_dir, axis_name in [(0, "X"), (1, "Y")]:
+        for sign, sign_name in [(+1, "+"), (-1, "-")]:
+            dir_label = f"{sign_name}{axis_name}"
+
+            # 多间隙尝试（以格距为单位，0~6格间距）
+            for gap_units in range(0, 7):
+                gap_mm = gap_units * grid_spacing
+
+                if axis_dir == 0:  # X 轴偏移
+                    if sign == +1:
+                        ext_col_min = col_max + 1 + gap_units
+                        ext_col_max = ext_col_min + n_cols1 - 1
+                    else:
+                        ext_col_max = col_min - 1 - gap_units
+                        ext_col_min = ext_col_max - n_cols1 + 1
+                    ext_row_min = row_min
+                    ext_row_max = row_max
+                else:  # Y 轴偏移
+                    if sign == +1:
+                        ext_row_min = row_max + 1 + gap_units
+                        ext_row_max = ext_row_min + n_rows1 - 1
+                    else:
+                        ext_row_max = row_min - 1 - gap_units
+                        ext_row_min = ext_row_max - n_rows1 + 1
+                    ext_col_min = col_min
+                    ext_col_max = col_max
+
+                # 生成假定第二棋盘格的世界坐标网格
+                ext_cols = np.arange(ext_col_min, ext_col_max + 1)
+                ext_rows = np.arange(ext_row_min, ext_row_max + 1)
+                if len(ext_cols) < 3 or len(ext_rows) < 3:
+                    continue
+
+                cc, rr = np.meshgrid(ext_cols, ext_rows)
+                ext_world = np.column_stack([
+                    cc.ravel() * grid_spacing,
+                    rr.ravel() * grid_spacing
+                ])
+
+                # 正向投影到图像
+                projected = _project_world_points(first_H, ext_world)
+                if projected is None:
+                    continue
+
+                # 去掉投影超出图像边界的
+                finite = np.isfinite(projected).all(axis=1)
+                if np.sum(finite) < min_points:
+                    continue
+
+                projected_f = projected[finite]
+                ext_world_f = ext_world[finite]
+
+                # 匹配：对每个投影点，找最近的候选点
+                # 匹配阈值：取投影网格的平均间距的 55%（够宽松）
+                grid_spacing_img = _projected_grid_spacing(
+                    projected_f.reshape(len(ext_rows), len(ext_cols), 2),
+                    ext_cols, ext_rows
+                ) if np.sum(finite) >= len(ext_cols) * len(ext_rows) else 25.0
+                match_dist = max(8.0, min(35.0, grid_spacing_img * 0.55))
+
+                dists, idxs = tree.query(projected_f, k=1)
+
+                good = dists <= match_dist
+                if np.sum(good) < min_points:
+                    continue
+
+                matched_img = candidate_pts[idxs[good]]
+                matched_world = ext_world_f[good]
+
+                # 去重：同一候选点被多个投影匹配时，保留距离最小的
+                dedup = {}
+                for i in range(len(matched_img)):
+                    pid = int(idxs[good][i])
+                    d = float(dists[good][i])
+                    if pid not in dedup or d < dedup[pid][1]:
+                        dedup[pid] = (i, d)
+                idx_list = [v[0] for v in dedup.values()]
+                matched_img = matched_img[idx_list]
+                matched_world = matched_world[idx_list]
+
+                if len(matched_img) < min_points:
+                    continue
+
+                # 世界坐标归零
+                shift = np.min(matched_world, axis=0)
+                matched_world_s = matched_world - shift
+
+                # 质量评分
+                snap = np.round(matched_world_s / grid_spacing).astype(int)
+                n_c = len(np.unique(snap[:, 0]))
+                n_r = len(np.unique(snap[:, 1]))
+                if n_c < 2 or n_r < 2:
+                    continue
+
+                quality = len(matched_img) * (1.0 + 0.25 * min(n_c, n_r))
+
+                if best_result is None or quality > best_result[0]:
+                    H_cand = compute_homography(matched_world_s, matched_img)
+                    if H_cand is not None:
+                        best_result = (quality, matched_img,
+                                       matched_world_s, H_cand, dir_label, match_dist)
+
+    if best_result is None:
+        print("  [传播] 未找到第二个棋盘格")
+        return None
+
+    quality, img_pts, world_pts, H, dir_name, mdist = best_result
+    print(f"  [传播·{dir_name}] 推定 {len(img_pts)} 网格点, 匹配阈值={mdist:.1f}px")
+    return img_pts, world_pts, H, set()
+
+
 def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     global img_path_glob
     img_path_glob = img_path
@@ -1011,49 +1162,228 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
             f"  候选棋盘: 点数 {len(img_pts)}, 线残差p90 {p90_line:.2f}, 最大残差 {worst_line:.2f}, 异常组 {bad_groups}, 质量 {quality:.2f}")
         scored_boards.append((img_pts, world_pts, H, used_idx, quality))
     # 按质量降序，取前2个不重叠的
+    # ⚠ 重要：用图像空间重叠检查，而非世界坐标（世界坐标已归零，不同棋盘格可能
+    #    巧合重叠）
     scored_boards.sort(key=lambda x: x[4], reverse=True)
     final_two = []
-    used_world_ranges = []
+    used_img_ranges = []
     for img_pts, world_pts, H, used_idx, qual in scored_boards:
-        # 重叠检查（世界坐标范围）
-        x_min, x_max = np.min(world_pts[:, 0]), np.max(world_pts[:, 0])
-        y_min, y_max = np.min(world_pts[:, 1]), np.max(world_pts[:, 1])
-        area = (x_max - x_min) * (y_max - y_min)
+        # 重叠检查 — 基于图像坐标
+        ix_min, ix_max = np.min(img_pts[:, 0]), np.max(img_pts[:, 0])
+        iy_min, iy_max = np.min(img_pts[:, 1]), np.max(img_pts[:, 1])
+        img_area = max(1.0, (ix_max - ix_min) * (iy_max - iy_min))
+        cx = float(np.mean(img_pts[:, 0]))
+        cy = float(np.mean(img_pts[:, 1]))
+
         overlap = False
-        for (ox_min, ox_max, oy_min, oy_max) in used_world_ranges:
-            inter_x = max(0, min(x_max, ox_max) - max(x_min, ox_min))
-            inter_y = max(0, min(y_max, oy_max) - max(y_min, oy_min))
-            if inter_x * inter_y > 0.2 * area:
+        for (ox_min, ox_max, oy_min, oy_max) in used_img_ranges:
+            inter_x = max(0.0, min(ix_max, ox_max) - max(ix_min, ox_min))
+            inter_y = max(0.0, min(iy_max, oy_max) - max(iy_min, oy_min))
+            if inter_x * inter_y > 0.15 * img_area:
                 overlap = True
                 break
+
+        # 额外保护：用图像点集 KDTree 精细判断重复（同一棋盘格不同算法产出）
+        if not overlap and len(final_two) >= 1:
+            for (exist_img, _, _, _, _) in final_two:
+                tree_exist = KDTree(exist_img)
+                dists, _ = tree_exist.query(img_pts, k=1)
+                if np.mean(dists < 12.0) > 0.65:
+                    overlap = True
+                    break
+
+        status = "已选" if (not overlap and len(final_two) < 2) else \
+                 ("重叠跳过" if overlap else "达2上限")
+        print(f"  候选: {len(img_pts)}点 q={qual:.2f} "
+              f"img中心=({cx:.0f},{cy:.0f}) "
+              f"img_X[{ix_min:.0f},{ix_max:.0f}] img_Y[{iy_min:.0f},{iy_max:.0f}] "
+              f"→ {status}")
         if not overlap and len(final_two) < 2:
             final_two.append((img_pts, world_pts, H, used_idx, qual))
-            used_world_ranges.append((x_min, x_max, y_min, y_max))
+            used_img_ranges.append((ix_min, ix_max, iy_min, iy_max))
         if len(final_two) == 2:
             break
+
+    print(f"  不重叠棋盘格: {len(final_two)} 个")
+
+    # ========== 循环传播：找最多 MAX_BOARDS 个棋盘格 ==========
+    # 设计为可扩展的循环：每轮用一个已识别的棋盘格传播新棋盘
+    # 用所有已识别棋盘格的合并凸包做排除
+    MAX_BOARDS = 3
+    if len(final_two) >= 1 and len(final_two) < MAX_BOARDS:
+        print(f"  当前已识别 {len(final_two)}/{MAX_BOARDS}，尝试传播找更多...")
+
+        # 多轮传播
+        propagation_attempts = 0
+        max_propagation_attempts = MAX_BOARDS + 1  # 防止死循环
+
+        while len(final_two) < MAX_BOARDS and propagation_attempts < max_propagation_attempts:
+            propagation_attempts += 1
+            found_this_round = False
+
+            # ---- 计算所有已识别棋盘格的合并凸包掩码 ----
+            all_excluded_mask = np.zeros(len(final_points), dtype=bool)
+            for (exist_img, _, _, _, _) in final_two:
+                poly, _ = get_chessboard_polygon(exist_img)
+                if poly is not None:
+                    all_excluded_mask |= poly.contains_points(final_points)
+
+            outside_mask = ~all_excluded_mask
+            outside_points = final_points[outside_mask]
+
+            if len(outside_points) < 6:
+                print(f"  凸包排除后剩余 {len(outside_points)} 点，跳过")
+                break
+
+            # ---- 策略 A：单应传播 ----
+            # 尝试用每个已识别棋盘格传播
+            best_propagated = None
+            for src_idx, (src_img, src_world, src_H, _, _) in enumerate(final_two):
+                propagated = propagate_chessboard_by_homography(
+                    src_img, src_world, src_H, final_points,
+                    grid_spacing=15.0, min_points=6
+                )
+                if propagated is not None:
+                    p_img, p_world, p_H, _ = propagated
+                    # 检验：传播结果必须在凸包外
+                    poly_src, _ = get_chessboard_polygon(src_img)
+                    if poly_src is not None:
+                        # 至少 50% 的点不在 src 棋盘格内
+                        outside_ratio = np.mean(~poly_src.contains_points(p_img))
+                        if outside_ratio < 0.5:
+                            continue
+                    # 质量优先
+                    p_world_s = p_world - np.min(p_world, axis=0)
+                    valid, med_dev = validate_chessboard_grid_alignment(
+                        p_world_s, max_deviation=3.5)
+                    if not valid or len(p_img) < 6:
+                        continue
+                    qual = calculate_chessboard_quality(p_img, p_world_s)
+                    if best_propagated is None or qual > best_propagated[0]:
+                        best_propagated = (qual, p_img, p_world_s, p_H, src_idx)
+
+            if best_propagated is not None:
+                qual, p_img, p_world, p_H, src_idx = best_propagated
+                final_two.append((p_img, p_world, p_H, set(), qual))
+                found_this_round = True
+                print(f"  ✓ 策略A单应传播: 棋盘格 #{len(final_two)} "
+                      f"(源自#{src_idx+1}, {len(p_img)}点, 质量{qual:.1f})")
+                continue
+
+            # ---- 策略 B：凸包排除后重搜索 ----
+            outside_v1 = final_v1[outside_mask]
+            outside_v2 = final_v2[outside_mask]
+            outside_scores_arr = final_scores[outside_mask]
+            outside_dirs = np.column_stack([outside_v1, outside_v2])
+
+            second_boards = find_chessboard_candidates(
+                outside_points, outside_dirs, outside_scores_arr,
+                img_gray.shape, max_boards=1
+            )
+            for b_img, b_world, b_H, b_used in second_boards:
+                b_img, b_world, b_H = prepare_chessboard_candidate(
+                    b_img, b_world, outside_points, b_H)
+                b_world = b_world - np.min(b_world, axis=0)
+                valid2, _ = validate_chessboard_grid_alignment(b_world)
+                if valid2 and len(b_img) >= 6:
+                    qual2 = calculate_chessboard_quality(b_img, b_world)
+                    final_two.append((b_img, b_world, b_H, set(), qual2))
+                    found_this_round = True
+                    print(f"  ✓ 策略B凸包重搜索: 棋盘格 #{len(final_two)} "
+                          f"({len(b_img)}点, 质量{qual2:.1f})")
+                    break
+            if found_this_round:
+                continue
+
+            # ---- 策略 C：降低 tau_score 阈值 ----
+            lower_tau = tau_score * 0.55
+            keep_lower = scores >= lower_tau
+            if np.sum(keep_lower) > np.sum(keep):
+                ext_points_all = refined_p[keep_lower]
+                ext_v1_all = refined_v1[keep_lower]
+                ext_v2_all = refined_v2[keep_lower]
+                ext_scores_all = scores[keep_lower]
+                ext_dirs_all = np.column_stack([ext_v1_all, ext_v2_all])
+
+                # 合并去重
+                merged_p, merged_dirs = merge_close_points(
+                    ext_points_all, ext_dirs_all, ext_scores_all,
+                    dist_thresh=8.0, ratio=0.5)
+                tree_raw = KDTree(refined_p)
+                _, sidx = tree_raw.query(merged_p, k=1)
+                merged_scores = scores[sidx]
+                merged_v1 = merged_dirs[:, 0]
+                merged_v2 = merged_dirs[:, 1]
+
+                # 排除所有已识别棋盘格凸包
+                poly_all = []
+                for (exist_img, _, _, _, _) in final_two:
+                    poly, _ = get_chessboard_polygon(exist_img)
+                    if poly is not None:
+                        poly_all.append(poly)
+
+                if poly_all:
+                    outside_mask_m = np.ones(len(merged_p), dtype=bool)
+                    for poly in poly_all:
+                        outside_mask_m &= ~poly.contains_points(merged_p)
+                else:
+                    outside_mask_m = np.ones(len(merged_p), dtype=bool)
+
+                if np.sum(outside_mask_m) >= 6:
+                    o_points = merged_p[outside_mask_m]
+                    o_v1 = merged_v1[outside_mask_m]
+                    o_v2 = merged_v2[outside_mask_m]
+                    o_scores = merged_scores[outside_mask_m]
+                    o_dirs = np.column_stack([o_v1, o_v2])
+
+                    extra_boards = find_chessboard_candidates(
+                        o_points, o_dirs, o_scores,
+                        img_gray.shape, max_boards=1
+                    )
+                    for b_img, b_world, b_H, b_used in extra_boards:
+                        b_img, b_world, b_H = prepare_chessboard_candidate(
+                            b_img, b_world, o_points, b_H)
+                        b_world = b_world - np.min(b_world, axis=0)
+                        valid2, _ = validate_chessboard_grid_alignment(
+                            b_world, max_deviation=3.0)
+                        if valid2 and len(b_img) >= 6:
+                            qual2 = calculate_chessboard_quality(b_img, b_world)
+                            final_two.append((b_img, b_world, b_H, set(), qual2))
+                            found_this_round = True
+                            print(f"  ✓ 策略C降阈值重检: 棋盘格 #{len(final_two)} "
+                                  f"({len(b_img)}点, 质量{qual2:.1f})")
+                            break
+
+            if not found_this_round:
+                print(f"  ✗ 本轮所有策略失败，停止传播")
+                break
+
+        print(f"  传播完成: 共识别 {len(final_two)}/{MAX_BOARDS} 个棋盘格")
+    # ================================================================
+
     cleaned_final_two = []
     for img_pts, world_pts, H, used_idx, qual in final_two:
         clean_img, clean_world, clean_H = complete_chessboard_from_candidates(img_pts, world_pts, final_points)
         cleaned_final_two.append((clean_img, clean_world, clean_H if clean_H is not None else H, used_idx, qual))
     final_two = cleaned_final_two
-    # 提取左右数据以适配原有 get_mark_cord 逻辑
+    # 提取各棋盘格数据（支持任意数量）
+    board_results = []  # [(xy, uv, jilu), ...]
+    for (img_b, world_b, H_b, _, _) in final_two:
+        xy_b = np.column_stack([world_b, np.ones(len(world_b))])
+        uv_b = np.column_stack([img_b, np.ones(len(img_b))])
+        xy_b, uv_b, jilu_b = get_mark_cord(
+            final_points, corner, xy_b, uv_b, H_b,
+            nn, spij3, spij7, [], xcsp, Im0, mm, img_gray)
+        board_results.append((xy_b, uv_b, jilu_b))
+    # 保持兼容旧变量名：取前 2 个
     xy1_left = uv1_left = None
     xy1_right = uv1_right = None
-    jilu_left = jilu_right = []
-    if len(final_two) >= 1:
-        img_l, world_l, H_l, _, _ = final_two[0]
-        xy1_left = np.column_stack([world_l, np.ones(len(world_l))])
-        uv1_left = np.column_stack([img_l, np.ones(len(img_l))])
-        xy1_left, uv1_left, jilu_left = get_mark_cord(
-            final_points, corner, xy1_left, uv1_left, H_l,
-            nn, spij3, spij7, [], xcsp, Im0, mm, img_gray)
-    if len(final_two) >= 2:
-        img_r, world_r, H_r, _, _ = final_two[1]
-        xy1_right = np.column_stack([world_r, np.ones(len(world_r))])
-        uv1_right = np.column_stack([img_r, np.ones(len(img_r))])
-        xy1_right, uv1_right, jilu_right = get_mark_cord(
-            final_points, corner, xy1_right, uv1_right, H_r,
-            nn, spij3, spij7, [], xcsp, Im0, mm, img_gray)
+    jilu_left = []
+    jilu_right = []
+    if len(board_results) >= 1:
+        xy1_left, uv1_left, jilu_left = board_results[0]
+    if len(board_results) >= 2:
+        xy1_right, uv1_right, jilu_right = board_results[1]
 
     def _check_handedness(pts, tol=1e-6):
         """
@@ -1111,15 +1441,15 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         draw_chessboard_grid(ax, im, wo)
         ax.plot(im[:, 0], im[:, 1], 'w+', markersize=9, markeredgewidth=1.6,
                 label=f'棋盘格{idx + 1}', zorder=8)
-    colors = {1: 'r', 2: 'm', 3: 'c', 4: 'orange'}
-    for rec in jilu_left:
-        ax.plot(rec[1], rec[2], 'o', color=colors.get(rec[0], 'w'), markersize=6, markeredgecolor='k')
-        ax.text(rec[1] + 5, rec[2] - 5, str(rec[0]), color='white', fontsize=10, weight='bold',
-                bbox=dict(facecolor='black', alpha=0.5))
-    for rec in jilu_right:
-        ax.plot(rec[1], rec[2], 'o', color=colors.get(rec[0], 'w'), markersize=6, markeredgecolor='k')
-        ax.text(rec[1] + 5, rec[2] - 5, str(rec[0]), color='white', fontsize=10, weight='bold',
-                bbox=dict(facecolor='black', alpha=0.5))
+    colors = {1: 'r', 2: 'm', 3: 'c', 4: 'orange', 5: 'lime', 6: 'yellow'}
+    # 绘制所有已识别棋盘格的标记点
+    for (xy_b, uv_b, jilu_b) in board_results:
+        for rec in jilu_b:
+            ax.plot(rec[1], rec[2], 'o', color=colors.get(rec[0], 'w'),
+                    markersize=6, markeredgecolor='k')
+            ax.text(rec[1] + 5, rec[2] - 5, str(rec[0]), color='white',
+                    fontsize=10, weight='bold',
+                    bbox=dict(facecolor='black', alpha=0.5))
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
     ax.legend(by_label.values(), by_label.keys())
