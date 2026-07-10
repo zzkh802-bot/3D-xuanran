@@ -14,7 +14,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SUPPORT_DIR = os.path.join(SCRIPT_DIR, '实习资料')
+SUPPORT_DIR = os.path.join(SCRIPT_DIR, '棋盘')
 if SUPPORT_DIR not in sys.path:
     sys.path.insert(0, SUPPORT_DIR)
 
@@ -75,15 +75,13 @@ def evaluate_collinearity_consistency(existing_pts, new_pt, grid_dir):
     # 拼接现有点和新增点
     test_pts = np.vstack([existing_pts, new_pt])
 
-    # 按网格方向筛选：水平方向按y分组，垂直方向按x分组
+    # 按网格方向筛选：以新增点的坐标作为参考线
     if grid_dir == 0:  # 水平/左右方向（同y坐标）
-        # 取现有点的y均值作为基准
-        ref_y = np.mean(existing_pts[:, 1])
-        # 筛选y接近基准的点（容错1.5像素）
+        ref_y = new_pt[1]
         mask = np.isclose(test_pts[:, 1], ref_y, atol=1.5)
         collinear_pts = test_pts[mask]
     else:  # 垂直/上下方向（同x坐标）
-        ref_x = np.mean(existing_pts[:, 0])
+        ref_x = new_pt[0]
         mask = np.isclose(test_pts[:, 0], ref_x, atol=1.5)
         collinear_pts = test_pts[mask]
 
@@ -96,12 +94,11 @@ def evaluate_collinearity_consistency(existing_pts, new_pt, grid_dir):
     return score
 
 
-def evaluate_local_grid_alignment(existing_local_pts, new_local_pt, anchor_local_pt,
-                                  grid_dir, ref_len=0):
-    """Score whether a new point stays on the expected local grid line."""
-    if existing_local_pts is None or len(existing_local_pts) == 0:
-        return 1.0
-
+def evaluate_local_grid_alignment(new_local_pt, anchor_local_pt, grid_dir, ref_len=0):
+    """
+    Score whether a new point stays on the expected local grid line.
+    移除了未使用的 existing_local_pts 参数，直接基于锚点评估垂直偏移与步长。
+    """
     perpendicular_axis = 1 if grid_dir == 0 else 0
     travel_axis = 0 if grid_dir == 0 else 1
     tolerance = max(2.5, ref_len * 0.16) if ref_len > 0 else 3.0
@@ -146,7 +143,7 @@ def grow_neighbor(xc0, used_mask, center_idx, direction_vec, ref_len=0,
     """
     在局部坐标系 xc0 中，从 center_idx 沿方向 direction_vec 寻找下一个点。
     新增：结合像素共线性一致性评分筛选最优点
-    :param original_pts: (N,2) 原始像素坐标点集（用于共线性计算）
+    :param original_pts: (N,2) 原始像素坐标点集（用于共线性计算，已移除此逻辑）
     :param grid_dir: 网格方向（0=水平/左右, 1=垂直/上下）
     :return: 候选索引，若找不到返回 -1。
     """
@@ -180,21 +177,12 @@ def grow_neighbor(xc0, used_mask, center_idx, direction_vec, ref_len=0,
         dist_scores = 1.0 / (1.0 + dists[candidates] / scale)
     base_scores = np.clip(cos_angle[candidates], 0.0, 1.0) * dist_scores
 
-    # 2. 新增：共线性一致性评分
+    # 2. 局部网格对齐评分（替代原先的死代码和像素共线性逻辑）
     collinear_scores = np.ones_like(base_scores)
-    existing_local_pts = xc0[used_mask]
     for i, cand_idx in enumerate(candidates):
         collinear_scores[i] = evaluate_local_grid_alignment(
-            existing_local_pts, xc0[cand_idx], center, grid_dir, ref_len
+            xc0[cand_idx], center, grid_dir, ref_len
         )
-    if False and original_pts is not None and len(original_pts) > 0:
-        # 提取现有同方向点（center_idx对应的原始点）
-        existing_pts = original_pts[np.where(~used_mask)[0]]
-        for i, cand_idx in enumerate(candidates):
-            new_pt = original_pts[cand_idx]
-            collinear_scores[i] = evaluate_collinearity_consistency(
-                existing_pts, new_pt, grid_dir
-            )
 
     # 3. 综合评分（基础评分*共线性评分）
     final_scores = base_scores * collinear_scores
@@ -207,6 +195,7 @@ def assign_grid_coords(adj_matrix, start_idx):
     """
     根据邻接矩阵 (Nx4，列序：左、右、上、下，-1 表示无连接) 分配网格坐标。
     返回 (N,2) 数组，若发生冲突则返回 None。
+    列顺序：[row, col]
     """
     n = adj_matrix.shape[0]
     coords = np.full((n, 2), np.nan)
@@ -357,23 +346,20 @@ def chessboardsgrow_py(points, directions, scores, img_shape, max_boards=3):
         valid = ~np.isnan(grid_coords[:, 0])
         if np.sum(valid) < 4:
             continue
-        world_local = grid_coords * 15.0
+        # 修正世界坐标：列索引对应 x，行索引对应 y
+        world_local = np.column_stack([grid_coords[:, 1] * 15.0, grid_coords[:, 0] * 15.0])
         img_local = points[board]
         img_pts = img_local[valid]
         world_pts = world_local[valid]
         # ---------- 手性自动修正 ----------
         if len(img_pts) >= 3:
             p0, p1, p2 = img_pts[:3]
-            img_cross = np.cross(p1 - p0, p2 - p0)
+            img_cross = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
             w0, w1, w2 = world_pts[:3]
-            world_cross = np.cross(w1 - w0, w2 - w0)
+            world_cross = (w1[0] - w0[0]) * (w2[1] - w0[1]) - (w1[1] - w0[1]) * (w2[0] - w0[0])
             if img_cross * world_cross < 0:
-                # 交换 X/Y 轴（行列互换）修正手性
-                world_pts = world_pts[:, [1, 0]]
-                w0, w1, w2 = world_pts[:3]
-                if np.cross(w1 - w0, w2 - w0) * img_cross <= 0:
-                    # 交换后仍不一致，丢弃
-                    continue
+                # 翻转 x 轴以保持手性一致（而不是交换 XY）
+                world_pts[:, 0] *= -1.0
         # ---------------------------------
         used_indices = set(board)
         H = compute_homography(world_pts, img_pts)
@@ -753,7 +739,6 @@ def get_mark_cord(xc, corner, xy1, uv1, HH0, nn, spij3, spij7, jilu, xcsp, Im0, 
         return xy1, uv1, jilu
 
 
-
 def sort_chessboard_points(img_pts, world_pts):
     world_rounded = np.round(world_pts, 2)
     _, unique_idx = np.unique(world_rounded, axis=0, return_index=True)
@@ -1022,7 +1007,8 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
             continue
         quality = calculate_chessboard_quality(img_pts, world_pts)
         p90_line, worst_line, bad_groups = chessboard_line_residual_summary(img_pts, world_pts)
-        print(f"  候选棋盘: 点数 {len(img_pts)}, 线残差p90 {p90_line:.2f}, 最大残差 {worst_line:.2f}, 异常组 {bad_groups}, 质量 {quality:.2f}")
+        print(
+            f"  候选棋盘: 点数 {len(img_pts)}, 线残差p90 {p90_line:.2f}, 最大残差 {worst_line:.2f}, 异常组 {bad_groups}, 质量 {quality:.2f}")
         scored_boards.append((img_pts, world_pts, H, used_idx, quality))
     # 按质量降序，取前2个不重叠的
     scored_boards.sort(key=lambda x: x[4], reverse=True)
@@ -1137,7 +1123,6 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
     ax.legend(by_label.values(), by_label.keys())
-    ax.set_title(f'{os.path.basename(img_path)}\n红=水平边 蓝=垂直边')
     ax.set_title(f'{os.path.basename(img_path)}\n红=竖向边  蓝=横向边  白色十字=交叉点')
     ax.axis('off')
     plt.tight_layout()
@@ -1181,13 +1166,12 @@ if False and __name__ == '__main__':
     print("所有图片处理完毕。")
     print(f"{'=' * 60}")
 
-
 if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='棋盘位图高精度识别与调试图输出')
-    parser.add_argument('--img-folder', default=os.path.join(SCRIPT_DIR, '实习资料', '2022nov1111'),
-                        help='图片文件夹，默认使用仓库内的 实习资料/2022nov1111')
+    parser.add_argument('--img-folder', default=r'D:\棋盘\2022nov1111',
+                        help='2022nov1111')
     parser.add_argument('--limit', type=int, default=0, help='最多处理多少张，0 表示全部')
     parser.add_argument('--start', type=int, default=0, help='从排序后的第几张开始处理')
     parser.add_argument('--no-show', action='store_true', help='不弹出 Matplotlib 窗口')
