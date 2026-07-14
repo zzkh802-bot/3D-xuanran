@@ -1099,7 +1099,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     img_norm = normalize_image_for_corners(img_gray)
     radius_list = [4, 8, 12]
     corner_map = filter_image_with_templates_fft(img_norm, radius_list)
-    corners_init = non_maximum_suppression_fast(corner_map, n=3, tau=tau_nms, margin=5)
+    corners_init = non_maximum_suppression_fast(corner_map, n=3, tau=tau_nms, margin=2)
     if len(corners_init) == 0:
         print("警告: 未检测到候选点，跳过")
         return True, img_path
@@ -1154,7 +1154,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         # 网格规整度验证
         valid, med_dev = validate_chessboard_grid_alignment(world_pts)
         if not valid:
-            print(f"  ✗ 丢弃棋盘格 (偏差 {med_dev:.2f})")
+            print(f"  [X] 丢弃棋盘格 (偏差 {med_dev:.2f})")
             continue
         quality = calculate_chessboard_quality(img_pts, world_pts)
         p90_line, worst_line, bad_groups = chessboard_line_residual_summary(img_pts, world_pts)
@@ -1266,7 +1266,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
                 qual, p_img, p_world, p_H, src_idx = best_propagated
                 final_two.append((p_img, p_world, p_H, set(), qual))
                 found_this_round = True
-                print(f"  ✓ 策略A单应传播: 棋盘格 #{len(final_two)} "
+                print(f"  [OK] 策略A单应传播: 棋盘格 #{len(final_two)} "
                       f"(源自#{src_idx+1}, {len(p_img)}点, 质量{qual:.1f})")
                 continue
 
@@ -1289,7 +1289,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
                     qual2 = calculate_chessboard_quality(b_img, b_world)
                     final_two.append((b_img, b_world, b_H, set(), qual2))
                     found_this_round = True
-                    print(f"  ✓ 策略B凸包重搜索: 棋盘格 #{len(final_two)} "
+                    print(f"  [OK] 策略B凸包重搜索: 棋盘格 #{len(final_two)} "
                           f"({len(b_img)}点, 质量{qual2:.1f})")
                     break
             if found_this_round:
@@ -1312,8 +1312,8 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
                 tree_raw = KDTree(refined_p)
                 _, sidx = tree_raw.query(merged_p, k=1)
                 merged_scores = scores[sidx]
-                merged_v1 = merged_dirs[:, 0]
-                merged_v2 = merged_dirs[:, 1]
+                merged_v1 = merged_dirs[:, :2]
+                merged_v2 = merged_dirs[:, 2:4]
 
                 # 排除所有已识别棋盘格凸包
                 poly_all = []
@@ -1350,12 +1350,12 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
                             qual2 = calculate_chessboard_quality(b_img, b_world)
                             final_two.append((b_img, b_world, b_H, set(), qual2))
                             found_this_round = True
-                            print(f"  ✓ 策略C降阈值重检: 棋盘格 #{len(final_two)} "
+                            print(f"  [OK] 策略C降阈值重检: 棋盘格 #{len(final_two)} "
                                   f"({len(b_img)}点, 质量{qual2:.1f})")
                             break
 
             if not found_this_round:
-                print(f"  ✗ 本轮所有策略失败，停止传播")
+                print(f"  [X] 本轮所有策略失败，停止传播")
                 break
 
         print(f"  传播完成: 共识别 {len(final_two)}/{MAX_BOARDS} 个棋盘格")
