@@ -28,21 +28,25 @@ npm run build
 - 四个教材球：高等数学上、高等数学下、线性代数、概率论与数理统计。
 - 总览 LOD0：只显示球体和外层端点。
 - 点击教材球或右侧按钮后聚焦单球。
-- 拉近/拉远自动切换四级 LOD：章节区域、小节区域、知识点。
-- 分区为贴合球面的细分曲面，不再只是平面直线拼接。
-- 章节/小节文字以纹理方式贴近球面表面。
+- 拉近/拉远自动切换四级 LOD：教材、章节、小节、知识点。
+- 每门课只渲染一个不透明球面；章节色、小节色和凹槽由 Shader 内的语义场控制，不再叠加区域网格。
+- 同一个边界距离场同时驱动凹槽位移、法线高光和接缝阴影。
+- 章节/小节文字根据区域内部空间自动缩放，并以局部弯曲网格贴近球面。
 - OrbitControls 支持拖拽旋转、缩放。
-- 微调模式支持选中点后改 `phi/psi`、方向按钮微调，也支持在球面上拖动点。
+- 微调模式支持选中共享交点后改 `phi/psi`、方向按钮微调，也支持按住 Shift 在球面上拖动；关联边界同步变化，松手后重建语义场。
+- LOD3 保留小节名并显示知识点，同时隐藏外层代表点。
 
 ## 数据
 
-- `src/data/course-data.json`：前端运行数据。
-- `scripts/generate_course_data.py`：从四个课程变量名脚本重新生成 JSON。
-- `src/data/*.py` 和 `src/data/*.xlsx`：保留的原始课程数据。
+- `src/data/course-data.json`：前端直接加载的 schema v3 数据。
+- `scripts/generate_course_data.py`：读取 XLSX 中的节路径、球面坐标、点对和章范围，生成共享顶点 ID 数据。
+- `src/data/*.xlsx`：章、节和交点坐标的主要数据源。
+- `src/data/*.py`：保留的参考曲线脚本；目前仅用于补齐线性代数表格缺失的 `P34`。
 
 重新生成课程 JSON：
 
 ```powershell
+python -m pip install -r requirements.txt
 python scripts\generate_course_data.py
 ```
 
@@ -50,10 +54,12 @@ python scripts\generate_course_data.py
 
 - 高等数学上：7 章，40 小节。
 - 高等数学下：5 章，33 小节。
-- 线性代数：6 章，28 个区域。
+- 线性代数：6 章，27 个小节区域。
 - 概率论与数理统计：8 章，30 小节。
 
 ## 验证
 
+- `python scripts\generate_course_data.py` 已通过，全部章/节引用均能解析到共享顶点。
 - `npm run build` 已通过。
+- Playwright 已验证四本教材 LOD1、高等数学下 LOD1/2/3、390x844 移动端和 Shift 拖拽联动。
 - 精简交付目录不保留 `node_modules`、`dist` 和截图；需要时按上面的命令重新安装、构建、运行。

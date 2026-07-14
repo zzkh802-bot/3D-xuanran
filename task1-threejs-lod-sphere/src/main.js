@@ -9,7 +9,6 @@ import {
   invalidateCourseLayouts,
   prepareCourse,
   readableTextColor,
-  regionBoundaryVectors,
   regionLayout,
   sampleClosedBoundary,
   slerpUnit,
@@ -140,8 +139,7 @@ function createCurvedGeometry(width, height) {
     const x = positions.getX(index);
     const y = positions.getY(index);
     const squaredDistance = Math.min(radius * radius * 0.92, x * x + y * y);
-    const z = Math.sqrt(radius * radius - squaredDistance) - radius;
-    positions.setZ(index, z);
+    positions.setZ(index, Math.sqrt(radius * radius - squaredDistance) - radius);
   }
   positions.needsUpdate = true;
   geometry.computeVertexNormals();
@@ -156,8 +154,7 @@ function surfaceQuaternion(normal) {
     : new THREE.Vector3(0, 1, 0);
   const east = new THREE.Vector3().crossVectors(upReference, direction).normalize();
   const north = new THREE.Vector3().crossVectors(direction, east).normalize();
-  const basis = new THREE.Matrix4().makeBasis(east, north, direction);
-  return new THREE.Quaternion().setFromRotationMatrix(basis);
+  return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(east, north, direction));
 }
 
 function makeSurfaceLabel(text, color, layout, options = {}) {
@@ -182,10 +179,7 @@ function makeSurfaceLabel(text, color, layout, options = {}) {
     toneMapped: false
   });
   material.userData.baseOpacity = 1;
-  const mesh = new THREE.Mesh(
-    createCurvedGeometry(width, height),
-    material
-  );
+  const mesh = new THREE.Mesh(createCurvedGeometry(width, height), material);
   const radialOffset = options.radialOffset || 0.22;
   mesh.position.copy(layout.anchor).multiplyScalar(radius + radialOffset);
   mesh.quaternion.copy(surfaceQuaternion(layout.anchor));
@@ -655,13 +649,14 @@ function focusCourse(courseId) {
   if (selectedCourse) {
     courseTitle.textContent = selectedCourse.course.title;
     if (changed) {
-      controls.target.set(0, 0, 0);
+      const targetY = isMobileView() ? -3.2 : 0;
+      controls.target.set(0, targetY, 0);
       const horizontal = selectedCourse.focusDirection.clone();
       horizontal.y = 0;
       if (horizontal.lengthSq() < 0.01) horizontal.set(0, 0, 1);
       horizontal.normalize().multiplyScalar(Math.sqrt(focusDistance * focusDistance - 49));
       camera.position.copy(horizontal);
-      camera.position.y = 7;
+      camera.position.y = targetY + 7;
     }
   } else {
     courseTitle.textContent = '四个教材';
@@ -690,7 +685,7 @@ function describeSelection(item) {
   if (item.type === 'knowledge') return `知识点：${item.section.title} / ${item.point.label}\n${sectionNeighborText(item.course, item.section)}`;
   if (item.type === 'control') {
     const count = item.course.__vertexUsage.get(item.point.id)?.size || 0;
-    return `可调交点：${item.point.label}\n关联区域：${count} 个\n按住 Shift 拖动可微调`;
+    return `可调交点：${item.point.label}\n关联区域：${count} 个`;
   }
   if (item.type === 'point') return `外层点：${item.point.label}`;
   return '未选择节点';
@@ -861,6 +856,10 @@ window.addEventListener('resize', () => {
     courseGroups.forEach((item, index) => {
       item.group.userData.target = overviewPosition(index);
     });
+  } else {
+    const offset = camera.position.clone().sub(controls.target);
+    controls.target.y = isMobileView() ? -3.2 : 0;
+    camera.position.copy(controls.target).add(offset);
   }
 });
 
@@ -880,5 +879,4 @@ renderTabs();
 const queryCourse = new URLSearchParams(window.location.search).get('course');
 if (queryCourse && data.courses.some((course) => course.id === queryCourse)) focusCourse(queryCourse);
 else focusCourse(null);
-window.__courseSphereDebug = { camera, controls, courseGroups, renderer, scene };
 animate();

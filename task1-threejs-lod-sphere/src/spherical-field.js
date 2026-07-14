@@ -1,8 +1,8 @@
 import * as THREE from 'three';
 
 const TAU = Math.PI * 2;
-const FIELD_WIDTH = 1024;
-const FIELD_HEIGHT = 512;
+const FIELD_WIDTH = 768;
+const FIELD_HEIGHT = 384;
 
 const CHAPTER_PALETTE = [
   '#ef3f4f', '#16a3d6', '#55b73f', '#ff9f1c',
@@ -58,10 +58,6 @@ export function slerpUnit(a, b, t) {
     .multiplyScalar(Math.sin((1 - t) * omega) / sinOmega)
     .add(end.multiplyScalar(Math.sin(t * omega) / sinOmega))
     .normalize();
-}
-
-function colorToCss(color) {
-  return `#${color.getHexString(THREE.SRGBColorSpace)}`;
 }
 
 function lighten(color, amount) {

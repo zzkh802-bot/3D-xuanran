@@ -93,6 +93,11 @@ button:hover {
   color: var(--focus);
 }
 
+button:focus-visible {
+  outline: 3px solid rgba(35, 104, 214, 0.3);
+  outline-offset: 2px;
+}
+
 .meta {
   margin-top: 12px;
   border-top: 1px solid var(--line);
@@ -103,6 +108,10 @@ button:hover {
   margin: 0 0 8px;
   color: var(--muted);
   line-height: 1.45;
+}
+
+#selectionText {
+  white-space: pre-line;
 }
 
 .editor {
