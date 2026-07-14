@@ -1,6 +1,6 @@
 # 3D xuanran
 
-本目录已按两个任务拆分完成。
+本目录已按三个任务拆分完成。
 
 ## 任务一：Three.js 四级 LOD 球面知识图谱
 
@@ -33,3 +33,20 @@ cd "D:\生产实习\3D xuanran\task2-chessboard-calibration"
 $env:MPLBACKEND='Agg'
 python yanzheng2026_5_12.py --img-folder "实习资料\2022nov1111" --start 3 --limit 1 --save-dir "识别结果\恢复验证" --no-show
 ```
+
+## 任务三：PhysicsNeMo / VFGN 烧结变形模型 smoke test
+
+目录：`task3-physicsnemo-vfgn`
+
+内容包括 NVIDIA Modulus/PhysicsNeMo 中 `sintering_physics` 示例的必要源码、本机 Python 3.9 兼容补丁、两个可运行 smoke test 脚本和一个本地 STL 样例。
+
+运行：
+
+```powershell
+cd "D:\生产实习\3D xuanran\task3-physicsnemo-vfgn"
+$env:PYTHONPATH=(Resolve-Path .).Path
+python run_synthetic_vfgn.py
+python run_stl_vfgn_smoke.py
+```
+
+说明：当前 smoke test 用随机小数据和 `sample_data\stl_foot.stl` 构造输入，验证 GitHub 模型链路能跑通；没有官方 checkpoint 和真实 `tfrecord`，所以不是可信烧结预测结果。
