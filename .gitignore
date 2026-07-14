@@ -1,4 +1,84 @@
-task1-threejs-lod-sphere/node_modules/
-task1-threejs-lod-sphere/dist/
-**/__pycache__/
-*.pyc
+# macOS / Windows
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Node.js / Three.js
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+.parcel-cache/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python bytecode and native extensions
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Python environments and packaging
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+wheelhouse/
+
+# Python tooling and test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.pid
+.cache/
+tmp/
+temp/
+
+# PhysicsNeMo / machine-learning run artifacts
+outputs/
+multirun/
+wandb/
+mlruns/
+lightning_logs/
+events.out.tfevents.*
+*.tfrecord
+
+# Generated checkpoints, rollouts, and prepared simulation data
+task3-physicsnemo-vfgn/examples/additive_manufacturing/sintering_physics/models/
+task3-physicsnemo-vfgn/examples/additive_manufacturing/sintering_physics/rollouts/
+task3-physicsnemo-vfgn/examples/additive_manufacturing/sintering_physics/data/
