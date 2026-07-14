@@ -428,7 +428,7 @@ function buildCourse(course, index) {
   group.userData.target = group.position.clone();
   root.add(group);
 
-  const fields = createSemanticFields(course, renderer);
+  const fields = createSemanticFields(course);
   const material = createSemanticMaterial(fields, course.color);
   const base = new THREE.Mesh(new THREE.SphereGeometry(radius, 192, 128), material);
   base.userData = { type: 'course', course };
@@ -510,7 +510,7 @@ data.courses.forEach(buildCourse);
 
 function rebuildCourseVisuals(courseGroup) {
   invalidateCourseLayouts(courseGroup.course);
-  const nextFields = createSemanticFields(courseGroup.course, renderer);
+  const nextFields = createSemanticFields(courseGroup.course);
   updateMaterialFields(courseGroup.material, nextFields);
   disposeSemanticFields(courseGroup.fields);
   courseGroup.fields = nextFields;
