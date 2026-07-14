@@ -1,6 +1,23 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import data from './data/course-data.json';
+import {
+  createSemanticFields,
+  createSemanticMaterial,
+  disposeSemanticFields,
+  findRegionAtDirection,
+  invalidateCourseLayouts,
+  prepareCourse,
+  readableTextColor,
+  regionBoundaryVectors,
+  regionLayout,
+  sampleClosedBoundary,
+  slerpUnit,
+  smoothstep,
+  sourceToVector,
+  updateMaterialFields,
+  vectorToSource
+} from './spherical-field.js';
 import './styles.css';
 
 const sceneEl = document.querySelector('#scene');
@@ -15,22 +32,23 @@ const phiInput = document.querySelector('#phiInput');
 const psiInput = document.querySelector('#psiInput');
 
 const radius = data.radius || 10;
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xeef2f7);
-
 const overviewDistance = 122;
 const overviewSpacing = 26.5;
 const focusDistance = 55;
 
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xeef2f7);
+
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1200);
 camera.position.set(0, 10, overviewDistance);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.08;
+renderer.toneMappingExposure = 1.02;
+renderer.domElement.setAttribute('aria-label', '可旋转缩放的课程球面知识图谱');
 sceneEl.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
@@ -39,12 +57,12 @@ controls.dampingFactor = 0.08;
 controls.minDistance = 14;
 controls.maxDistance = 170;
 
-scene.add(new THREE.HemisphereLight(0xffffff, 0x8ea0b8, 1.75));
-const keyLight = new THREE.DirectionalLight(0xffffff, 2.55);
-keyLight.position.set(30, 35, 28);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x7f91aa, 1.45));
+const keyLight = new THREE.DirectionalLight(0xffffff, 2.15);
+keyLight.position.set(28, 36, 30);
 scene.add(keyLight);
-const rimLight = new THREE.DirectionalLight(0xb8f1ff, 1.15);
-rimLight.position.set(-34, 18, -26);
+const rimLight = new THREE.DirectionalLight(0xc6f2ff, 0.9);
+rimLight.position.set(-30, 16, -24);
 scene.add(rimLight);
 
 const raycaster = new THREE.Raycaster();
@@ -58,162 +76,12 @@ let selectedNode = null;
 let editMode = false;
 let draggingPoint = null;
 let currentLodLevel = 0;
-const controlMatchEps = 0.035;
+let rebuildTimer = null;
 
-const chapterPalette = [
-  '#e11d48', '#0891b2', '#65a30d', '#f59e0b',
-  '#7c3aed', '#dc2626', '#0d9488', '#2563eb',
-  '#c026d3', '#ea580c', '#16a34a', '#4f46e5'
-];
-const regionTextureCache = new Map();
-
-function colorToThree(color, offset = 0) {
-  const c = new THREE.Color(color);
-  if (offset > 0) c.lerp(new THREE.Color(0xffffff), offset);
-  if (offset < 0) c.lerp(new THREE.Color(0x101820), Math.abs(offset));
-  return c;
-}
-
-function readableTextColor(color) {
-  const c = new THREE.Color(color);
-  const luminance = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-  return luminance < 0.48 ? '#ffffff' : '#102033';
-}
-
-function smoothstep(edge0, edge1, value) {
-  const t = THREE.MathUtils.clamp((value - edge0) / (edge1 - edge0), 0, 1);
-  return t * t * (3 - 2 * t);
-}
-
-function chapterColor(index) {
-  return chapterPalette[index % chapterPalette.length];
-}
-
-function sectionColor(baseColor, index, total) {
-  const source = new THREE.Color(baseColor);
-  const hsl = {};
-  source.getHSL(hsl);
-  const phase = total <= 1 ? 0.5 : index / (total - 1);
-  const lightBands = [0.50, 0.64, 0.56, 0.70, 0.44, 0.60, 0.52, 0.66];
-  const saturationBands = [0.86, 0.76, 0.90, 0.80, 0.82, 0.88, 0.72, 0.84];
-  const color = new THREE.Color();
-  const hue = (hsl.h + (phase - 0.5) * 0.055 + ((index % 3) - 1) * 0.012 + 1) % 1;
-  const saturation = THREE.MathUtils.clamp(Math.max(hsl.s, 0.72) * saturationBands[index % saturationBands.length], 0.58, 0.98);
-  const lightness = THREE.MathUtils.clamp(lightBands[index % lightBands.length] + (phase - 0.5) * 0.035, 0.30, 0.78);
-  color.setHSL(hue, saturation, lightness);
-  return color;
-}
-
-function hashNoise(x, y, seed) {
-  const value = Math.sin(x * 127.1 + y * 311.7 + seed * 74.7) * 43758.5453123;
-  return value - Math.floor(value);
-}
-
-function makeRegionTexture(color, kind = 'region') {
-  const base = new THREE.Color(color);
-  const key = `${kind}:${base.getHexString()}`;
-  if (regionTextureCache.has(key)) return regionTextureCache.get(key);
-
-  const size = 256;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  const image = ctx.createImageData(size, size);
-  const seed = parseInt(base.getHexString().slice(0, 5), 16) / 8192;
-
-  for (let y = 0; y < size; y += 1) {
-    for (let x = 0; x < size; x += 1) {
-      const nx = x / size - 0.5;
-      const ny = y / size - 0.5;
-      const grain =
-        hashNoise(Math.floor(x / 5), Math.floor(y / 5), seed) * 0.032 +
-        hashNoise(Math.floor(x / 17), Math.floor(y / 17), seed + 8.7) * 0.026;
-      const contour = Math.sin((nx * 1.45 + ny * 1.05) * 21 + Math.sin((nx - ny) * 8)) * 0.018;
-      const vignette = -Math.sqrt(nx * nx + ny * ny) * 0.045;
-      const shade = THREE.MathUtils.clamp(0.985 + grain + contour + vignette, 0.88, 1.10);
-      const idx = (y * size + x) * 4;
-      image.data[idx] = THREE.MathUtils.clamp(base.r * 255 * shade, 0, 255);
-      image.data[idx + 1] = THREE.MathUtils.clamp(base.g * 255 * shade, 0, 255);
-      image.data[idx + 2] = THREE.MathUtils.clamp(base.b * 255 * shade, 0, 255);
-      image.data[idx + 3] = 255;
-    }
-  }
-  ctx.putImageData(image, 0, 0);
-
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.anisotropy = Math.min(renderer.capabilities.getMaxAnisotropy(), 8);
-  texture.wrapS = THREE.ClampToEdgeWrapping;
-  texture.wrapT = THREE.ClampToEdgeWrapping;
-  texture.userData.sharedRegionTexture = true;
-  regionTextureCache.set(key, texture);
-  return texture;
-}
-
-function rememberOpacity(object) {
-  object.traverse((child) => {
-    const materials = child.material ? (Array.isArray(child.material) ? child.material : [child.material]) : [];
-    materials.forEach((material) => {
-      if (material.userData.baseOpacity === undefined) {
-        material.userData.baseOpacity = material.opacity ?? 1;
-      }
-      if (material.userData.baseDepthWrite === undefined) {
-        material.userData.baseDepthWrite = material.depthWrite;
-      }
-      material.transparent = Boolean(material.userData.keepTransparent) || material.userData.baseOpacity < 0.985;
-    });
-  });
-  return object;
-}
-
-function setLayerOpacity(group, opacity) {
-  group.visible = opacity > 0.015;
-  group.traverse((child) => {
-    const materials = child.material ? (Array.isArray(child.material) ? child.material : [child.material]) : [];
-    materials.forEach((material) => {
-      if (material.userData.baseOpacity === undefined) {
-        material.userData.baseOpacity = material.opacity ?? 1;
-      }
-      const baseOpacity = material.userData.baseOpacity;
-      const effectiveOpacity = baseOpacity * opacity;
-      material.opacity = effectiveOpacity;
-      material.transparent = Boolean(material.userData.keepTransparent) || effectiveOpacity < 0.985;
-      material.depthWrite = material.transparent ? false : material.userData.baseDepthWrite;
-    });
-  });
-}
-
-function sphericalToVector(phi, psi, r = radius) {
-  const cp = Math.cos(psi);
-  return new THREE.Vector3(
-    r * cp * Math.cos(phi),
-    r * Math.sin(psi),
-    r * cp * Math.sin(phi)
-  );
-}
-
-function sourceToVector(point, r = radius) {
-  if (Number.isFinite(point?.x) && Number.isFinite(point?.y) && Number.isFinite(point?.z)) {
-    const v = new THREE.Vector3(point.x, point.z, point.y);
-    if (v.lengthSq() > 0.001) return v.normalize().multiplyScalar(r);
-  }
-  return sphericalToVector(point?.phi || 0, point?.psi || 0, r);
-}
-
-function sourceDistance(a, b) {
-  if (!a || !b) return Infinity;
-  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2);
-}
-
-function vectorToSource(localVector, target) {
-  const v = localVector.clone().normalize().multiplyScalar(radius);
-  target.x = Number(v.x.toFixed(5));
-  target.y = Number(v.z.toFixed(5));
-  target.z = Number(v.y.toFixed(5));
-  target.phi = Number(Math.atan2(v.z, v.x).toFixed(6));
-  target.psi = Number(Math.asin(THREE.MathUtils.clamp(v.y / radius, -1, 1)).toFixed(6));
-}
+const outerGeometry = new THREE.SphereGeometry(0.17, 18, 14);
+const handleGeometry = new THREE.SphereGeometry(0.22, 18, 14);
+const knowledgeGeometry = new THREE.SphereGeometry(0.12, 16, 12);
+const knowledgeLabelCache = new Map();
 
 function isMobileView() {
   return window.innerWidth < 720;
@@ -225,583 +93,520 @@ function currentOverviewDistance() {
 
 function overviewPosition(index) {
   if (!isMobileView()) return new THREE.Vector3((index - 1.5) * overviewSpacing, 0, 0);
-  const col = index % 2 === 0 ? -1 : 1;
-  const rowY = index < 2 ? 18 : -5;
-  return new THREE.Vector3(col * 10.5, rowY, 0);
+  const column = index % 2 === 0 ? -1 : 1;
+  const row = index < 2 ? 18 : -5;
+  return new THREE.Vector3(column * 10.5, row, 0);
 }
 
-function wrapText(ctx, text, maxChars = 11) {
+function wrapText(text, maxChars) {
   const clean = String(text).replace(/\s+/g, ' ').trim();
-  return clean.match(new RegExp(`.{1,${maxChars}}`, 'g')) || [clean];
+  const parts = clean.match(new RegExp(`.{1,${maxChars}}`, 'g')) || [clean];
+  if (parts.length <= 3) return parts;
+  return [parts[0], parts[1], `${parts.slice(2).join('').slice(0, maxChars - 1)}…`];
 }
 
-function makeTextTexture(text, color = '#17202a') {
+function makeTextTexture(text, color = '#17202a', maxChars = 10) {
+  const lines = wrapText(text, maxChars);
   const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
-  canvas.width = 640;
-  canvas.height = 192;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.font = '600 38px "Microsoft YaHei", "Noto Sans SC", sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.shadowColor = 'rgba(0, 0, 0, 0.38)';
-  ctx.shadowBlur = 8;
-  ctx.shadowOffsetX = 3;
-  ctx.shadowOffsetY = 4;
-  ctx.lineJoin = 'round';
-  ctx.lineWidth = color === '#ffffff' ? 7 : 5;
-  ctx.strokeStyle = color === '#ffffff' ? 'rgba(8, 17, 32, 0.62)' : 'rgba(255, 255, 255, 0.68)';
-  ctx.fillStyle = color;
-  wrapText(ctx, text).slice(0, 3).forEach((line, idx, lines) => {
-    const y = canvas.height / 2 + (idx - (lines.length - 1) / 2) * 44;
-    ctx.strokeText(line, canvas.width / 2, y);
-    ctx.fillText(line, canvas.width / 2, y);
+  canvas.width = 512;
+  canvas.height = 32 + lines.length * 48;
+  const context = canvas.getContext('2d');
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.font = '700 32px "Microsoft YaHei", "Noto Sans SC", sans-serif';
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.lineJoin = 'round';
+  context.lineWidth = color === '#ffffff' ? 6 : 4;
+  context.strokeStyle = color === '#ffffff' ? 'rgba(6, 14, 28, 0.72)' : 'rgba(255, 255, 255, 0.78)';
+  context.fillStyle = color;
+  context.shadowColor = 'rgba(0, 0, 0, 0.28)';
+  context.shadowBlur = 5;
+  context.shadowOffsetY = 2;
+  lines.forEach((line, index) => {
+    const y = 16 + (index + 0.5) * 48;
+    context.strokeText(line, canvas.width / 2, y);
+    context.fillText(line, canvas.width / 2, y);
   });
   const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
   texture.anisotropy = Math.min(renderer.capabilities.getMaxAnisotropy(), 8);
-  return texture;
+  return { texture, aspect: canvas.width / canvas.height };
 }
 
-function makeBillboardLabel(text, color = '#17202a', scale = 1) {
-  const texture = makeTextTexture(text, color);
-  const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
-  material.userData.keepTransparent = true;
-  const sprite = new THREE.Sprite(material);
-  sprite.scale.set(6.1 * scale, 1.85 * scale, 1);
-  return sprite;
+function createCurvedGeometry(width, height) {
+  const geometry = new THREE.PlaneGeometry(width, height, 14, 5);
+  const positions = geometry.attributes.position;
+  for (let index = 0; index < positions.count; index += 1) {
+    const x = positions.getX(index);
+    const y = positions.getY(index);
+    const squaredDistance = Math.min(radius * radius * 0.92, x * x + y * y);
+    const z = Math.sqrt(radius * radius - squaredDistance) - radius;
+    positions.setZ(index, z);
+  }
+  positions.needsUpdate = true;
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+  return geometry;
 }
 
-function makeSurfaceLabel(text, color = '#17202a', scale = 1) {
-  const texture = makeTextTexture(text, color);
-  const width = 4.8 * scale;
-  const height = 1.45 * scale;
+function surfaceQuaternion(normal) {
+  const direction = normal.clone().normalize();
+  const upReference = Math.abs(direction.y) > 0.94
+    ? new THREE.Vector3(0, 0, 1)
+    : new THREE.Vector3(0, 1, 0);
+  const east = new THREE.Vector3().crossVectors(upReference, direction).normalize();
+  const north = new THREE.Vector3().crossVectors(direction, east).normalize();
+  const basis = new THREE.Matrix4().makeBasis(east, north, direction);
+  return new THREE.Quaternion().setFromRotationMatrix(basis);
+}
+
+function makeSurfaceLabel(text, color, layout, options = {}) {
+  const maxChars = options.maxChars || 10;
+  const { texture, aspect } = makeTextTexture(text, color, maxChars);
+  const available = Math.max(0.9, 2 * radius * Math.sin(layout.clearance) * 0.88);
+  let width = Math.min(options.maxWidth || 6.2, available);
+  width = Math.max(options.minWidth || 0.9, width);
+  let height = width / aspect;
+  const maxHeight = Math.max(0.45, available * 0.62);
+  if (height > maxHeight) {
+    height = maxHeight;
+    width = height * aspect;
+  }
   const material = new THREE.MeshBasicMaterial({
     map: texture,
     transparent: true,
+    alphaTest: 0.025,
     depthTest: true,
     depthWrite: false,
     side: THREE.DoubleSide,
-    polygonOffset: true,
-    polygonOffsetFactor: -4
+    toneMapped: false
   });
-  material.userData.keepTransparent = true;
-  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), material);
-  mesh.userData.labelSize = { width, height };
-  mesh.userData.isSurfaceLabel = true;
-  return mesh;
-}
-
-function markSurfaceLabel(label, data, priority) {
-  const labelSize = label.userData.labelSize;
-  label.userData = { ...data, labelSize, isSurfaceLabel: true, labelPriority: priority };
-}
-
-function fitLabelScale(text, vectors, minScale, maxScale) {
-  if (!vectors.length) return minScale;
-  const center = centroidOf(vectors, radius);
-  const spread = Math.max(...vectors.map((v) => v.distanceTo(center)));
-  const textPenalty = THREE.MathUtils.clamp(9 / Math.max(4, String(text).length), 0.54, 1);
-  return THREE.MathUtils.clamp((spread / 4.6) * textPenalty, minScale, maxScale);
-}
-
-function labelAnchor(vectors, r = radius) {
-  if (!vectors.length) return new THREE.Vector3(0, r, 0);
-  const anchor = new THREE.Vector3();
-  vectors.forEach((vector) => {
-    const normal = vector.clone().normalize();
-    const frontWeight = 0.35 + Math.max(0, normal.z) * 1.8;
-    anchor.add(normal.multiplyScalar(frontWeight));
-  });
-  if (anchor.lengthSq() < 0.001) return centroidOf(vectors, r);
-  return anchor.normalize().multiplyScalar(r);
-}
-
-function placeSurfaceObject(object, position, outward = 1.04) {
-  const normal = position.clone().normalize();
-  object.position.copy(normal.clone().multiplyScalar(radius * outward));
-  object.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal);
-}
-
-function slerpUnit(a, b, t) {
-  const an = a.clone().normalize();
-  const bn = b.clone().normalize();
-  const dot = THREE.MathUtils.clamp(an.dot(bn), -0.9995, 0.9995);
-  const omega = Math.acos(dot);
-  if (omega < 0.0001) return an.lerp(bn, t).normalize();
-  const so = Math.sin(omega);
-  return an.multiplyScalar(Math.sin((1 - t) * omega) / so).add(bn.multiplyScalar(Math.sin(t * omega) / so)).normalize();
-}
-
-function pathVectors(path, r = radius) {
-  return (path || [])
-    .map((point) => sourceToVector(point, r))
-    .filter((point) => point.lengthSq() > 0.001);
-}
-
-function centroidOf(vectors, r = radius) {
-  const center = new THREE.Vector3();
-  vectors.forEach((v) => center.add(v.clone().normalize()));
-  if (center.lengthSq() < 0.001) return new THREE.Vector3(0, r, 0);
-  return center.normalize().multiplyScalar(r);
-}
-
-function createPatchMesh(geometry, color, opacity) {
-  geometry.computeVertexNormals();
-  return new THREE.Mesh(
-    geometry,
-    new THREE.MeshStandardMaterial({
-      color,
-      roughness: 0.72,
-      metalness: 0.015,
-      transparent: true,
-      opacity,
-      side: THREE.DoubleSide
-    })
-  );
-}
-
-function createSphericalPatch(boundary, color, opacity = 1, rings = 8, lift = 1.012) {
-  if (boundary.length < 3) return null;
-  const normals = [];
-  boundary.forEach((point) => {
-    const normal = point.clone().normalize();
-    const previous = normals[normals.length - 1];
-    if (!previous || previous.distanceTo(normal) > 0.0008) normals.push(normal);
-  });
-  if (normals.length > 2 && normals[0].distanceTo(normals[normals.length - 1]) < 0.0008) normals.pop();
-  if (normals.length < 3) return null;
-
-  const center = centroidOf(normals, 1).normalize();
-  const vertices = [];
-  const pushVertex = (vertex) => {
-    vertices.push(vertex.x, vertex.y, vertex.z);
-  };
-  const ringPoint = (ring, index) => {
-    const t = ring / rings;
-    return slerpUnit(center, normals[index % normals.length], t).multiplyScalar(radius * lift);
-  };
-
-  for (let i = 0; i < normals.length; i += 1) {
-    pushVertex(center.clone().multiplyScalar(radius * lift));
-    pushVertex(ringPoint(1, i));
-    pushVertex(ringPoint(1, i + 1));
-  }
-
-  for (let ring = 1; ring < rings; ring += 1) {
-    for (let i = 0; i < normals.length; i += 1) {
-      const a = ringPoint(ring, i);
-      const b = ringPoint(ring, i + 1);
-      const c = ringPoint(ring + 1, i);
-      const d = ringPoint(ring + 1, i + 1);
-      pushVertex(a); pushVertex(c); pushVertex(b);
-      pushVertex(b); pushVertex(c); pushVertex(d);
-    }
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-  return createPatchMesh(geometry, color, opacity);
-}
-
-function createBoundaryLine(points, color, outward = 1.032, opacity = 0.28) {
-  if (points.length < 2) return null;
-  const geometry = new THREE.BufferGeometry().setFromPoints(points.map((p) => p.clone().normalize().multiplyScalar(radius * outward)));
-  const line = new THREE.LineLoop(
-    geometry,
-    new THREE.LineBasicMaterial({ color, transparent: true, opacity })
-  );
-  return line;
-}
-
-function createTubeOnSphere(points, color, tubeRadius, outward, opacity) {
-  if (points.length < 4) return null;
-  const curvePoints = points.map((p) => p.clone().normalize().multiplyScalar(radius * outward));
-  const curve = new THREE.CatmullRomCurve3(curvePoints, true, 'centripetal', 0.22);
-  const geometry = new THREE.TubeGeometry(curve, Math.max(72, points.length * 2), tubeRadius, 8, true);
+  material.userData.baseOpacity = 1;
   const mesh = new THREE.Mesh(
-    geometry,
-    new THREE.MeshStandardMaterial({
-      color,
-      roughness: 0.86,
-      metalness: 0.015,
-      transparent: true,
-      opacity,
-      depthWrite: false
-    })
+    createCurvedGeometry(width, height),
+    material
   );
-  mesh.renderOrder = 6;
+  const radialOffset = options.radialOffset || 0.22;
+  mesh.position.copy(layout.anchor).multiplyScalar(radius + radialOffset);
+  mesh.quaternion.copy(surfaceQuaternion(layout.anchor));
+  mesh.renderOrder = options.renderOrder || 5;
+  mesh.userData = {
+    isSurfaceLabel: true,
+    anchorLocal: mesh.position.clone(),
+    labelSize: { width, height },
+    labelPriority: options.priority || 1
+  };
   return mesh;
 }
 
-function createGroove(points, color = 0x273142, tubeRadius = 0.052) {
-  if (points.length < 4) return null;
-  const group = new THREE.Group();
-  const softened = new THREE.Color(color).lerp(new THREE.Color(0x475569), 0.48).getHex();
-  const shadow = createTubeOnSphere(points, 0x1f2937, tubeRadius * 1.55, 1.012, 0.22);
-  const core = createTubeOnSphere(points, softened, tubeRadius, 1.026, 0.70);
-  const glint = createBoundaryLine(points, 0xffffff, 1.033, 0.16);
-  [shadow, core, glint].forEach((object) => {
-    if (object) group.add(object);
-  });
-  return group.children.length ? group : null;
+function makeBillboardLabel(text, color = '#17202a', scale = 1, depthTest = false) {
+  const { texture, aspect } = makeTextTexture(text, color, 12);
+  const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest, depthWrite: false });
+  material.userData.baseOpacity = 1;
+  const sprite = new THREE.Sprite(material);
+  const height = 1.35 * scale;
+  sprite.scale.set(height * aspect, height, 1);
+  return sprite;
 }
 
-function sectionNeighborText(course, section) {
-  const idx = course.sections.findIndex((item) => item.id === section?.id);
-  const prev = idx > 0 ? course.sections[idx - 1].title : '本章起点';
-  const next = idx >= 0 && idx < course.sections.length - 1 ? course.sections[idx + 1].title : '本章终点';
-  return `前置：${prev}\n后接：${next}`;
-}
-
-function describeSelection(data) {
-  if (!data?.type) return '未选择节点';
-  if (data.type === 'course') return `教材：${data.course.title}`;
-  if (data.type === 'chapter') return `章节：${data.chapter.title}\n小节数：${data.chapter.sectionIds?.length || 0}`;
-  if (data.type === 'section') return `小节：${data.section.title}\n${sectionNeighborText(data.course, data.section)}`;
-  if (data.type === 'knowledge') return `知识点：${data.section.title} / ${data.point.label}\n${sectionNeighborText(data.course, data.section)}`;
-  if (data.type === 'control') {
-    const sectionCount = data.link?.sections?.size || 0;
-    return `可调交点：${data.point.label}\n关联边界：${sectionCount} 个小节\n按住 Shift 拖动可微调`;
+function makeKnowledgeLabel(text) {
+  if (!knowledgeLabelCache.has(text)) {
+    const { texture, aspect } = makeTextTexture(text, '#0f172a', 3);
+    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true, depthWrite: false });
+    material.userData.baseOpacity = 1;
+    material.userData.sharedMaterial = true;
+    knowledgeLabelCache.set(text, { material, aspect });
   }
-  if (data.type === 'point') return `外层点：${data.point.label}`;
-  return '未选择节点';
+  const cached = knowledgeLabelCache.get(text);
+  const sprite = new THREE.Sprite(cached.material);
+  const height = 0.46;
+  sprite.scale.set(height * cached.aspect, height, 1);
+  return sprite;
 }
 
-function chapterIndexOf(course, chapterKey) {
-  return Math.max(0, course.chapters.findIndex((chapter) => String(chapter.key) === String(chapterKey)));
+function makeShadowTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 256;
+  const context = canvas.getContext('2d');
+  const gradient = context.createRadialGradient(128, 128, 12, 128, 128, 118);
+  gradient.addColorStop(0, 'rgba(26, 39, 58, 0.34)');
+  gradient.addColorStop(0.55, 'rgba(26, 39, 58, 0.16)');
+  gradient.addColorStop(1, 'rgba(26, 39, 58, 0)');
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, 256, 256);
+  return new THREE.CanvasTexture(canvas);
 }
 
-function sectionOrdinal(course, section) {
-  const siblings = course.sections.filter((item) => String(item.chapterKey) === String(section.chapterKey));
-  return Math.max(0, siblings.findIndex((item) => item.id === section.id));
-}
+const shadowTexture = makeShadowTexture();
 
-function sectionColorFor(course, section) {
-  const chapterIndex = chapterIndexOf(course, section.chapterKey);
-  const siblings = course.sections.filter((item) => String(item.chapterKey) === String(section.chapterKey));
-  return sectionColor(chapterColor(chapterIndex), sectionOrdinal(course, section), siblings.length || 1);
-}
-
-function disposeObject(object) {
-  if (!object) return;
-  object.traverse((child) => {
-    if (child.geometry) child.geometry.dispose();
+function clearDynamicGroup(group) {
+  while (group.children.length) {
+    const child = group.children.pop();
+    if (!child.userData?.sharedGeometry) child.geometry?.dispose();
     const materials = child.material ? (Array.isArray(child.material) ? child.material : [child.material]) : [];
     materials.forEach((material) => {
-      ['map', 'bumpMap', 'alphaMap', 'normalMap', 'roughnessMap'].forEach((key) => {
-        if (material[key] && !material[key].userData?.sharedRegionTexture) material[key].dispose();
-      });
+      if (material.userData?.sharedMaterial) return;
+      material.map?.dispose();
       material.dispose();
     });
+  }
+}
+
+function setLayerOpacity(group, opacity) {
+  group.visible = opacity > 0.015;
+  group.traverse((child) => {
+    const materials = child.material ? (Array.isArray(child.material) ? child.material : [child.material]) : [];
+    materials.forEach((material) => {
+      if (material.userData.baseOpacity === undefined) material.userData.baseOpacity = material.opacity ?? 1;
+      material.opacity = material.userData.baseOpacity * opacity;
+      material.transparent = true;
+      material.depthWrite = false;
+    });
   });
 }
 
-function removeFromParent(object) {
-  if (object?.parent) object.parent.remove(object);
-  disposeObject(object);
-}
-
-function createSectionVisual(courseGroup, section, sectionIndex) {
-  const vectors = pathVectors(section.path);
-  const color = sectionColorFor(courseGroup.course, section);
-  const objects = [];
-  const sectionLift = 1.018 + (sectionIndex % 48) * 0.00012;
-  const patch = createSphericalPatch(vectors, color.getHex(), 1, 8, sectionLift);
-  if (patch) {
-    patch.renderOrder = 20;
-    patch.userData = { type: 'section', course: courseGroup.course, section };
-    rememberOpacity(patch);
-    courseGroup.sections.add(patch);
-    objects.push(patch);
-  }
-  const groove = createGroove(vectors, 0x101820, 0.05);
-  if (groove) {
-    groove.renderOrder = 40;
-    groove.userData = { type: 'section', course: courseGroup.course, section };
-    rememberOpacity(groove);
-    courseGroup.sections.add(groove);
-    objects.push(groove);
-  }
-  const highlight = createBoundaryLine(vectors, 0xffffff);
-  if (highlight) {
-    highlight.renderOrder = 45;
-    highlight.material.opacity = 0.20;
-    highlight.userData = { type: 'section', course: courseGroup.course, section };
-    rememberOpacity(highlight);
-    courseGroup.sections.add(highlight);
-    objects.push(highlight);
-  }
-  if (vectors.length) {
-    const scale = fitLabelScale(section.title, vectors, 0.52, 0.92);
-    const label = makeSurfaceLabel(section.title, readableTextColor(color), scale);
-    label.renderOrder = 60;
-    placeSurfaceObject(label, labelAnchor(vectors), 1.074);
-    markSurfaceLabel(label, { type: 'section', course: courseGroup.course, section }, 2);
-    rememberOpacity(label);
-    courseGroup.sectionLabels.add(label);
-    objects.push(label);
-  }
-  section.__visualObjects = objects;
-  section.__visualIndex = sectionIndex;
-}
-
-function rebuildSectionVisual(course, section) {
-  const courseGroup = courseGroups.find((item) => item.course === course);
-  if (!courseGroup || !section) return;
-  (section.__visualObjects || []).forEach(removeFromParent);
-  createSectionVisual(courseGroup, section, section.__visualIndex || course.sections.indexOf(section));
-}
-
-function buildControlLinks(course) {
-  const links = [];
-  const byPoint = new Map();
-  (course.points || []).forEach((point) => {
-    const refs = [];
-    const sections = new Set();
-    (course.sections || []).forEach((section) => {
-      (section.path || []).forEach((pathPoint) => {
-        if (sourceDistance(point, pathPoint) <= controlMatchEps) {
-          refs.push({ section, point: pathPoint });
-          sections.add(section);
-        }
-      });
-    });
-    if (!refs.length) return;
-    const link = { point, refs, sections };
-    links.push(link);
-    byPoint.set(point, link);
+function buildVertexUsage(course) {
+  const usage = new Map(course.vertices.map((vertex) => [vertex.id, new Set()]));
+  [...course.chapters, ...course.sections].forEach((region) => {
+    region.vertexIds.forEach((vertexId) => usage.get(vertexId)?.add(region));
   });
-  course.__controlLinks = links;
-  course.__controlLinkByPoint = byPoint;
-  return links;
+  course.__vertexUsage = usage;
 }
 
-function applyPointMove(course, point, localVector) {
-  if (!course || !point) return;
-  const link = course.__controlLinkByPoint?.get(point);
-  const changedSections = new Set();
-  vectorToSource(localVector, point);
-  if (link) {
-    link.refs.forEach((ref) => {
-      vectorToSource(localVector, ref.point);
-      changedSections.add(ref.section);
+function buildOuterPoints(courseGroup) {
+  const { course, outer } = courseGroup;
+  const stride = Math.max(1, Math.ceil(course.vertices.length / 8));
+  course.vertices.forEach((point, index) => {
+    if (index % stride !== 0 && index !== course.vertices.length - 1) return;
+    const material = new THREE.MeshStandardMaterial({
+      color: 0xf8fbff,
+      emissive: new THREE.Color(course.color),
+      emissiveIntensity: index % 2 ? 0.18 : 0.28,
+      roughness: 0.46,
+      metalness: 0.02,
+      transparent: true
     });
+    const dot = new THREE.Mesh(outerGeometry, material);
+    dot.userData = { type: 'point', course, point, sharedGeometry: true };
+    dot.position.copy(sourceToVector(point, radius + 0.82));
+    outer.add(dot);
+  });
+}
+
+function buildHandles(courseGroup) {
+  const { course, handles } = courseGroup;
+  course.vertices.forEach((point) => {
+    const material = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      emissive: 0x1677ff,
+      emissiveIntensity: 0.45,
+      roughness: 0.34,
+      transparent: true
+    });
+    const handle = new THREE.Mesh(handleGeometry, material);
+    handle.userData = { type: 'control', course, point, sharedGeometry: true };
+    handle.position.copy(sourceToVector(point, radius + 0.46));
+    handle.renderOrder = 12;
+    handles.add(handle);
+  });
+}
+
+function ensureKnowledge(section, course) {
+  const layout = regionLayout(course, section);
+  const boundary = sampleClosedBoundary(course, section, 6, 1);
+  if (!section.knowledge.length) {
+    section.knowledge = [0, 1, 2].map((index) => ({
+      id: `${section.id}-knowledge-${index + 1}`,
+      label: `K${index + 1}`,
+      generated: true
+    }));
   }
-  syncPointObjects(course, point);
-  changedSections.forEach((section) => rebuildSectionVisual(course, section));
+  section.knowledge.forEach((point, index) => {
+    if (point.manual) return;
+    const target = boundary[Math.floor(((index + 0.65) / section.knowledge.length) * boundary.length) % boundary.length];
+    const direction = target ? slerpUnit(layout.anchor, target, index === 0 ? 0.18 : 0.34) : layout.anchor;
+    vectorToSource(direction.multiplyScalar(radius), point, radius);
+  });
+}
+
+function buildLabelsAndKnowledge(courseGroup) {
+  const {
+    course, chapterLabels, sectionLabels, knowledge, knowledgeLabels, knowledgeMaterial
+  } = courseGroup;
+  clearDynamicGroup(chapterLabels);
+  clearDynamicGroup(sectionLabels);
+  clearDynamicGroup(knowledge);
+  clearDynamicGroup(knowledgeLabels);
+
+  course.chapters.forEach((chapter) => {
+    const layout = regionLayout(course, chapter);
+    const label = makeSurfaceLabel(chapter.title, readableTextColor(chapter.__color), layout, {
+      maxChars: 8,
+      minWidth: 3.0,
+      maxWidth: 8.6,
+      radialOffset: 0.25,
+      priority: 3,
+      renderOrder: 7
+    });
+    label.userData = { ...label.userData, type: 'chapter', course, chapter };
+    chapterLabels.add(label);
+  });
+
+  course.sections.forEach((section) => {
+    const layout = regionLayout(course, section);
+    const label = makeSurfaceLabel(section.title, readableTextColor(section.__color), layout, {
+      maxChars: 9,
+      minWidth: 1.3,
+      maxWidth: 5.3,
+      radialOffset: 0.27,
+      priority: 2,
+      renderOrder: 8
+    });
+    label.userData = { ...label.userData, type: 'section', course, section };
+    sectionLabels.add(label);
+
+    ensureKnowledge(section, course);
+    section.knowledge.forEach((point) => {
+      const dot = new THREE.Mesh(knowledgeGeometry, knowledgeMaterial);
+      dot.position.copy(sourceToVector(point, radius + 0.34));
+      dot.userData = { type: 'knowledge', course, section, point, sharedGeometry: true };
+      knowledge.add(dot);
+
+      const pointLabel = makeKnowledgeLabel(point.label);
+      pointLabel.position.copy(sourceToVector(point, radius + 0.48));
+      pointLabel.userData = {
+        type: 'knowledge',
+        course,
+        section,
+        point,
+        isSurfaceLabel: true,
+        anchorLocal: pointLabel.position.clone(),
+        labelSize: { width: 0.86, height: 0.38 },
+        labelPriority: 1,
+        sharedGeometry: true
+      };
+      knowledgeLabels.add(pointLabel);
+    });
+  });
+}
+
+function buildPreviewGeometry(course) {
+  const positions = [];
+  course.edges.forEach((edge) => {
+    const startPoint = course.__vertexMap.get(edge.a);
+    const endPoint = course.__vertexMap.get(edge.b);
+    if (!startPoint || !endPoint) return;
+    const start = sourceToVector(startPoint, 1);
+    const end = sourceToVector(endPoint, 1);
+    const steps = 8;
+    for (let step = 0; step < steps; step += 1) {
+      const a = slerpUnit(start, end, step / steps).multiplyScalar(radius + 0.31);
+      const b = slerpUnit(start, end, (step + 1) / steps).multiplyScalar(radius + 0.31);
+      positions.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    }
+  });
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  return geometry;
+}
+
+function updatePreview(courseGroup) {
+  const oldGeometry = courseGroup.preview.geometry;
+  courseGroup.preview.geometry = buildPreviewGeometry(courseGroup.course);
+  oldGeometry?.dispose();
+}
+
+function updateFocusDirection(courseGroup) {
+  const layouts = courseGroup.course.chapters.map((chapter) => regionLayout(courseGroup.course, chapter));
+  const largest = layouts.reduce((best, layout) => (
+    !best || layout.clearance > best.clearance ? layout : best
+  ), null);
+  courseGroup.focusDirection = largest?.anchor.clone().normalize() || new THREE.Vector3(0, 0, 1);
 }
 
 function buildCourse(course, index) {
+  prepareCourse(course);
+  buildVertexUsage(course);
+
   const group = new THREE.Group();
   group.position.copy(overviewPosition(index));
+  group.userData.target = group.position.clone();
   root.add(group);
 
-  const base = new THREE.Mesh(
-    new THREE.SphereGeometry(radius, 128, 96),
-    new THREE.MeshStandardMaterial({
-      color: colorToThree(course.color, 0.50),
-      map: makeRegionTexture(colorToThree(course.color, 0.44).getHex(), 'base'),
-      bumpMap: makeRegionTexture(colorToThree(course.color, 0.44).getHex(), 'base'),
-      bumpScale: 0.028,
-      roughness: 0.62,
-      metalness: 0.015
-    })
-  );
+  const fields = createSemanticFields(course, renderer);
+  const material = createSemanticMaterial(fields, course.color);
+  const base = new THREE.Mesh(new THREE.SphereGeometry(radius, 192, 128), material);
   base.userData = { type: 'course', course };
-  base.renderOrder = 0;
   group.add(base);
 
+  const shadowMaterial = new THREE.MeshBasicMaterial({
+    map: shadowTexture,
+    transparent: true,
+    opacity: 0.7,
+    depthWrite: false,
+    toneMapped: false
+  });
+  const shadow = new THREE.Mesh(new THREE.PlaneGeometry(19, 19), shadowMaterial);
+  shadow.rotation.x = -Math.PI / 2;
+  shadow.position.y = -radius - 0.48;
+  shadow.renderOrder = -1;
+  group.add(shadow);
+
   const outer = new THREE.Group();
-  const chapters = new THREE.Group();
   const chapterLabels = new THREE.Group();
-  const sections = new THREE.Group();
   const sectionLabels = new THREE.Group();
   const knowledge = new THREE.Group();
   const knowledgeLabels = new THREE.Group();
   const handles = new THREE.Group();
-  group.add(outer, chapters, chapterLabels, sections, sectionLabels, knowledge, knowledgeLabels, handles);
+  group.add(outer, chapterLabels, sectionLabels, knowledge, knowledgeLabels, handles);
 
-  course.points.forEach((point, pointIndex) => {
-    const dot = new THREE.Mesh(
-      new THREE.SphereGeometry(pointIndex % 7 === 0 ? 0.23 : 0.15, 18, 14),
-      new THREE.MeshStandardMaterial({ color: colorToThree(course.color, pointIndex % 7 === 0 ? -0.16 : 0.12) })
-    );
-    dot.position.copy(sourceToVector(point, radius * 1.095));
-    dot.userData = { type: 'point', course, point };
-    outer.add(dot);
+  const previewMaterial = new THREE.LineBasicMaterial({
+    color: 0x0b76d1,
+    transparent: true,
+    opacity: 0.84,
+    depthTest: true,
+    depthWrite: false
   });
+  previewMaterial.userData.baseOpacity = 0.84;
+  const preview = new THREE.LineSegments(buildPreviewGeometry(course), previewMaterial);
+  preview.renderOrder = 10;
+  group.add(preview);
 
-  course.chapters.forEach((chapter, chapterIndex) => {
-    const vectors = pathVectors(chapter.path);
-    const patchColor = chapterColor(chapterIndex);
-    const patch = createSphericalPatch(vectors, new THREE.Color(patchColor).getHex(), 1, 10, 1.006 + chapterIndex * 0.00015);
-    if (patch) {
-      patch.renderOrder = 10;
-      patch.userData = { type: 'chapter', course, chapter };
-      rememberOpacity(patch);
-      chapters.add(patch);
-    }
-    const groove = createGroove(vectors, 0x0f172a, 0.072);
-    if (groove) {
-      groove.renderOrder = 35;
-      groove.userData = { type: 'chapter', course, chapter };
-      rememberOpacity(groove);
-      chapters.add(groove);
-    }
-    const line = createBoundaryLine(vectors, 0xffffff);
-    if (line) {
-      line.renderOrder = 38;
-      line.material.opacity = 0.22;
-      rememberOpacity(line);
-      chapters.add(line);
-    }
-    if (vectors.length) {
-      const scale = fitLabelScale(chapter.title, vectors, 1.08, 1.72);
-      const label = makeSurfaceLabel(chapter.title, readableTextColor(patchColor), scale);
-      label.renderOrder = 58;
-      placeSurfaceObject(label, labelAnchor(vectors), 1.094);
-      markSurfaceLabel(label, { type: 'chapter', course, chapter }, 3);
-      rememberOpacity(label);
-      chapterLabels.add(label);
-    }
+  const knowledgeMaterial = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(course.color).lerp(new THREE.Color(0x07111f), 0.44),
+    emissive: new THREE.Color(course.color),
+    emissiveIntensity: 0.14,
+    roughness: 0.45,
+    transparent: true
   });
+  knowledgeMaterial.userData.sharedMaterial = true;
+  knowledgeMaterial.userData.baseOpacity = 1;
 
-  course.sections.forEach((section, sectionIndex) => {
-    createSectionVisual({ course, sections, sectionLabels }, section, sectionIndex);
-
-    (section.knowledge || []).forEach((point) => {
-      const dot = new THREE.Mesh(
-        new THREE.SphereGeometry(0.11, 14, 10),
-        new THREE.MeshStandardMaterial({ color: colorToThree(course.color, -0.3) })
-      );
-      dot.position.copy(sourceToVector(point, radius * 1.12));
-      dot.userData = { type: 'knowledge', course, section, point };
-      rememberOpacity(dot);
-      knowledge.add(dot);
-
-      const label = makeSurfaceLabel(point.label, '#0f172a', 0.35);
-      label.renderOrder = 62;
-      placeSurfaceObject(label, sourceToVector(point), 1.14);
-      markSurfaceLabel(label, { type: 'knowledge', course, section, point }, 1);
-      rememberOpacity(label);
-      knowledgeLabels.add(label);
-    });
-  });
-
-  buildControlLinks(course).forEach((link) => {
-    const handle = new THREE.Mesh(
-      new THREE.SphereGeometry(0.145, 16, 12),
-      new THREE.MeshStandardMaterial({
-        color: 0xffffff,
-        emissive: 0x2563eb,
-        emissiveIntensity: 0.35,
-        roughness: 0.42
-      })
-    );
-    handle.position.copy(sourceToVector(link.point, radius * 1.108));
-    handle.userData = { type: 'control', course, point: link.point, link };
-    rememberOpacity(handle);
-    handles.add(handle);
-  });
-
-  const title = makeBillboardLabel(course.title, '#101820', 1.16);
-  title.position.set(0, radius * 1.72, 0);
+  const title = makeBillboardLabel(course.title, '#101820', 1.55, false);
+  title.position.set(0, radius * 1.52, 0);
   title.userData = { type: 'course', course };
   group.add(title);
 
-  courseGroups.push({
+  const courseGroup = {
     course,
     group,
     base,
+    material,
+    fields,
+    shadow,
     outer,
-    chapters,
     chapterLabels,
-    sections,
     sectionLabels,
     knowledge,
     knowledgeLabels,
     handles,
+    preview,
+    knowledgeMaterial,
     title
-  });
+  };
+  buildOuterPoints(courseGroup);
+  buildHandles(courseGroup);
+  buildLabelsAndKnowledge(courseGroup);
+  updateFocusDirection(courseGroup);
+  courseGroups.push(courseGroup);
 }
 
 data.courses.forEach(buildCourse);
 
-function setLod(level) {
-  lodLabel.textContent = `LOD ${level}`;
-  currentLodLevel = level;
+function rebuildCourseVisuals(courseGroup) {
+  invalidateCourseLayouts(courseGroup.course);
+  const nextFields = createSemanticFields(courseGroup.course, renderer);
+  updateMaterialFields(courseGroup.material, nextFields);
+  disposeSemanticFields(courseGroup.fields);
+  courseGroup.fields = nextFields;
+  buildLabelsAndKnowledge(courseGroup);
+  updateFocusDirection(courseGroup);
+  updatePreview(courseGroup);
 }
 
-function updateLayerBlend(dist) {
-  const titleAlpha = smoothstep(74, 92, dist);
-  const outerAlpha = smoothstep(26, 36, dist);
-  const chapterAlpha = dist > 54 && dist < 90 ? 1 : 0;
-  const sectionAlpha = dist <= 54 ? 1 : 0;
-  const sectionLabelAlpha = 1 - smoothstep(24, 42, dist);
-  const knowledgeAlpha = 1 - smoothstep(22, 32, dist);
+function queueCourseRebuild(courseGroup, delay = 180) {
+  clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(() => {
+    rebuildTimer = null;
+    rebuildCourseVisuals(courseGroup);
+  }, delay);
+}
+
+function setLod(level) {
+  if (currentLodLevel === level && lodLabel.textContent === `LOD ${level}`) return;
+  currentLodLevel = level;
+  lodLabel.textContent = `LOD ${level}`;
+}
+
+function updateLayerBlend(distance) {
+  const regionReveal = 1 - smoothstep(78, 92, distance);
+  const sectionBlend = 1 - smoothstep(43, 56, distance);
+  const knowledgeAlpha = 1 - smoothstep(24, 31, distance);
+  const outerAlpha = smoothstep(24, 31, distance);
+  const titleAlpha = smoothstep(74, 94, distance);
+  const chapterLabelAlpha = regionReveal * (1 - sectionBlend);
+  const sectionLabelAlpha = regionReveal * sectionBlend;
   const handleAlpha = editMode ? 0.96 : 0;
+
   courseGroups.forEach((item) => {
+    item.material.uniforms.uRegionReveal.value = regionReveal;
+    item.material.uniforms.uSectionBlend.value = sectionBlend;
     setLayerOpacity(item.outer, outerAlpha);
-    setLayerOpacity(item.chapters, chapterAlpha);
-    setLayerOpacity(item.chapterLabels, chapterAlpha);
-    setLayerOpacity(item.sections, sectionAlpha);
-    setLayerOpacity(item.sectionLabels, Math.max(sectionAlpha * 0.42, sectionLabelAlpha));
+    setLayerOpacity(item.chapterLabels, chapterLabelAlpha);
+    setLayerOpacity(item.sectionLabels, sectionLabelAlpha);
     setLayerOpacity(item.knowledge, knowledgeAlpha);
     setLayerOpacity(item.knowledgeLabels, knowledgeAlpha);
     setLayerOpacity(item.handles, handleAlpha);
+    setLayerOpacity(item.preview, handleAlpha);
     setLayerOpacity(item.title, titleAlpha);
   });
 }
 
 function updateLod() {
-  const dist = camera.position.distanceTo(controls.target);
-  const level = dist > 82 ? 0 : dist > 43 ? 1 : dist > 25 ? 2 : 3;
+  const distance = camera.position.distanceTo(controls.target);
+  const level = distance > 82 ? 0 : distance > 48 ? 1 : distance > 28 ? 2 : 3;
   setLod(level);
-  updateLayerBlend(dist);
-}
-
-function firstMaterial(object) {
-  const material = object.material;
-  return Array.isArray(material) ? material[0] : material;
-}
-
-function rectsOverlap(a, b) {
-  return Math.abs(a.x - b.x) * 2 < a.w + b.w && Math.abs(a.y - b.y) * 2 < a.h + b.h;
+  updateLayerBlend(distance);
 }
 
 function labelScreenRect(label, courseGroup) {
-  const material = firstMaterial(label);
+  const material = Array.isArray(label.material) ? label.material[0] : label.material;
   if (!label.userData?.isSurfaceLabel || !material || material.opacity < 0.12) return null;
-
-  const world = new THREE.Vector3();
+  const localAnchor = label.userData.anchorLocal;
+  if (!localAnchor) return null;
+  const world = courseGroup.group.localToWorld(localAnchor.clone());
   const center = new THREE.Vector3();
-  label.getWorldPosition(world);
   courseGroup.group.getWorldPosition(center);
   const normal = world.clone().sub(center).normalize();
   const view = camera.position.clone().sub(world).normalize();
-  if (normal.dot(view) < 0.28) return null;
-
+  if (normal.dot(view) < 0.25) return null;
   const projected = world.clone().project(camera);
   if (Math.abs(projected.x) > 1.08 || Math.abs(projected.y) > 1.08 || projected.z < -1 || projected.z > 1) return null;
-
-  const size = label.userData.labelSize || { width: 4.8, height: 1.45 };
+  const size = label.userData.labelSize || { width: 1, height: 0.4 };
   const distance = Math.max(1, camera.position.distanceTo(world));
-  const pxPerWorld = renderer.domElement.clientHeight / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * distance);
+  const pixelsPerWorld = renderer.domElement.clientHeight
+    / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * distance);
   return {
     x: (projected.x * 0.5 + 0.5) * renderer.domElement.clientWidth,
     y: (-projected.y * 0.5 + 0.5) * renderer.domElement.clientHeight,
-    w: size.width * pxPerWorld * 1.18,
-    h: size.height * pxPerWorld * 1.35,
+    w: size.width * pixelsPerWorld * 1.08,
+    h: size.height * pixelsPerWorld * 1.25,
     priority: label.userData.labelPriority || 0,
     opacity: material.opacity,
     label
   };
 }
 
+function rectsOverlap(a, b) {
+  return Math.abs(a.x - b.x) * 2 < a.w + b.w && Math.abs(a.y - b.y) * 2 < a.h + b.h;
+}
+
 function updateSurfaceLabelVisibility() {
   const entries = [];
   courseGroups.forEach((courseGroup) => {
     if (!courseGroup.group.visible) return;
+    courseGroup.group.updateMatrixWorld();
     [
       ...courseGroup.chapterLabels.children,
       ...courseGroup.sectionLabels.children,
@@ -815,45 +620,13 @@ function updateSurfaceLabelVisibility() {
       entries.push(rect);
     });
   });
-
-  entries.sort((a, b) => (
-    b.priority - a.priority ||
-    b.opacity - a.opacity ||
-    b.w * b.h - a.w * a.h
-  ));
-
+  entries.sort((a, b) => b.priority - a.priority || b.opacity - a.opacity || b.w * b.h - a.w * a.h);
   const accepted = [];
   entries.forEach((entry) => {
     const overlaps = accepted.some((item) => rectsOverlap(entry, item));
     entry.label.visible = !overlaps;
     if (!overlaps) accepted.push(entry);
   });
-}
-
-function focusCourse(courseId) {
-  const previousCourseId = selectedCourse?.course.id || null;
-  selectedCourse = courseGroups.find((item) => item.course.id === courseId) || null;
-  const changedFocus = previousCourseId !== (selectedCourse?.course.id || null);
-  courseGroups.forEach((item, index) => {
-    item.group.visible = !selectedCourse || item === selectedCourse;
-    item.group.userData.target = selectedCourse
-      ? new THREE.Vector3(item === selectedCourse ? 0 : (index < 2 ? -82 : 82), 0, selectedCourse && item !== selectedCourse ? -34 : 0)
-      : overviewPosition(index);
-  });
-  if (selectedCourse) {
-    courseTitle.textContent = selectedCourse.course.title;
-    if (changedFocus) {
-      controls.target.set(0, 0, 0);
-      camera.position.set(0, 7, focusDistance);
-    }
-  } else {
-    courseTitle.textContent = '四个教材';
-    if (changedFocus) {
-      controls.target.set(0, 0, 0);
-      camera.position.set(0, 10, currentOverviewDistance());
-    }
-  }
-  renderTabs();
 }
 
 function renderTabs() {
@@ -863,44 +636,74 @@ function renderTabs() {
     button.type = 'button';
     button.textContent = course.title;
     button.className = selectedCourse?.course.id === course.id ? 'active' : '';
+    button.setAttribute('aria-pressed', selectedCourse?.course.id === course.id ? 'true' : 'false');
     button.addEventListener('click', () => focusCourse(course.id));
     tabsEl.appendChild(button);
   });
 }
 
-function selectNode(object) {
-  const item = object?.userData;
+function focusCourse(courseId) {
+  const previousId = selectedCourse?.course.id || null;
+  selectedCourse = courseGroups.find((item) => item.course.id === courseId) || null;
+  const changed = previousId !== (selectedCourse?.course.id || null);
+  courseGroups.forEach((item, index) => {
+    item.group.visible = !selectedCourse || item === selectedCourse;
+    item.group.userData.target = selectedCourse
+      ? new THREE.Vector3(item === selectedCourse ? 0 : (index < 2 ? -82 : 82), 0, item === selectedCourse ? 0 : -34)
+      : overviewPosition(index);
+  });
+  if (selectedCourse) {
+    courseTitle.textContent = selectedCourse.course.title;
+    if (changed) {
+      controls.target.set(0, 0, 0);
+      const horizontal = selectedCourse.focusDirection.clone();
+      horizontal.y = 0;
+      if (horizontal.lengthSq() < 0.01) horizontal.set(0, 0, 1);
+      horizontal.normalize().multiplyScalar(Math.sqrt(focusDistance * focusDistance - 49));
+      camera.position.copy(horizontal);
+      camera.position.y = 7;
+    }
+  } else {
+    courseTitle.textContent = '四个教材';
+    selectionText.textContent = '未选择节点';
+    if (changed) {
+      controls.target.set(0, 0, 0);
+      camera.position.set(0, 10, currentOverviewDistance());
+    }
+  }
+  renderTabs();
+}
+
+function sectionNeighborText(course, section) {
+  const siblings = course.sections.filter((item) => item.chapterId === section.chapterId);
+  const index = siblings.findIndex((item) => item.id === section.id);
+  const previous = index > 0 ? siblings[index - 1].title : '本章起点';
+  const next = index >= 0 && index < siblings.length - 1 ? siblings[index + 1].title : '本章终点';
+  return `前置：${previous}\n后接：${next}`;
+}
+
+function describeSelection(item) {
+  if (!item?.type) return '未选择节点';
+  if (item.type === 'course') return `教材：${item.course.title}`;
+  if (item.type === 'chapter') return `章节：${item.chapter.title}\n小节数：${item.chapter.sectionIds.length}`;
+  if (item.type === 'section') return `小节：${item.section.title}\n${sectionNeighborText(item.course, item.section)}`;
+  if (item.type === 'knowledge') return `知识点：${item.section.title} / ${item.point.label}\n${sectionNeighborText(item.course, item.section)}`;
+  if (item.type === 'control') {
+    const count = item.course.__vertexUsage.get(item.point.id)?.size || 0;
+    return `可调交点：${item.point.label}\n关联区域：${count} 个\n按住 Shift 拖动可微调`;
+  }
+  if (item.type === 'point') return `外层点：${item.point.label}`;
+  return '未选择节点';
+}
+
+function selectNode(item, object = null) {
   if (!item?.type) return;
   selectedNode = { ...item, object };
   selectionText.textContent = describeSelection(item);
-  const editablePoint = item.point;
-  if (editablePoint) {
-    phiInput.value = editablePoint.phi || 0;
-    psiInput.value = editablePoint.psi || 0;
+  if (item.point) {
+    phiInput.value = item.point.phi || 0;
+    psiInput.value = item.point.psi || 0;
   }
-}
-
-function syncPointObjects(course, point) {
-  const group = courseGroups.find((item) => item.course === course);
-  if (!group || !point) return;
-  group.outer.children.forEach((child) => {
-    if (child.userData?.point === point) child.position.copy(sourceToVector(point, radius * 1.095));
-  });
-  group.knowledge.children.forEach((child) => {
-    if (child.userData?.point === point) child.position.copy(sourceToVector(point, radius * 1.12));
-  });
-  group.knowledgeLabels.children.forEach((child) => {
-    if (child.userData?.point === point) placeSurfaceObject(child, sourceToVector(point), 1.14);
-  });
-  group.handles.children.forEach((child) => {
-    if (child.userData?.point === point) child.position.copy(sourceToVector(point, radius * 1.105));
-  });
-}
-
-function updateSelectedPoint() {
-  if (!selectedNode?.point) return;
-  const local = sphericalToVector(Number(phiInput.value), Number(psiInput.value), radius);
-  applyPointMove(selectedNode.course, selectedNode.point, local);
 }
 
 function setPointer(event) {
@@ -912,39 +715,74 @@ function setPointer(event) {
 
 function raycastScene(event) {
   setPointer(event);
-  const visibleGroups = courseGroups.filter((item) => item.group.visible);
-  const targets = visibleGroups.flatMap((item) => [
-    item.base,
-    item.title,
-    ...item.outer.children,
-    ...item.chapters.children,
-    ...item.chapterLabels.children,
-    ...item.sections.children,
-    ...item.sectionLabels.children,
+  const visible = courseGroups.filter((item) => item.group.visible);
+  const targets = visible.flatMap((item) => [
+    ...(editMode ? item.handles.children : []),
     ...item.knowledge.children,
-    ...item.knowledgeLabels.children,
-    ...(editMode ? item.handles.children : [])
+    ...item.outer.children,
+    item.base
   ]);
-  return raycaster.intersectObjects(targets, false)[0];
+  const hit = raycaster.intersectObjects(targets, false)[0];
+  if (!hit) return null;
+  const courseGroup = visible.find((item) => item.course === hit.object.userData?.course);
+  if (!courseGroup) return null;
+  let item = hit.object.userData;
+  if (hit.object === courseGroup.base && selectedCourse === courseGroup) {
+    const localDirection = courseGroup.group.worldToLocal(hit.point.clone()).normalize();
+    if (currentLodLevel >= 2) {
+      const section = findRegionAtDirection(courseGroup.course, courseGroup.course.sections, localDirection);
+      if (section) item = { type: 'section', course: courseGroup.course, section };
+    } else if (currentLodLevel === 1) {
+      const chapter = findRegionAtDirection(courseGroup.course, courseGroup.course.chapters, localDirection);
+      if (chapter) item = { type: 'chapter', course: courseGroup.course, chapter };
+    }
+  }
+  return { hit, courseGroup, item };
+}
+
+function syncPointObjects(courseGroup, point) {
+  courseGroup.outer.children.forEach((child) => {
+    if (child.userData.point === point) child.position.copy(sourceToVector(point, radius + 0.82));
+  });
+  courseGroup.handles.children.forEach((child) => {
+    if (child.userData.point === point) child.position.copy(sourceToVector(point, radius + 0.46));
+  });
+  courseGroup.knowledge.children.forEach((child) => {
+    if (child.userData.point === point) child.position.copy(sourceToVector(point, radius + 0.34));
+  });
+  courseGroup.knowledgeLabels.children.forEach((child) => {
+    if (child.userData.point === point) {
+      child.position.copy(sourceToVector(point, radius + 0.48));
+      child.userData.anchorLocal = child.position.clone();
+    }
+  });
+}
+
+function applyPointMove(courseGroup, point, localVector, queueRebuild = false) {
+  vectorToSource(localVector, point, radius);
+  const isSurfaceVertex = courseGroup.course.__vertexMap.has(point.id);
+  if (!isSurfaceVertex) point.manual = true;
+  syncPointObjects(courseGroup, point);
+  if (isSurfaceVertex) {
+    invalidateCourseLayouts(courseGroup.course);
+    updatePreview(courseGroup);
+    if (queueRebuild) queueCourseRebuild(courseGroup);
+  }
+  return isSurfaceVertex;
 }
 
 renderer.domElement.addEventListener('pointerdown', (event) => {
-  const hit = raycastScene(event);
-  if (!hit) return;
-  const item = hit.object.userData;
-  if (item?.course) {
-    if (!selectedCourse || selectedCourse.course.id !== item.course.id) {
-      focusCourse(item.course.id);
-    }
-    selectNode(hit.object);
-  }
-  if (editMode && item?.point) {
+  const result = raycastScene(event);
+  if (!result) return;
+  const { hit, courseGroup, item } = result;
+  if (!selectedCourse || selectedCourse.course.id !== courseGroup.course.id) focusCourse(courseGroup.course.id);
+  selectNode(item, hit.object);
+  if (editMode && item.point) {
     draggingPoint = {
-      course: item.course,
+      courseGroup,
       point: item.point,
-      section: item.section,
-      type: item.type,
-      startVector: sourceToVector(item.point, radius)
+      startVector: sourceToVector(item.point, radius),
+      surfaceChanged: false
     };
     controls.enabled = false;
     renderer.domElement.setPointerCapture(event.pointerId);
@@ -954,36 +792,51 @@ renderer.domElement.addEventListener('pointerdown', (event) => {
 renderer.domElement.addEventListener('pointermove', (event) => {
   if (!draggingPoint) return;
   setPointer(event);
-  const group = courseGroups.find((item) => item.course === draggingPoint.course);
-  if (!group) return;
   const center = new THREE.Vector3();
-  group.group.getWorldPosition(center);
+  draggingPoint.courseGroup.group.getWorldPosition(center);
   const hit = new THREE.Vector3();
-  const ok = raycaster.ray.intersectSphere(new THREE.Sphere(center, radius * 1.12), hit);
-  if (!ok) return;
-  const targetLocal = group.group.worldToLocal(hit.clone()).normalize().multiplyScalar(radius);
+  const intersects = raycaster.ray.intersectSphere(new THREE.Sphere(center, radius + 0.48), hit);
+  if (!intersects) return;
+  const localTarget = draggingPoint.courseGroup.group.worldToLocal(hit.clone()).normalize().multiplyScalar(radius);
   const local = event.shiftKey
-    ? slerpUnit(draggingPoint.startVector, targetLocal, 0.18).multiplyScalar(radius)
-    : targetLocal;
-  applyPointMove(draggingPoint.course, draggingPoint.point, local);
+    ? slerpUnit(draggingPoint.startVector, localTarget, 0.18).multiplyScalar(radius)
+    : localTarget;
+  draggingPoint.surfaceChanged = applyPointMove(draggingPoint.courseGroup, draggingPoint.point, local) || draggingPoint.surfaceChanged;
   phiInput.value = draggingPoint.point.phi;
   psiInput.value = draggingPoint.point.psi;
 });
 
-renderer.domElement.addEventListener('pointerup', (event) => {
-  if (draggingPoint) {
-    draggingPoint = null;
-    controls.enabled = true;
-    if (renderer.domElement.hasPointerCapture(event.pointerId)) {
-      renderer.domElement.releasePointerCapture(event.pointerId);
-    }
-  }
-});
+function finishPointerDrag(event) {
+  if (!draggingPoint) return;
+  if (draggingPoint.surfaceChanged) rebuildCourseVisuals(draggingPoint.courseGroup);
+  draggingPoint = null;
+  controls.enabled = true;
+  if (renderer.domElement.hasPointerCapture(event.pointerId)) renderer.domElement.releasePointerCapture(event.pointerId);
+}
+
+renderer.domElement.addEventListener('pointerup', finishPointerDrag);
+renderer.domElement.addEventListener('pointercancel', finishPointerDrag);
+
+function updateSelectedPoint() {
+  if (!selectedNode?.point || !selectedNode?.course) return;
+  const courseGroup = courseGroups.find((item) => item.course === selectedNode.course);
+  if (!courseGroup) return;
+  const phi = Number(phiInput.value);
+  const psi = Number(psiInput.value);
+  const cp = Math.cos(psi);
+  const local = new THREE.Vector3(
+    radius * cp * Math.cos(phi),
+    radius * Math.sin(psi),
+    radius * cp * Math.sin(phi)
+  );
+  applyPointMove(courseGroup, selectedNode.point, local, true);
+}
 
 overviewBtn.addEventListener('click', () => focusCourse(null));
 editBtn.addEventListener('click', () => {
   editMode = !editMode;
   editBtn.classList.toggle('active', editMode);
+  editBtn.setAttribute('aria-pressed', editMode ? 'true' : 'false');
   editorEl.classList.toggle('hidden', !editMode);
 });
 phiInput.addEventListener('input', updateSelectedPoint);
@@ -991,13 +844,24 @@ psiInput.addEventListener('input', updateSelectedPoint);
 document.querySelectorAll('[data-nudge]').forEach((button) => {
   button.addEventListener('click', () => {
     if (!selectedNode?.point) return;
-    const step = 0.04;
+    const step = 0.025;
     if (button.dataset.nudge === 'left') phiInput.value = Number(phiInput.value) - step;
     if (button.dataset.nudge === 'right') phiInput.value = Number(phiInput.value) + step;
     if (button.dataset.nudge === 'up') psiInput.value = Number(psiInput.value) + step;
     if (button.dataset.nudge === 'down') psiInput.value = Number(psiInput.value) - step;
     updateSelectedPoint();
   });
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  if (!selectedCourse) {
+    courseGroups.forEach((item, index) => {
+      item.group.userData.target = overviewPosition(index);
+    });
+  }
 });
 
 function animate() {
@@ -1012,24 +876,9 @@ function animate() {
   renderer.render(scene, camera);
 }
 
-window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  if (!selectedCourse) {
-    courseGroups.forEach((item, index) => {
-      item.group.userData.target = overviewPosition(index);
-    });
-    camera.position.set(0, 10, currentOverviewDistance());
-  }
-});
-
-camera.position.set(0, 10, currentOverviewDistance());
 renderTabs();
-const initialCourseId = new URLSearchParams(window.location.search).get('course');
-if (initialCourseId && data.courses.some((course) => course.id === initialCourseId)) {
-  focusCourse(initialCourseId);
-} else {
-  setLod(0);
-}
+const queryCourse = new URLSearchParams(window.location.search).get('course');
+if (queryCourse && data.courses.some((course) => course.id === queryCourse)) focusCourse(queryCourse);
+else focusCourse(null);
+window.__courseSphereDebug = { camera, controls, courseGroups, renderer, scene };
 animate();
