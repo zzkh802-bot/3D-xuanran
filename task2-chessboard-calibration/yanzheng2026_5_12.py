@@ -592,6 +592,57 @@ def _trim_sparse_border_grid(img_pts, world_pts, min_fill=0.45, min_points=9):
     return img_pts, world_pts
 
 
+def interpolate_missing_grid_points(img_pts, world_pts, min_neighbors=3):
+    """根据已检测的棋盘格网格，对内部缺失的网格点进行单应插值填补。
+    仅当缺失点至少有 min_neighbors 个已检测的 4-邻接邻居时才添加，
+    以减少在反光/低对比区域引入错误点的风险。
+    """
+    img_pts, world_pts = _unique_world_points(img_pts, world_pts)
+    if len(img_pts) < 6:
+        return img_pts, world_pts
+    snapped = np.round(world_pts / 15.0).astype(int)
+    existing = set(map(tuple, snapped))
+    cols = np.unique(snapped[:, 0])
+    rows = np.unique(snapped[:, 1])
+    if len(cols) < 2 or len(rows) < 2:
+        return img_pts, world_pts
+
+    col_min, col_max = int(cols.min()), int(cols.max())
+    row_min, row_max = int(rows.min()), int(rows.max())
+    full_cols = np.arange(col_min, col_max + 1)
+    full_rows = np.arange(row_min, row_max + 1)
+    xx, yy = np.meshgrid(full_cols, full_rows)
+    full_world = np.column_stack([xx.ravel() * 15.0, yy.ravel() * 15.0])
+
+    H = compute_homography(world_pts, img_pts)
+    if H is None:
+        return img_pts, world_pts
+    projected = _project_world_points(H, full_world)
+    if projected is None:
+        return img_pts, world_pts
+
+    new_img, new_world = [], []
+    for i, (c, r) in enumerate(zip(xx.ravel(), yy.ravel())):
+        if (c, r) in existing:
+            continue
+        # 统计 4-邻接已检测邻居数
+        neighbors = sum(
+            1 for dc, dr in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            if (c + dc, r + dr) in existing
+        )
+        if neighbors >= min_neighbors:
+            pt = projected[i]
+            if np.isfinite(pt).all():
+                new_img.append(pt)
+                new_world.append(full_world[i])
+
+    if not new_img:
+        return img_pts, world_pts
+    img_pts = np.vstack([img_pts, np.asarray(new_img, dtype=float)])
+    world_pts = np.vstack([world_pts, np.asarray(new_world, dtype=float)])
+    return _unique_world_points(img_pts, world_pts)
+
+
 def complete_chessboard_from_candidates(img_pts, world_pts, candidate_pts, min_points=9, expand_margin=1):
     img_pts, world_pts = _unique_world_points(img_pts, world_pts)
     candidate_pts = np.asarray(candidate_pts, dtype=float)
@@ -732,11 +783,319 @@ def adjust_skipped_grid_axis(img_pts, world_pts, candidate_pts, min_inside=4):
 
 
 def get_mark_cord(xc, corner, xy1, uv1, HH0, nn, spij3, spij7, jilu, xcsp, Im0, mm, img_gray):
+    """X 角点（黑白半圆标记）检测包装函数，如果失败则返回原始棋盘格结果"""
     try:
-        return get_mark_cord_m(xc, corner, xy1, uv1, HH0, nn, spij3, spij7, jilu, xcsp, Im0, mm)
+        return get_mark_cord_m(xc, corner, xy1, uv1, HH0, nn, spij3, spij7, jilu, xcsp, Im0, mm, img_gray)
     except Exception as exc:
         print(f"  警告: 标记点识别失败，保留棋盘格结果: {exc}")
         return xy1, uv1, jilu
+
+
+# ===================== X角点检测：适用于归零世界坐标 =====================
+def _detect_x_corners_on_board(img_pts, world_pts, H, all_saddle_pts, corner,
+                                h, Im0, spij3, grid_spacing=15.0,
+                                full_col_min=None, full_col_max=None,
+                                full_row_min=None, full_row_max=None):
+    """
+    在单个棋盘格上检测X形半圆标记（最多4个，分布在四个角）。
+    X标记位于棋盘格网格外侧半格处（即棋盘格白色底板的四个实际外角）。
+
+    :param full_col_min/max, full_row_min/max:
+        完整棋盘格网格范围（用于修正遮挡导致的范围收缩）。
+        若未提供，则回退到 detected 范围。
+        角点类型：1=左上, 2=右上, 3=左下, 4=右下
+    """
+    max_index = len(Im0)
+    if H is None or len(world_pts) < 4 or len(all_saddle_pts) == 0:
+        return []
+
+    # 1. 确定网格范围
+    snapped = np.round(world_pts / grid_spacing).astype(int)
+    col_min, col_max = int(np.min(snapped[:, 0])), int(np.max(snapped[:, 0]))
+    row_min, row_max = int(np.min(snapped[:, 1])), int(np.max(snapped[:, 1]))
+
+    # 如果提供了完整范围，优先使用（修正遮挡导致的范围收缩）
+    if full_col_min is not None:
+        col_min = min(col_min, full_col_min) if full_col_min > col_min else full_col_min
+    if full_col_max is not None:
+        col_max = max(col_max, full_col_max) if full_col_max < col_max else full_col_max
+    if full_row_min is not None:
+        row_min = min(row_min, full_row_min) if full_row_min > row_min else full_row_min
+    if full_row_max is not None:
+        row_max = max(row_max, full_row_max) if full_row_max < row_max else full_row_max
+
+    if col_max - col_min < 1 or row_max - row_min < 1:
+        return []
+
+    # 2. X标记世界坐标：位于棋盘格网格外侧半格处（底板实际外角）
+    corner_world = np.array([
+        [(col_min - 0.5) * grid_spacing, (row_min - 0.5) * grid_spacing],  # 1: 左上
+        [(col_max + 0.5) * grid_spacing, (row_min - 0.5) * grid_spacing],  # 2: 右上
+        [(col_min - 0.5) * grid_spacing, (row_max + 0.5) * grid_spacing],  # 3: 左下
+        [(col_max + 0.5) * grid_spacing, (row_max + 0.5) * grid_spacing],  # 4: 右下
+    ])
+    corner_types = [1, 2, 3, 4]
+
+    # 3. 投影到图像
+    projected = _project_world_points(H, corner_world)
+    if projected is None or len(projected) != 4:
+        return []
+
+    # 4. 获取棋盘格在图像中的方向（用于S值对角方向计算）
+    # 从 H 投影两个相邻世界点来确定图像中棋盘格的轴方向
+    origin_uv = _project_world_points(H, np.array([[0, 0]]))
+    x_dir_uv = _project_world_points(H, np.array([[grid_spacing, 0]]))
+    if origin_uv is None or x_dir_uv is None or len(origin_uv) == 0 or len(x_dir_uv) == 0:
+        return []
+    img_x_dir = (x_dir_uv[0] - origin_uv[0])
+    img_x_norm = float(np.linalg.norm(img_x_dir))
+    if img_x_norm < 1e-6:
+        return []
+    # 棋盘格X轴在图像中的单位方向
+    uv0_global = img_x_dir / img_x_norm
+
+    # 5. S值辅助函数（在任意像素位置计算S值对比度）
+    def _compute_s_contrast_at(cx, cy):
+        """在图像位置 (cx, cy) 计算X形标记的S值对比度。
+        使用棋盘格的轴方向来确定4个对角方向。"""
+        base_px = int(round(cx)) * h + int(round(cy))
+        if base_px < 0 or base_px >= max_index:
+            return 0.0
+        ux, uy = uv0_global[0], uv0_global[1]
+        # 4个对角方向（X形标记的4个扇区）
+        n1 = base_px - int(round(7 * uy)) * h + int(round(7 * ux))
+        n2 = base_px + int(round(7 * ux)) * h + int(round(7 * uy))
+        n3 = base_px + int(round(7 * (ux + uy))) * h + int(round(7 * (-ux + uy)))
+        n4 = base_px + int(round(7 * (ux - uy))) * h + int(round(7 * (ux + uy)))
+        s_vals = []
+        for ni in [n1, n2, n3, n4]:
+            indices = ni + spij3
+            mask = (indices >= 0) & (indices < max_index)
+            s_vals.append(float(np.sum(Im0[indices[mask]])) if np.any(mask) else 0.0)
+        smin, smax = min(s_vals), max(s_vals)
+        if smax < 1e-6:
+            return 0.0
+        return smax / (smin + 1e-9)  # 对比度
+
+    # 6. 对每个角：在投影点周围的小窗口内搜索最佳S值位置
+    jilu_found = []
+    spacing_img_val = np.mean(np.linalg.norm(
+        np.diff(img_pts[:min(4, len(img_pts))], axis=0), axis=1)) if len(img_pts) >= 2 else 20.0
+    # 搜索窗口半径：至少 10px，约半格间距（X标记可能偏离投影点达半格）
+    search_offset = max(10, int(spacing_img_val * 0.55))
+    img_w = max_index // h
+
+    for i, (proj_pt, ctype) in enumerate(zip(projected, corner_types)):
+        if not np.isfinite(proj_pt).all():
+            continue
+        px, py = float(proj_pt[0]), float(proj_pt[1])
+
+        # 阶段1：粗搜索（步长2，快速定位）
+        best_contrast = 1.3  # 较低阈值，保留更多候选
+        best_pos = None
+        for dx in range(-search_offset, search_offset + 1, 2):
+            for dy in range(-search_offset, search_offset + 1, 2):
+                cx, cy = px + dx, py + dy
+                if cx < 0 or cy < 0 or cx >= img_w or cy >= h:
+                    continue
+                contrast = _compute_s_contrast_at(cx, cy)
+                if contrast > best_contrast:
+                    best_contrast = contrast
+                    best_pos = (cx, cy)
+
+        # 阶段2：在粗搜索最佳位置附近精搜索（步长1，精度更高）
+        if best_pos is not None:
+            cx0, cy0 = best_pos
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
+                    cx, cy = cx0 + dx, cy0 + dy
+                    if cx < 0 or cy < 0 or cx >= img_w or cy >= h:
+                        continue
+                    contrast = _compute_s_contrast_at(cx, cy)
+                    if contrast > best_contrast:
+                        best_contrast = contrast
+                        best_pos = (cx, cy)
+
+        # 接受：对比度足够高且位置在图像范围内
+        if best_pos is not None and best_contrast >= 1.5:
+            jilu_found.append([ctype, best_pos[0], best_pos[1]])
+
+    return jilu_found
+
+
+# ===================== X角点遮挡推断函数（来自429(2)机制） =====================
+def _infer_missing_corners_from_partial(jilu_partial, existing_world_pts,
+                                         existing_img_pts, grid_spacing=15.0):
+    """
+    角点补全：基于已检测到的角点（1-3个，被遮挡时不足4个）和已有网格的几何关系，
+    推算出缺失角点的图像坐标。仅用于内部推算，不用于可视化。
+
+    核心思路：
+    1. 从已有网格的bbox确定棋盘格世界坐标范围
+    2. 4角点的世界坐标定义：X标记位于棋盘格网格外侧半格处（底板实际外角）
+    3. 用H_grid将4角点世界坐标投影到图像
+    4. 用已知角点对proj位置做仿射修正
+    5. 返回补全后的4角点jilu
+
+    :param jilu_partial: 部分角点记录 [mark_type, img_x, img_y]
+    :param existing_world_pts: 现有棋盘格世界坐标
+    :param existing_img_pts: 现有棋盘格图像坐标
+    :param grid_spacing: 网格间距
+    :return: 补全后的 jilu（4角点）或 None（无法补全）
+    """
+    if len(existing_img_pts) < 4 or len(existing_world_pts) < 4:
+        return None
+
+    # 1. 从已有世界坐标确定棋盘格范围
+    world_grid = np.round(existing_world_pts / grid_spacing).astype(int)
+    col_min, col_max = int(world_grid[:, 0].min()), int(world_grid[:, 0].max())
+    row_min, row_max = int(world_grid[:, 1].min()), int(world_grid[:, 1].max())
+    if col_max - col_min < 1 or row_max - row_min < 1:
+        print(f"  [角点补全] 网格太小，无法定义角点")
+        return None
+
+    # 2. X角点世界坐标：位于棋盘格网格外侧半格处（底板实际四角）
+    corner_world = {
+        1: np.array([(col_min - 0.5) * grid_spacing, (row_min - 0.5) * grid_spacing],
+                    dtype=np.float64),
+        2: np.array([(col_max + 0.5) * grid_spacing, (row_min - 0.5) * grid_spacing],
+                    dtype=np.float64),
+        3: np.array([(col_min - 0.5) * grid_spacing, (row_max + 0.5) * grid_spacing],
+                    dtype=np.float64),
+        4: np.array([(col_max + 0.5) * grid_spacing, (row_max + 0.5) * grid_spacing],
+                    dtype=np.float64),
+    }
+
+    # 3. 用已有网格点拟合 H_grid
+    H_grid = compute_homography(existing_world_pts, existing_img_pts)
+    if H_grid is None or not np.all(np.isfinite(H_grid)):
+        print(f"  [角点补全] H_grid 拟合失败")
+        return None
+
+    # 4. 提取已知角点
+    known = {}
+    for rec in jilu_partial:
+        mt = int(rec[0])
+        if mt in {1, 2, 3, 4}:
+            known[mt] = np.array([float(rec[1]), float(rec[2])])
+
+    # 5. 投影4角点世界坐标到图像
+    corner_img_proj = _project_world_points(
+        H_grid, np.array(list(corner_world.values())))
+    if corner_img_proj is None or len(corner_img_proj) != 4:
+        print(f"  [角点补全] H_grid 投影失败")
+        return None
+
+    corner_types = [1, 2, 3, 4]
+    proj_dict = {mt: corner_img_proj[i] for i, mt in enumerate(corner_types)}
+
+    # 6. 用已知角点修正 proj
+    if len(known) == 0:
+        # 没有任何角点被检测到，直接依赖网格单应性投影四角点
+        inferred = {mt: proj_dict[mt] for mt in [1, 2, 3, 4]}
+    elif len(known) == 1:
+        mt = list(known.keys())[0]
+        kp = known[mt]
+        best_proj_mt = min(proj_dict.keys(),
+                           key=lambda k: float(np.linalg.norm(proj_dict[k] - kp)))
+        offset = kp - proj_dict[best_proj_mt]
+        inferred = {mt: kp for mt in [1, 2, 3, 4]}
+        for mt in [1, 2, 3, 4]:
+            if mt not in known:
+                inferred[mt] = proj_dict[mt] + offset
+    elif len(known) == 2:
+        mts = list(known.keys())
+        kps = np.array([known[mts[0]], known[mts[1]]])
+        proj1, proj2 = proj_dict[mts[0]], proj_dict[mts[1]]
+        proj_pts = np.array([proj1, proj2])
+        delta_known = kps[1] - kps[0]
+        delta_proj = proj_pts[1] - proj_pts[0]
+        norm_k, norm_p = float(np.linalg.norm(delta_known)), float(np.linalg.norm(delta_proj))
+        if norm_p > 1e-6 and norm_k > 1e-6:
+            scale = norm_k / norm_p
+            cos_t = float(np.dot(delta_proj, delta_known) / (norm_p * norm_k + 1e-9))
+            cos_t = max(-1.0, min(1.0, cos_t))
+            sin_t = float(delta_proj[0] * delta_known[1] - delta_proj[1] * delta_known[0]) / (norm_p * norm_k + 1e-9)
+            R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+            t = kps[0] - scale * R @ proj1
+            inferred = {mt: scale * R @ proj_dict[mt] + t for mt in [1, 2, 3, 4]}
+        else:
+            offset = kps.mean(axis=0) - proj_pts.mean(axis=0)
+            inferred = {mt: proj_dict[mt] + offset for mt in [1, 2, 3, 4]}
+    elif len(known) == 3:
+        mts = list(known.keys())
+        proj_pts = np.array([proj_dict[mt] for mt in mts])
+        known_pts = np.array([known[mt] for mt in mts])
+        A_mat = np.column_stack([proj_pts, np.ones(3)])
+        try:
+            params_x, _, _, _ = np.linalg.lstsq(A_mat, known_pts[:, 0], rcond=None)
+            params_y, _, _, _ = np.linalg.lstsq(A_mat, known_pts[:, 1], rcond=None)
+            inferred = {}
+            for mt in [1, 2, 3, 4]:
+                px, py = proj_dict[mt]
+                inferred[mt] = np.array([
+                    params_x[0] * px + params_x[1] * py + params_x[2],
+                    params_y[0] * px + params_y[1] * py + params_y[2]
+                ])
+        except Exception:
+            offset = known_pts.mean(axis=0) - proj_pts.mean(axis=0)
+            inferred = {mt: proj_dict[mt] + offset for mt in [1, 2, 3, 4]}
+    else:
+        return None
+
+    # 7. 构造4元组jilu返回
+    jilu_full = [[mt, float(inferred[mt][0]), float(inferred[mt][1])]
+                 for mt in [1, 2, 3, 4]]
+    detected_ids = set(known.keys())
+    inferred_ids = {1, 2, 3, 4} - detected_ids
+    print(f"  [角点补全] 检测到{len(known)}个角点 (types={sorted(detected_ids)}), "
+          f"推断{len(inferred_ids)}个缺失角点 (types={sorted(inferred_ids)})")
+    return jilu_full
+
+
+# ===================== 修改点5: 网格拓扑数据输出 =====================
+def build_grid_topology(img_pts, world_pts, H, grid_spacing=15.0):
+    """
+    输出棋盘格的网格拓扑结构数据。
+    返回: dict 包含 grid_shape, cells 列表等
+    """
+    if len(img_pts) < 4 or H is None:
+        return None
+
+    snapped = np.round(world_pts / grid_spacing).astype(int)
+    cols = np.unique(snapped[:, 0])
+    rows = np.unique(snapped[:, 1])
+    existing = set(zip(snapped[:, 0], snapped[:, 1]))
+
+    cells = []
+    for r in range(len(rows) - 1):
+        for c in range(len(cols) - 1):
+            gc_tl = (int(cols[c]), int(rows[r]))
+            gc_tr = (int(cols[c + 1]), int(rows[r]))
+            gc_bl = (int(cols[c]), int(rows[r + 1]))
+            gc_br = (int(cols[c + 1]), int(rows[r + 1]))
+
+            has_all = all(g in existing for g in [gc_tl, gc_tr, gc_bl, gc_br])
+
+            cells.append({
+                'grid_rc': (r, c),
+                'corners_world': {
+                    'tl': (float(cols[c] * grid_spacing), float(rows[r] * grid_spacing)),
+                    'tr': (float(cols[c + 1] * grid_spacing), float(rows[r] * grid_spacing)),
+                    'bl': (float(cols[c] * grid_spacing), float(rows[r + 1] * grid_spacing)),
+                    'br': (float(cols[c + 1] * grid_spacing), float(rows[r + 1] * grid_spacing)),
+                },
+                'has_all_four': has_all
+            })
+
+    return {
+        'grid_shape': (len(rows), len(cols)),
+        'col_range': (int(cols[0]), int(cols[-1])),
+        'row_range': (int(rows[0]), int(rows[-1])),
+        'n_cells': len(cells),
+        'n_complete_cells': sum(1 for c in cells if c['has_all_four']),
+        'cells': cells,
+    }
 
 
 def sort_chessboard_points(img_pts, world_pts):
@@ -783,6 +1142,7 @@ def draw_chessboard_grid(ax, img_pts, world_pts):
         t = centered @ direction
         p0 = np.mean(pts_fit, axis=0) + np.min(t) * direction
         p1 = np.mean(pts_fit, axis=0) + np.max(t) * direction
+
         return np.vstack([p0, p1])
 
     def line_angle(segment):
@@ -1084,8 +1444,9 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     img_gray = imread_gray(img_path)
     img_gray = gaussian_filter(img_gray, sigma=0.5)
     blur_var = measure_blur_level(img_gray)
-    tau_nms = 0.02 if blur_var < 50 else 0.025
-    tau_score = 0.03 if blur_var < 50 else 0.04
+    tau_nms = 0.015 if blur_var < 50 else 0.02
+    tau_score = 0.01 if blur_var < 50 else 0.015
+    print(f"  模糊度={blur_var:.1f}, NMS阈值={tau_nms}, 评分阈值={tau_score}")
     h, w = img_gray.shape
     nn = [h, w]
     mm = h
@@ -1119,6 +1480,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     final_v1 = refined_v1[keep]
     final_v2 = refined_v2[keep]
     final_scores = scores[keep]
+    print(f"  候选点数: NMS后={len(corners_init)}, 精化后={len(refined_p)}, 评分过滤后={len(final_points)}")
     if len(final_points) == 0:
         print("警告: 评分过滤后无点，跳过")
         return True, img_path
@@ -1141,7 +1503,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     points = final_points.copy()
     # 替换原来的调用
     dirs = np.column_stack([final_v1, final_v2])
-    found_chessboards_raw = find_chessboard_candidates(points, dirs, final_scores, img_gray.shape, max_boards=3)
+    found_chessboards_raw = find_chessboard_candidates(points, dirs, final_scores, img_gray.shape, max_boards=6)
     if not found_chessboards_raw:
         print("未找到有效棋盘格")
         return False, img_path
@@ -1161,9 +1523,10 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         print(
             f"  候选棋盘: 点数 {len(img_pts)}, 线残差p90 {p90_line:.2f}, 最大残差 {worst_line:.2f}, 异常组 {bad_groups}, 质量 {quality:.2f}")
         scored_boards.append((img_pts, world_pts, H, used_idx, quality))
-    # 按质量降序，取前2个不重叠的
+    # 按质量降序，取不重叠的棋盘格（数量不限，后续由MAX_BOARDS控制总量）
     # ⚠ 重要：用图像空间重叠检查，而非世界坐标（世界坐标已归零，不同棋盘格可能
     #    巧合重叠）
+    MAX_BOARDS = 6  # 提升：从3→6，识别更多棋盘格
     scored_boards.sort(key=lambda x: x[4], reverse=True)
     final_two = []
     used_img_ranges = []
@@ -1192,24 +1555,28 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
                     overlap = True
                     break
 
-        status = "已选" if (not overlap and len(final_two) < 2) else \
-                 ("重叠跳过" if overlap else "达2上限")
+        # 质量过滤：拒绝低质量假棋盘格
+        if qual < 0.5:
+            print(f"  候选: {len(img_pts)}点 q={qual:.2f} "
+                  f"img中心=({cx:.0f},{cy:.0f}) "
+                  f"img_X[{ix_min:.0f},{ix_max:.0f}] img_Y[{iy_min:.0f},{iy_max:.0f}] "
+                  f"→ 质量过低跳过")
+            continue
+
+        status = "已选" if (not overlap) else "重叠跳过"
         print(f"  候选: {len(img_pts)}点 q={qual:.2f} "
               f"img中心=({cx:.0f},{cy:.0f}) "
               f"img_X[{ix_min:.0f},{ix_max:.0f}] img_Y[{iy_min:.0f},{iy_max:.0f}] "
               f"→ {status}")
-        if not overlap and len(final_two) < 2:
+        if not overlap:
             final_two.append((img_pts, world_pts, H, used_idx, qual))
             used_img_ranges.append((ix_min, ix_max, iy_min, iy_max))
-        if len(final_two) == 2:
-            break
 
     print(f"  不重叠棋盘格: {len(final_two)} 个")
 
     # ========== 循环传播：找最多 MAX_BOARDS 个棋盘格 ==========
     # 设计为可扩展的循环：每轮用一个已识别的棋盘格传播新棋盘
     # 用所有已识别棋盘格的合并凸包做排除
-    MAX_BOARDS = 3
     if len(final_two) >= 1 and len(final_two) < MAX_BOARDS:
         print(f"  当前已识别 {len(final_two)}/{MAX_BOARDS}，尝试传播找更多...")
 
@@ -1364,15 +1731,31 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     cleaned_final_two = []
     for img_pts, world_pts, H, used_idx, qual in final_two:
         clean_img, clean_world, clean_H = complete_chessboard_from_candidates(img_pts, world_pts, final_points)
+        before_fill = len(clean_img)
+        clean_img, clean_world = interpolate_missing_grid_points(clean_img, clean_world, min_neighbors=2)
+        if len(clean_img) != before_fill:
+            print(f"  网格插值填补: {before_fill} -> {len(clean_img)} 个交叉点")
+            clean_H = compute_homography(clean_world, clean_img)
         cleaned_final_two.append((clean_img, clean_world, clean_H if clean_H is not None else H, used_idx, qual))
     final_two = cleaned_final_two
     # 提取各棋盘格数据（支持任意数量）
     board_results = []  # [(xy, uv, jilu), ...]
     for (img_b, world_b, H_b, _, _) in final_two:
-        xy_b = np.column_stack([world_b, np.ones(len(world_b))])
-        uv_b = np.column_stack([img_b, np.ones(len(img_b))])
+        # 强制归一化为参考代码格式：2 列竖直、x∈[0,15]、y 向下增长、按行排序
+        world_n = world_b - np.min(world_b, axis=0)
+        max_r = np.max(world_n, axis=0)
+        if max_r[0] > max_r[1]:
+            world_n = world_n[:, [1, 0]]
+            world_n[:, 0] = 15.0 - world_n[:, 0]
+        order = np.lexsort((world_n[:, 0], world_n[:, 1]))
+        world_n = world_n[order]
+        img_n = img_b[order]
+        H_n = compute_homography(world_n, img_n)
+
+        xy_b = np.column_stack([world_n, np.ones(len(world_n))])
+        uv_b = np.column_stack([img_n, np.ones(len(img_n))])
         xy_b, uv_b, jilu_b = get_mark_cord(
-            final_points, corner, xy_b, uv_b, H_b,
+            final_points, corner, xy_b, uv_b, H_n,
             nn, spij3, spij7, [], xcsp, Im0, mm, img_gray)
         board_results.append((xy_b, uv_b, jilu_b))
     # 保持兼容旧变量名：取前 2 个
@@ -1431,35 +1814,128 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     # ### 修改部分 1 结束 ###
     # ========================================
 
+    # ===================== X角点：找出中央棋盘格（最靠近图像中心的棋盘格） =====================
+    center_board_idx = -1
+    center_jilu = []       # 全部角点（检测+推断），用于内部计算
+    center_detected = []   # 仅检测到的角点（可视化用）
+    center_inferred = []   # 仅推断的角点（不显示）
+
+    # 以图像中心为基准，选择最靠近中心的棋盘格作为中央棋盘格
+    img_center = np.array([img_gray.shape[1] / 2.0, img_gray.shape[0] / 2.0])
+    board_centroids = []
+    for b_idx, (im, wo, H_b, _, qual_b) in enumerate(final_two):
+        if H_b is None or len(wo) < 4 or len(im) < 4:
+            continue
+        centroid = np.mean(im[:, :2], axis=0)
+        dist = float(np.linalg.norm(centroid - img_center))
+        board_centroids.append((dist, b_idx, im, wo, H_b, qual_b))
+
+    if board_centroids:
+        board_centroids.sort(key=lambda x: x[0])
+        _, center_board_idx, center_im, center_wo, center_H, center_qual = board_centroids[0]
+
+        # 从所有棋盘格中推测最完整的网格范围（用于修正遮挡导致的范围收缩）
+        ref_col_max, ref_row_max = 0, 0
+        for (_im, _wo, _Hb, _, _) in final_two:
+            if _Hb is None or len(_wo) < 4 or len(_im) < 4:
+                continue
+            snapped_r = np.round(_wo / 15.0).astype(int)
+            rcM = int(np.max(snapped_r[:, 0]))
+            rrM = int(np.max(snapped_r[:, 1]))
+            ref_col_max = max(ref_col_max, rcM)
+            ref_row_max = max(ref_row_max, rrM)
+        # 用最大范围修正中央棋盘格（但不能小于中央棋盘的检测范围）
+        center_snapped = np.round(center_wo / 15.0).astype(int)
+        full_col_max = max(int(np.max(center_snapped[:, 0])), ref_col_max)
+        full_row_max = max(int(np.max(center_snapped[:, 1])), ref_row_max)
+
+        # 在中央棋盘格上检测X角点（优先使用参考代码 get_mark_cord 的结果，
+        # 它使用固定世界坐标 xy_add，落在实际蝴蝶形标记中心；
+        # 只有 get_mark_cord 未检测到任何角点时才回退到网格外推检测）
+        jilu_b = board_results[center_board_idx][2]
+        if len(jilu_b) > 0:
+            print(f"  使用 get_mark_cord 检测到的X角点: {jilu_b}")
+        else:
+            print(f"  get_mark_cord 未检测到X角点，回退到 _detect_x_corners_on_board")
+            jilu_b = _detect_x_corners_on_board(
+                center_im, center_wo, center_H, final_points, corner, h, Im0, spij3,
+                grid_spacing=15.0,
+                full_col_min=0, full_col_max=full_col_max,
+                full_row_min=0, full_row_max=full_row_max)
+            print(f"  [_detect_x_corners_on_board] jilu_b={jilu_b}")
+        center_detected = [rec for rec in jilu_b]
+        center_jilu = jilu_b
+
+        # 不足4个X角点：推断缺失的（用于内部 H_corner 等计算，但推断的不标出）
+        if 0 < len(jilu_b) < 4:
+            jilu_full = _infer_missing_corners_from_partial(
+                jilu_b, center_wo, center_im, grid_spacing=15.0)
+            if jilu_full is not None and len(jilu_full) == 4:
+                center_jilu = jilu_full
+                detected_ids = {int(r[0]) for r in jilu_b}
+                center_inferred = [r for r in jilu_full if int(r[0]) not in detected_ids]
+        print(f"  中央棋盘格 #{center_board_idx+1} (质量={center_qual:.1f}, "
+              f"距图像中心={board_centroids[0][0]:.1f}px, 范围 col[0,{full_col_max}] row[0,{full_row_max}]): "
+              f"检测到{len(center_detected)}个X角点, 推断{len(center_inferred)}个缺失角点, 共{len(center_jilu)}个")
+    else:
+        print(f"  未找到可作为中央棋盘格的候选棋盘格")
+    # ========================================================================
+
     # ---------- 可视化 ----------
-    plt.figure(figsize=(12, 10))
+    plt.figure(figsize=(14, 12))
     ax = plt.gca()
     ax.imshow(img_gray, cmap='gray')
-    ax.plot(points[:, 0], points[:, 1], 'yo', markersize=3, alpha=0.3, label='鞍点')
+    ax.plot(points[:, 0], points[:, 1], 'yo', markersize=3, alpha=0.4, label='鞍点')
     for idx, (im, wo, _, _, _) in enumerate(final_two):
-        ax.plot(im[:, 0], im[:, 1], 'w+', markersize=8, label=f'棋盘格{idx + 1}')
         draw_chessboard_grid(ax, im, wo)
         ax.plot(im[:, 0], im[:, 1], 'w+', markersize=9, markeredgewidth=1.6,
                 label=f'棋盘格{idx + 1}', zorder=8)
-    colors = {1: 'r', 2: 'm', 3: 'c', 4: 'orange', 5: 'lime', 6: 'yellow'}
-    # 绘制所有已识别棋盘格的标记点
-    for (xy_b, uv_b, jilu_b) in board_results:
-        for rec in jilu_b:
-            ax.plot(rec[1], rec[2], 'o', color=colors.get(rec[0], 'w'),
-                    markersize=6, markeredgecolor='k')
-            ax.text(rec[1] + 5, rec[2] - 5, str(rec[0]), color='white',
-                    fontsize=10, weight='bold',
-                    bbox=dict(facecolor='black', alpha=0.5))
+
+    # 绘制中央棋盘格X角点：仅绘制检测到的（绿色实心大圆），推断的不标出
+    if len(center_detected) > 0:
+        first_label = True
+        for rec in center_detected:
+            mt, cx, cy = int(rec[0]), rec[1], rec[2]
+            ax.plot(cx, cy, 'go', markersize=14, markeredgewidth=2.5,
+                    alpha=0.9, zorder=10, label='X角点' if first_label else None)
+            ax.text(cx + 8, cy - 8, str(mt), color='#00ff00', fontsize=11,
+                    weight='bold', zorder=11,
+                    bbox=dict(facecolor='black', alpha=0.7, pad=2))
+            first_label = False
+
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys())
-    ax.set_title(f'{os.path.basename(img_path)}\n红=竖向边  蓝=横向边  白色十字=交叉点')
+    ax.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize=8)
+    ax.set_title(f'{os.path.basename(img_path)}\n红=竖向边  蓝=横向边  绿圆=X角点  白十字=网格点')
     ax.axis('off')
     plt.tight_layout()
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
         out_name = os.path.splitext(os.path.basename(img_path))[0] + '_detect.png'
         plt.savefig(os.path.join(save_dir, out_name), dpi=160, bbox_inches='tight')
+        # 额外保存调试图：青色=精化后评分前，黄色=评分通过，白色十字=棋盘格点
+        fig_dbg, ax_dbg = plt.subplots(figsize=(14, 12))
+        ax_dbg.imshow(img_gray, cmap='gray')
+        if 'refined_p' in locals() and len(refined_p) > 0:
+            ax_dbg.plot(refined_p[:, 0], refined_p[:, 1], 'co', markersize=2,
+                        alpha=0.25, label=f'精化后({len(refined_p)})')
+        ax_dbg.plot(points[:, 0], points[:, 1], 'yo', markersize=3,
+                    alpha=0.5, label=f'评分通过({len(points)})')
+        for idx, (im, wo, _, _, _) in enumerate(final_two):
+            ax_dbg.plot(im[:, 0], im[:, 1], 'w+', markersize=10, markeredgewidth=2.0,
+                        label=f'棋盘格{idx + 1}({len(im)})', zorder=8)
+        # 调试图中也加入X角点标记（仅检测到的）
+        if len(center_detected) > 0:
+            for rec in center_detected:
+                mt, cx, cy = int(rec[0]), rec[1], rec[2]
+                ax_dbg.plot(cx, cy, 'go', markersize=10, markeredgewidth=2.0,
+                            alpha=0.85, zorder=10)
+        ax_dbg.legend(loc='upper right')
+        ax_dbg.set_title(f'{os.path.basename(img_path)} 调试视图（青=精化后/黄=评分通过/绿圆=X角点）')
+        ax_dbg.axis('off')
+        dbg_name = os.path.splitext(os.path.basename(img_path))[0] + '_debug.png'
+        plt.savefig(os.path.join(save_dir, dbg_name), dpi=200, bbox_inches='tight')
+        plt.close(fig_dbg)
     if show:
         plt.show()
         time.sleep(2)
