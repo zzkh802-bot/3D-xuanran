@@ -1758,6 +1758,14 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
             final_points, corner, xy_b, uv_b, H_n,
             nn, spij3, spij7, [], xcsp, Im0, mm, img_gray)
         board_results.append((xy_b, uv_b, jilu_b))
+
+    # 收集所有棋盘格实际检测到的X角点（不仅限于中央棋盘格，用于可视化）
+    all_detected = []
+    for (_, _, jilu_b) in board_results:
+        all_detected.extend([rec for rec in jilu_b])
+    if len(all_detected) > 0:
+        print(f"  所有棋盘格共检测到 {len(all_detected)} 个X角点")
+
     # 保持兼容旧变量名：取前 2 个
     xy1_left = uv1_left = None
     xy1_right = uv1_right = None
@@ -1849,22 +1857,17 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         full_col_max = max(int(np.max(center_snapped[:, 0])), ref_col_max)
         full_row_max = max(int(np.max(center_snapped[:, 1])), ref_row_max)
 
-        # 在中央棋盘格上检测X角点（优先使用参考代码 get_mark_cord 的结果，
-        # 它使用固定世界坐标 xy_add，落在实际蝴蝶形标记中心；
-        # 只有 get_mark_cord 未检测到任何角点时才回退到网格外推检测）
+        # 在中央棋盘格上检测X角点（仅使用参考代码 get_mark_cord 的结果，
+        # 它基于蝴蝶形黑白半圆标记的模板匹配，落在实际标记中心；
+        # 没有蝴蝶形标记的图片不应标出X角点，因此不进行网格外推回退）
         jilu_b = board_results[center_board_idx][2]
         if len(jilu_b) > 0:
             print(f"  使用 get_mark_cord 检测到的X角点: {jilu_b}")
         else:
-            print(f"  get_mark_cord 未检测到X角点，回退到 _detect_x_corners_on_board")
-            jilu_b = _detect_x_corners_on_board(
-                center_im, center_wo, center_H, final_points, corner, h, Im0, spij3,
-                grid_spacing=15.0,
-                full_col_min=0, full_col_max=full_col_max,
-                full_row_min=0, full_row_max=full_row_max)
-            print(f"  [_detect_x_corners_on_board] jilu_b={jilu_b}")
+            print(f"  get_mark_cord 未检测到X角点（图片可能无蝴蝶形黑白半圆标记），不标出X角点")
         center_detected = [rec for rec in jilu_b]
         center_jilu = jilu_b
+        center_inferred = []
 
         # 不足4个X角点：推断缺失的（用于内部 H_corner 等计算，但推断的不标出）
         if 0 < len(jilu_b) < 4:
@@ -1882,19 +1885,33 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     # ========================================================================
 
     # ---------- 可视化 ----------
+    def _mask_points_near_boards(pts, boards, max_dist=40.0):
+        """保留距离任一已检测棋盘格网格点不超过 max_dist 像素的候选点"""
+        if not boards or len(pts) == 0:
+            return np.zeros(len(pts), dtype=bool)
+        board_pts = np.vstack([im for (im, _, _, _, _) in boards if len(im) > 0])
+        if len(board_pts) == 0:
+            return np.zeros(len(pts), dtype=bool)
+        tree = KDTree(board_pts)
+        dist, _ = tree.query(pts, k=1)
+        return dist <= max_dist
+
+    near_board = _mask_points_near_boards(points, final_two, max_dist=40.0)
+
     plt.figure(figsize=(14, 12))
     ax = plt.gca()
     ax.imshow(img_gray, cmap='gray')
-    ax.plot(points[:, 0], points[:, 1], 'yo', markersize=3, alpha=0.4, label='鞍点')
+    ax.plot(points[near_board, 0], points[near_board, 1], 'yo', markersize=3,
+            alpha=0.4, label=f'鞍点({np.sum(near_board)}/{len(points)})')
     for idx, (im, wo, _, _, _) in enumerate(final_two):
         draw_chessboard_grid(ax, im, wo)
         ax.plot(im[:, 0], im[:, 1], 'w+', markersize=9, markeredgewidth=1.6,
                 label=f'棋盘格{idx + 1}', zorder=8)
 
-    # 绘制中央棋盘格X角点：仅绘制检测到的（绿色实心大圆），推断的不标出
-    if len(center_detected) > 0:
+    # 绘制所有棋盘格检测到的X角点（绿色实心大圆），推断的不标出
+    if len(all_detected) > 0:
         first_label = True
-        for rec in center_detected:
+        for rec in all_detected:
             mt, cx, cy = int(rec[0]), rec[1], rec[2]
             ax.plot(cx, cy, 'go', markersize=14, markeredgewidth=2.5,
                     alpha=0.9, zorder=10, label='X角点' if first_label else None)
@@ -1919,14 +1936,14 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         if 'refined_p' in locals() and len(refined_p) > 0:
             ax_dbg.plot(refined_p[:, 0], refined_p[:, 1], 'co', markersize=2,
                         alpha=0.25, label=f'精化后({len(refined_p)})')
-        ax_dbg.plot(points[:, 0], points[:, 1], 'yo', markersize=3,
-                    alpha=0.5, label=f'评分通过({len(points)})')
+        ax_dbg.plot(points[near_board, 0], points[near_board, 1], 'yo', markersize=3,
+                    alpha=0.5, label=f'评分通过({np.sum(near_board)}/{len(points)})')
         for idx, (im, wo, _, _, _) in enumerate(final_two):
             ax_dbg.plot(im[:, 0], im[:, 1], 'w+', markersize=10, markeredgewidth=2.0,
                         label=f'棋盘格{idx + 1}({len(im)})', zorder=8)
-        # 调试图中也加入X角点标记（仅检测到的）
-        if len(center_detected) > 0:
-            for rec in center_detected:
+        # 调试图中也加入X角点标记（所有检测到的）
+        if len(all_detected) > 0:
+            for rec in all_detected:
                 mt, cx, cy = int(rec[0]), rec[1], rec[2]
                 ax_dbg.plot(cx, cy, 'go', markersize=10, markeredgewidth=2.0,
                             alpha=0.85, zorder=10)
