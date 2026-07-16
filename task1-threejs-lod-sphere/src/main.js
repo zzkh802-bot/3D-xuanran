@@ -161,14 +161,16 @@ function makeSurfaceLabel(text, color, layout, options = {}) {
   const maxChars = options.maxChars || 10;
   const { texture, aspect } = makeTextTexture(text, color, maxChars);
   const available = Math.max(0.9, 2 * radius * Math.sin(layout.clearance) * 0.88);
-  let width = Math.min(options.maxWidth || 6.2, available);
-  width = Math.max(options.minWidth || 0.9, width);
+  const targetWidth = options.targetWidth || 5.4;
+  let width = targetWidth;
   let height = width / aspect;
   const maxHeight = Math.max(0.45, available * 0.62);
-  if (height > maxHeight) {
-    height = maxHeight;
-    width = height * aspect;
-  }
+  const fitScale = Math.min(1, available / width, maxHeight / height);
+  // 标签使用同一目标字号；极小区域最多缩小 20%，其余拥挤情况交给遮挡检测处理。
+  // 这样能保持整体字级统一，同时避免小区域文字无限缩小到不可读。
+  const labelScale = Math.max(options.minScale || 0.8, fitScale);
+  width *= labelScale;
+  height *= labelScale;
   const material = new THREE.MeshBasicMaterial({
     map: texture,
     transparent: true,
@@ -266,13 +268,15 @@ function buildVertexUsage(course) {
     region.vertexIds.forEach((vertexId) => usage.get(vertexId)?.add(region));
   });
   course.__vertexUsage = usage;
+  course.__boundaryVertices = course.vertices.filter((vertex) => usage.get(vertex.id)?.size);
 }
 
 function buildOuterPoints(courseGroup) {
   const { course, outer } = courseGroup;
-  const stride = Math.max(1, Math.ceil(course.vertices.length / 8));
-  course.vertices.forEach((point, index) => {
-    if (index % stride !== 0 && index !== course.vertices.length - 1) return;
+  const boundaryVertices = course.__boundaryVertices || [];
+  const stride = Math.max(1, Math.ceil(boundaryVertices.length / 8));
+  boundaryVertices.forEach((point, index) => {
+    if (index % stride !== 0 && index !== boundaryVertices.length - 1) return;
     const material = new THREE.MeshStandardMaterial({
       color: 0xf8fbff,
       emissive: new THREE.Color(course.color),
@@ -290,7 +294,7 @@ function buildOuterPoints(courseGroup) {
 
 function buildHandles(courseGroup) {
   const { course, handles } = courseGroup;
-  course.vertices.forEach((point) => {
+  (course.__boundaryVertices || []).forEach((point) => {
     const material = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       emissive: 0x1677ff,
@@ -337,8 +341,8 @@ function buildLabelsAndKnowledge(courseGroup) {
     const layout = regionLayout(course, chapter);
     const label = makeSurfaceLabel(chapter.title, readableTextColor(chapter.__color), layout, {
       maxChars: 8,
-      minWidth: 3.0,
-      maxWidth: 8.6,
+      targetWidth: 5.4,
+      minScale: 0.8,
       radialOffset: 0.25,
       priority: 3,
       renderOrder: 7
@@ -351,8 +355,8 @@ function buildLabelsAndKnowledge(courseGroup) {
     const layout = regionLayout(course, section);
     const label = makeSurfaceLabel(section.title, readableTextColor(section.__color), layout, {
       maxChars: 9,
-      minWidth: 1.3,
-      maxWidth: 5.3,
+      targetWidth: 5.4,
+      minScale: 0.8,
       radialOffset: 0.27,
       priority: 2,
       renderOrder: 8
@@ -387,7 +391,17 @@ function buildLabelsAndKnowledge(courseGroup) {
 
 function buildPreviewGeometry(course) {
   const positions = [];
-  course.edges.forEach((edge) => {
+  const boundaryEdges = new Map();
+  [...course.chapters, ...course.sections].forEach((region) => {
+    const ids = region.vertexIds || [];
+    ids.forEach((startId, index) => {
+      const endId = ids[(index + 1) % ids.length];
+      if (!startId || !endId || startId === endId) return;
+      const key = [startId, endId].sort().join('|');
+      if (!boundaryEdges.has(key)) boundaryEdges.set(key, { a: startId, b: endId });
+    });
+  });
+  boundaryEdges.forEach((edge) => {
     const startPoint = course.__vertexMap.get(edge.a);
     const endPoint = course.__vertexMap.get(edge.b);
     if (!startPoint || !endPoint) return;

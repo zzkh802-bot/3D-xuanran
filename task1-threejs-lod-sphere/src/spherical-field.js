@@ -121,8 +121,7 @@ export function sampleClosedBoundary(course, region, stepsPerEdge = 9, radius = 
   return sampled;
 }
 
-export function sphericalContains(point, boundary) {
-  if (boundary.length < 3) return false;
+function sphericalWinding(point, boundary) {
   const direction = point.clone().normalize();
   let winding = 0;
   for (let index = 0; index < boundary.length; index += 1) {
@@ -130,21 +129,74 @@ export function sphericalContains(point, boundary) {
     const b = boundary[(index + 1) % boundary.length].clone().normalize();
     const tangentA = a.addScaledVector(direction, -a.dot(direction));
     const tangentB = b.addScaledVector(direction, -b.dot(direction));
-    if (tangentA.lengthSq() < 1e-10 || tangentB.lengthSq() < 1e-10) return true;
+    if (tangentA.lengthSq() < 1e-10 || tangentB.lengthSq() < 1e-10) {
+      const onBoundary = a.dot(direction) > 0.999999 || b.dot(direction) > 0.999999;
+      return { winding: 0, onBoundary };
+    }
     tangentA.normalize();
     tangentB.normalize();
     const cross = new THREE.Vector3().crossVectors(tangentA, tangentB);
     winding += Math.atan2(direction.dot(cross), tangentA.dot(tangentB));
   }
-  return Math.abs(winding) > Math.PI;
+  return { winding, onBoundary: false };
+}
+
+function boundaryInteriorSign(boundary) {
+  // 用球面三角形的有向面积确定边界朝向。与“顶点平均方向”不同，
+  // 该方法对凹区域同样有效，不会因为质心落到区域外而翻转内外侧。
+  const origin = boundary[0];
+  let signedArea = 0;
+  for (let index = 1; index < boundary.length - 1; index += 1) {
+    const b = boundary[index];
+    const c = boundary[index + 1];
+    const determinant = origin.dot(new THREE.Vector3().crossVectors(b, c));
+    const denominator = 1 + origin.dot(b) + b.dot(c) + c.dot(origin);
+    signedArea += 2 * Math.atan2(determinant, denominator);
+  }
+  return Math.sign(signedArea) || 1;
+}
+
+export function sphericalContains(point, boundary) {
+  if (boundary.length < 3) return false;
+  const result = sphericalWinding(point, boundary);
+  if (result.onBoundary) return true;
+  // 一条球面闭合曲线会把球分成两面，两面的绕数绝对值都可能接近 2π。
+  // 以边界的有向面积确定内部，避免把背面的镜像区域也误判为命中。
+  const interiorSign = boundaryInteriorSign(boundary);
+  return result.winding * interiorSign > Math.PI;
 }
 
 export function findRegionAtDirection(course, regions, direction) {
-  for (let index = regions.length - 1; index >= 0; index -= 1) {
-    const boundary = regionBoundaryVectors(course, regions[index], 1);
-    if (sphericalContains(direction, boundary)) return regions[index];
+  let candidates = regions;
+  if (regions.some((region) => region.chapterId)) {
+    const chapter = findRegionAtDirection(course, course.chapters, direction);
+    const siblings = regions.filter((region) => region.chapterId === chapter?.id);
+    if (!siblings.length) return null;
+    candidates = siblings;
   }
-  return null;
+  let bestRegion = null;
+  let bestDot = -Infinity;
+  for (let index = 0; index < candidates.length; index += 1) {
+    const boundary = regionBoundaryVectors(course, candidates[index], 1);
+    const site = regionLayout(course, candidates[index]).anchor;
+    const siteDot = direction.dot(site);
+    if (sphericalContains(direction, boundary) && siteDot > bestDot) {
+      bestRegion = candidates[index];
+      bestDot = siteDot;
+    }
+  }
+  // 与语义场保持一致：数据存在细小空隙时按最近区域中心补齐归属。
+  if (!bestRegion) {
+    candidates.forEach((region) => {
+      const site = regionLayout(course, region).anchor;
+      const siteDot = direction.dot(site);
+      if (siteDot > bestDot) {
+        bestRegion = region;
+        bestDot = siteDot;
+      }
+    });
+  }
+  return bestRegion;
 }
 
 function centroidDirection(vectors) {
@@ -157,6 +209,10 @@ function centroidDirection(vectors) {
 export function regionLayout(course, region) {
   if (region.__layout) return region.__layout;
   const boundary = regionBoundaryVectors(course, region, 1);
+  const parent = region.chapterId
+    ? course.chapters.find((chapter) => chapter.id === region.chapterId)
+    : null;
+  const parentBoundary = parent ? regionBoundaryVectors(course, parent, 1) : null;
   const denseBoundary = sampleClosedBoundary(course, region, 7, 1);
   const center = centroidDirection(boundary);
   const candidates = [center];
@@ -164,16 +220,15 @@ export function regionLayout(course, region) {
     candidates.push(slerpUnit(center, point, 0.22));
     candidates.push(slerpUnit(center, point, 0.44));
   });
-  const cap = Math.min(Math.PI, Math.max(...boundary.map((point) => center.angleTo(point)), 0.15) + 0.2);
-  const capCos = Math.cos(cap);
-  fibonacciCandidates.forEach((candidate) => {
-    if (candidate.dot(center) >= capCos) candidates.push(candidate);
-  });
+  // 全球候选点让凹多边形也能找到真正位于内部的标签锚点。
+  // 仅按顶点质心附近搜索时，质心落在凹口外会把标签放错区域。
+  candidates.push(...fibonacciCandidates);
 
   let best = null;
   let bestClearance = -1;
   candidates.forEach((candidate) => {
     if (!sphericalContains(candidate, boundary)) return;
+    if (parentBoundary && !sphericalContains(candidate, parentBoundary)) return;
     let clearance = Infinity;
     denseBoundary.forEach((edgePoint) => {
       clearance = Math.min(clearance, candidate.angleTo(edgePoint));
@@ -245,7 +300,7 @@ function colorBytes(color) {
 }
 
 // 用球面绕数而不是经纬平面多边形判断区域。这样不会受 UV 接缝和极点退化影响。
-function sphericalContainsGridPoint(grid, offset, boundary) {
+function sphericalContainsGridPoint(grid, offset, boundary, interiorSign) {
   const px = grid[offset];
   const py = grid[offset + 1];
   const pz = grid[offset + 2];
@@ -264,7 +319,9 @@ function sphericalContainsGridPoint(grid, offset, boundary) {
     const bz = b.z - pz * bDot;
     const aLength = Math.hypot(ax, ay, az);
     const bLength = Math.hypot(bx, by, bz);
-    if (aLength < 1e-6 || bLength < 1e-6) return true;
+    if (aLength < 1e-6 || bLength < 1e-6) {
+      return aDot > 0.999999 || bDot > 0.999999;
+    }
 
     const invALength = 1 / aLength;
     const invBLength = 1 / bLength;
@@ -280,7 +337,7 @@ function sphericalContainsGridPoint(grid, offset, boundary) {
     winding += Math.atan2(px * crossX + py * crossY + pz * crossZ, nax * nbx + nay * nby + naz * nbz);
   }
 
-  return Math.abs(winding) > Math.PI;
+  return winding * interiorSign > Math.PI;
 }
 
 function buildRegionInfos(course, regions) {
@@ -289,21 +346,22 @@ function buildRegionInfos(course, regions) {
     if (boundary.length < 3) {
       throw new Error(`区域 ${region.id || region.title || 'unknown'} 至少需要三个有效顶点`);
     }
-    const site = centroidDirection(boundary);
+    const site = regionLayout(course, region).anchor;
+    const interiorSign = boundaryInteriorSign(boundary);
     // 包围帽只用于跳过显然不可能命中的区域；实际归属仍由球面绕数确定。
     const sampledBoundary = sampleClosedBoundary(course, region, 8, 1);
     const capRadius = Math.min(
       Math.PI,
       Math.max(...sampledBoundary.map((point) => site.angleTo(point))) + 0.03
     );
-    return { boundary, site, capCosine: Math.cos(capRadius) };
+    return { region, boundary, site, interiorSign, capCosine: Math.cos(capRadius) };
   });
 }
 
-function nearestRegionIndex(infos, px, py, pz) {
-  let bestIndex = 0;
+function nearestRegionIndex(infos, px, py, pz, candidateIndices) {
+  let bestIndex = candidateIndices[0];
   let bestDot = -Infinity;
-  for (let index = 0; index < infos.length; index += 1) {
+  for (const index of candidateIndices) {
     const site = infos[index].site;
     const dot = px * site.x + py * site.y + pz * site.z;
     if (dot > bestDot) {
@@ -314,46 +372,69 @@ function nearestRegionIndex(infos, px, py, pz) {
   return bestIndex;
 }
 
-function buildSphericalIds(course, regions) {
+function chooseRegionIndex(infos, directions, offset, candidateIndices) {
+  const px = directions[offset];
+  const py = directions[offset + 1];
+  const pz = directions[offset + 2];
+  let matchedRegion = -1;
+  let matchedDot = -Infinity;
+
+  // 数据边界出现轻微重叠时，选择中心方向最近的区域，避免数组顺序决定归属。
+  for (const index of candidateIndices) {
+    const info = infos[index];
+    const siteDot = px * info.site.x + py * info.site.y + pz * info.site.z;
+    if (siteDot < info.capCosine) continue;
+    if (sphericalContainsGridPoint(directions, offset, info.boundary, info.interiorSign)
+      && siteDot > matchedDot) {
+      matchedRegion = index;
+      matchedDot = siteDot;
+    }
+  }
+
+  // 包围帽只是加速条件；不命中时完整复核，避免凹区域或异常数据被误跳过。
+  if (matchedRegion < 0) {
+    for (const index of candidateIndices) {
+      const info = infos[index];
+      const siteDot = px * info.site.x + py * info.site.y + pz * info.site.z;
+      if (sphericalContainsGridPoint(directions, offset, info.boundary, info.interiorSign)
+        && siteDot > matchedDot) {
+        matchedRegion = index;
+        matchedDot = siteDot;
+      }
+    }
+  }
+
+  return matchedRegion >= 0
+    ? matchedRegion
+    : nearestRegionIndex(infos, px, py, pz, candidateIndices);
+}
+
+function buildSphericalIds(course, regions, parentIds = null) {
   const infos = buildRegionInfos(course, regions);
   const directions = getDirectionGrid();
   const ids = new Int16Array(FIELD_WIDTH * FIELD_HEIGHT);
+  const allIndices = infos.map((_, index) => index);
+  const indicesByChapter = new Map();
+  if (parentIds) {
+    infos.forEach((info, index) => {
+      const siblings = indicesByChapter.get(info.region.chapterId) || [];
+      siblings.push(index);
+      indicesByChapter.set(info.region.chapterId, siblings);
+    });
+  }
 
   for (let pixel = 0; pixel < ids.length; pixel += 1) {
     const offset = pixel * 3;
-    const px = directions[offset];
-    const py = directions[offset + 1];
-    const pz = directions[offset + 2];
-    let matchedRegion = -1;
-
-    // 反向遍历保持原先“后定义区域覆盖前定义区域”的优先级。
-    for (let index = infos.length - 1; index >= 0; index -= 1) {
-      const info = infos[index];
-      if (px * info.site.x + py * info.site.y + pz * info.site.z < info.capCosine) continue;
-      if (sphericalContainsGridPoint(directions, offset, info.boundary)) {
-        matchedRegion = index;
-        break;
-      }
-    }
-
-    // 包围帽只是加速条件；不命中时完整复核，避免凹区域或异常数据被误跳过。
-    if (matchedRegion < 0) {
-      for (let index = infos.length - 1; index >= 0; index -= 1) {
-        if (sphericalContainsGridPoint(directions, offset, infos[index].boundary)) {
-          matchedRegion = index;
-          break;
-        }
-      }
-    }
-    ids[pixel] = matchedRegion >= 0 ? matchedRegion : nearestRegionIndex(infos, px, py, pz);
+    const chapterId = parentIds ? course.chapters[parentIds[pixel]]?.id : null;
+    const candidateIndices = (chapterId && indicesByChapter.get(chapterId)) || allIndices;
+    ids[pixel] = chooseRegionIndex(infos, directions, offset, candidateIndices);
   }
 
   return ids;
 }
 
-function buildField(course, regions, level) {
+function buildField(course, regions, level, ids = buildSphericalIds(course, regions)) {
   const pixelCount = FIELD_WIDTH * FIELD_HEIGHT;
-  const ids = buildSphericalIds(course, regions);
 
   const distance = new Float32Array(pixelCount);
   distance.fill(1e6);
@@ -412,7 +493,7 @@ function buildField(course, regions, level) {
   const colorImage = colorContext.createImageData(FIELD_WIDTH, FIELD_HEIGHT);
   const heightImage = heightContext.createImageData(FIELD_WIDTH, FIELD_HEIGHT);
   const palette = regions.map((region) => colorBytes(region.__color || new THREE.Color(course.color)));
-  const seamWidth = level === 'chapter' ? 8.5 : 5.5;
+  const seamWidth = level === 'chapter' ? 9 : 4.5;
   for (let pixel = 0; pixel < pixelCount; pixel += 1) {
     const offset = pixel * 4;
     const [red, green, blue] = palette[ids[pixel]];
@@ -438,9 +519,23 @@ function buildField(course, regions, level) {
 }
 
 export function createSemanticFields(course) {
+  const chapterIds = buildSphericalIds(course, course.chapters);
+  const chaptersWithSections = new Set(course.sections.map((section) => section.chapterId));
+  const sectionRegions = [
+    ...course.sections,
+    ...course.chapters
+      .filter((chapter) => !chaptersWithSections.has(chapter.id))
+      .map((chapter) => ({
+        ...chapter,
+        id: `${chapter.id}-empty-section`,
+        chapterId: chapter.id,
+        __color: chapter.__color
+      }))
+  ];
+  const sectionIds = buildSphericalIds(course, sectionRegions, chapterIds);
   return {
-    chapter: buildField(course, course.chapters, 'chapter'),
-    section: buildField(course, course.sections, 'section')
+    chapter: buildField(course, course.chapters, 'chapter', chapterIds),
+    section: buildField(course, sectionRegions, 'section', sectionIds)
   };
 }
 
@@ -461,7 +556,7 @@ export function createSemanticMaterial(fields, courseColor) {
       uBaseColor: { value: lighten(courseColor, 0.44) },
       uRegionReveal: { value: 0 },
       uSectionBlend: { value: 0 },
-      uDisplacement: { value: 0.035 },
+      uDisplacement: { value: 0.046 },
       uBumpStrength: { value: 0.42 },
       uTexel: { value: new THREE.Vector2(1 / FIELD_WIDTH, 1 / FIELD_HEIGHT) }
     },
@@ -474,19 +569,23 @@ export function createSemanticMaterial(fields, courseColor) {
       varying vec2 vUvField;
       varying vec3 vWorldPosition;
       varying vec3 vWorldNormal;
-      varying float vFieldHeight;
+
+      float combinedHeight(float chapterHeight, float sectionHeight) {
+        float chapterGroove = 1.0 - chapterHeight;
+        float sectionGroove = (1.0 - sectionHeight) * uSectionBlend * 0.62;
+        return 1.0 - max(chapterGroove, sectionGroove);
+      }
 
       void main() {
         float chapterHeight = texture2D(uChapterHeight, uv).r;
         float sectionHeight = texture2D(uSectionHeight, uv).r;
-        float fieldHeight = mix(chapterHeight, sectionHeight, uSectionBlend);
-        float displacement = (fieldHeight - 0.58) * uDisplacement * uRegionReveal;
+        float fieldHeight = combinedHeight(chapterHeight, sectionHeight);
+        float displacement = (fieldHeight - 0.78) * uDisplacement * uRegionReveal;
         vec3 transformed = position + normal * displacement;
         vec4 worldPosition = modelMatrix * vec4(transformed, 1.0);
         vUvField = uv;
         vWorldPosition = worldPosition.xyz;
         vWorldNormal = normalize(mat3(modelMatrix) * normal);
-        vFieldHeight = fieldHeight;
         gl_Position = projectionMatrix * viewMatrix * worldPosition;
       }
     `,
@@ -503,7 +602,6 @@ export function createSemanticMaterial(fields, courseColor) {
       varying vec2 vUvField;
       varying vec3 vWorldPosition;
       varying vec3 vWorldNormal;
-      varying float vFieldHeight;
 
       vec3 srgbToLinear(vec3 value) {
         vec3 low = value / 12.92;
@@ -514,7 +612,9 @@ export function createSemanticMaterial(fields, courseColor) {
       float fieldHeightAt(vec2 uv) {
         float chapterHeight = texture2D(uChapterHeight, uv).r;
         float sectionHeight = texture2D(uSectionHeight, uv).r;
-        return mix(chapterHeight, sectionHeight, uSectionBlend);
+        float chapterGroove = 1.0 - chapterHeight;
+        float sectionGroove = (1.0 - sectionHeight) * uSectionBlend * 0.62;
+        return 1.0 - max(chapterGroove, sectionGroove);
       }
 
       float surfaceNoise(vec3 point) {
@@ -524,13 +624,22 @@ export function createSemanticMaterial(fields, courseColor) {
       void main() {
         vec3 chapterColor = srgbToLinear(texture2D(uChapterMap, vUvField).rgb);
         vec3 sectionColor = srgbToLinear(texture2D(uSectionMap, vUvField).rgb);
+        float chapterHeight = texture2D(uChapterHeight, vUvField).r;
+        float sectionHeight = texture2D(uSectionHeight, vUvField).r;
         vec3 surfaceColor = mix(uBaseColor, chapterColor, uRegionReveal);
         surfaceColor = mix(surfaceColor, sectionColor, uRegionReveal * uSectionBlend);
 
-        float seam = (1.0 - smoothstep(0.16, 0.80, vFieldHeight)) * uRegionReveal;
-        float seamCore = (1.0 - smoothstep(0.05, 0.34, vFieldHeight)) * uRegionReveal;
-        surfaceColor *= mix(1.0, 0.90, seam);
-        surfaceColor = mix(surfaceColor, vec3(0.035, 0.050, 0.065), seamCore * 0.16);
+        float chapterSeam = (1.0 - smoothstep(0.22, 0.86, chapterHeight)) * uRegionReveal;
+        float sectionSeam = (1.0 - smoothstep(0.12, 0.72, sectionHeight))
+          * uRegionReveal * uSectionBlend * (1.0 - chapterSeam * 0.72);
+        float chapterCore = (1.0 - smoothstep(0.05, 0.30, chapterHeight)) * uRegionReveal;
+        float sectionCore = (1.0 - smoothstep(0.05, 0.27, sectionHeight))
+          * uRegionReveal * uSectionBlend * (1.0 - chapterCore * 0.82);
+        float seam = max(chapterSeam, sectionSeam);
+        surfaceColor *= mix(1.0, 0.93, sectionSeam);
+        surfaceColor *= mix(1.0, 0.82, chapterSeam);
+        surfaceColor = mix(surfaceColor, vec3(0.035, 0.050, 0.065), sectionCore * 0.12);
+        surfaceColor = mix(surfaceColor, vec3(0.025, 0.038, 0.052), chapterCore * 0.30);
 
         float hLeft = fieldHeightAt(vUvField - vec2(uTexel.x, 0.0));
         float hRight = fieldHeightAt(vUvField + vec2(uTexel.x, 0.0));
