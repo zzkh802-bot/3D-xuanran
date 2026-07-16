@@ -573,8 +573,9 @@ def _trim_sparse_border_grid(img_pts, world_pts, min_fill=0.45, min_points=9):
         if len(cols) < 2 or len(rows) < 2:
             break
         keep = np.ones(len(img_pts), dtype=bool)
-        min_row_count = max(4, int(np.ceil(len(cols) * min_fill)))
-        min_col_count = max(4, int(np.ceil(len(rows) * min_fill)))
+        # 边界行/列的最小点数不能超过该方向的总列/行数，否则对细长棋盘格会过度修剪
+        min_row_count = min(len(cols), max(1, int(np.ceil(len(cols) * min_fill))))
+        min_col_count = min(len(rows), max(1, int(np.ceil(len(rows) * min_fill))))
         for row in (rows[0], rows[-1]):
             idx = np.where(snapped[:, 1] == row)[0]
             if len(idx) < min_row_count:
@@ -590,6 +591,7 @@ def _trim_sparse_border_grid(img_pts, world_pts, min_fill=0.45, min_points=9):
             world_pts = world_pts[keep]
             changed = True
     return img_pts, world_pts
+
 
 
 def interpolate_missing_grid_points(img_pts, world_pts, min_neighbors=3):
@@ -630,11 +632,17 @@ def interpolate_missing_grid_points(img_pts, world_pts, min_neighbors=3):
             1 for dc, dr in [(-1, 0), (1, 0), (0, -1), (0, 1)]
             if (c + dc, r + dr) in existing
         )
-        if neighbors >= min_neighbors:
+        # 边界点（最外圈）放宽要求：只需 1 个邻居即可推断，
+        # 避免细长棋盘格的顶角/边角因遮挡或漏检而无法补齐。
+        is_boundary = (c == col_min or c == col_max or
+                       r == row_min or r == row_max)
+        required = 1 if is_boundary else min_neighbors
+        if neighbors >= required:
             pt = projected[i]
             if np.isfinite(pt).all():
                 new_img.append(pt)
                 new_world.append(full_world[i])
+
 
     if not new_img:
         return img_pts, world_pts
@@ -1107,13 +1115,44 @@ def sort_chessboard_points(img_pts, world_pts):
     return img_clean[sort_idx], world_clean[sort_idx]
 
 
-def draw_chessboard_grid(ax, img_pts, world_pts):
+def draw_chessboard_grid(ax, img_pts, world_pts, img_shape=None):
     img_s, world_s = sort_chessboard_points(img_pts, world_pts)
     unique_y = np.unique(np.round(world_s[:, 1], 2))
     unique_x = np.unique(np.round(world_s[:, 0], 2))
     H = compute_homography(world_s, img_s)
     x_min, x_max = float(np.min(unique_x)), float(np.max(unique_x))
     y_min, y_max = float(np.min(unique_y)), float(np.max(unique_y))
+
+    # 图像边界（含一点小 margin，避免数值抖动），用于裁剪网格线
+    if img_shape is not None:
+        h_img, w_img = float(img_shape[0]), float(img_shape[1])
+    else:
+        h_img, w_img = None, None
+
+    def clip_segment_to_image(segment):
+        """使用 Liang-Barsky 算法将线段裁剪到图像边界内。"""
+        if h_img is None or w_img is None:
+            return segment
+        x1, y1 = segment[0]
+        x2, y2 = segment[1]
+        dx, dy = x2 - x1, y2 - y1
+        p = [-dx, dx, -dy, dy]
+        q = [x1, w_img - x1, y1, h_img - y1]
+        u1, u2 = 0.0, 1.0
+        for pi, qi in zip(p, q):
+            if pi == 0:
+                if qi < 0:
+                    return None
+                continue
+            r = qi / pi
+            if pi < 0:
+                u1 = max(u1, r)
+            else:
+                u2 = min(u2, r)
+        if u1 > u2:
+            return None
+        return np.array([[x1 + u1 * dx, y1 + u1 * dy],
+                         [x1 + u2 * dx, y1 + u2 * dy]])
 
     def project_segment(world_segment):
         if H is None:
@@ -1156,7 +1195,9 @@ def draw_chessboard_grid(ax, img_pts, world_pts):
     def plot_segment(segment):
         span = np.ptp(segment, axis=0)
         color = '#d83b32' if span[1] > span[0] else '#1f73d8'
-        ax.plot(segment[:, 0], segment[:, 1], color=color, linewidth=2, alpha=0.9, zorder=4)
+        clipped = clip_segment_to_image(segment)
+        if clipped is not None:
+            ax.plot(clipped[:, 0], clipped[:, 1], color=color, linewidth=2, alpha=0.9, zorder=4)
 
     row_records = []
     col_records = []
@@ -1202,6 +1243,7 @@ def draw_chessboard_grid(ax, img_pts, world_pts):
         plot_segment(use_segment)
 
 
+
 def plot_chessboard_edge(ax, img_pts, color='red', linewidth=2, linestyle='--'):
     return
 
@@ -1229,6 +1271,50 @@ def find_inside_saddle_points(polygon_path, all_saddle_pts, chess_used_idx):
     return all_saddle_pts[mask], all_idx[mask]
 
 
+def _filter_points_inside_polygon(img_pts, world_pts, ref_img_pts):
+    """
+    过滤掉落在 ref_img_pts 凸包外的点。
+    用于防止棋盘格重建/插值时把外围候选点误拉进可视化网格。
+    """
+    if len(ref_img_pts) < 3 or len(img_pts) == 0:
+        return img_pts, world_pts
+    poly, _ = get_chessboard_polygon(ref_img_pts)
+    if poly is None:
+        return img_pts, world_pts
+    inside = poly.contains_points(img_pts)
+    if np.sum(inside) < 4:
+        return img_pts, world_pts
+    return img_pts[inside], world_pts[inside]
+
+
+def _filter_false_positive_x_corners(jilu_b, img_b, min_dist_ratio=0.35):
+    """
+    过滤掉落在棋盘格普通网格角点上的假阳性 X 角点。
+
+    真正的蝴蝶形黑白半圆 X 角点位于棋盘格网格外侧半格处，
+    距离最近的棋盘格网格点约为半格间距；而假阳性通常是普通
+    棋盘格角点，距离网格点非常近。
+    """
+    if len(jilu_b) == 0 or len(img_b) < 2:
+        return jilu_b
+
+    tree = KDTree(img_b)
+    dists, _ = tree.query(img_b, k=2)
+    median_spacing = float(np.median(dists[:, 1]))
+    min_dist = max(5.0, min_dist_ratio * median_spacing)
+
+    filtered = []
+    for rec in jilu_b:
+        cx, cy = float(rec[1]), float(rec[2])
+        d, _ = tree.query([[cx, cy]], k=1)
+        if d[0] >= min_dist:
+            filtered.append(rec)
+        else:
+            print(f"  [过滤] 疑似假阳性 X 角点 (type={int(rec[0])}, "
+                  f"位置=({cx:.1f},{cy:.1f})): 距最近网格点 {d[0]:.1f}px < {min_dist:.1f}px")
+    return filtered
+
+
 def validate_chessboard_grid_alignment(world_pts, max_deviation=1.5):
     if len(world_pts) < 4:
         return False, 1e9
@@ -1244,6 +1330,7 @@ def validate_chessboard_grid_alignment(world_pts, max_deviation=1.5):
     if len(ux) < 2 or len(uy) < 2:
         return False, median_dev
     return True, median_dev
+
 
 
 def calculate_chessboard_quality(img_pts, world_pts):
@@ -1527,6 +1614,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     # ⚠ 重要：用图像空间重叠检查，而非世界坐标（世界坐标已归零，不同棋盘格可能
     #    巧合重叠）
     MAX_BOARDS = 6  # 提升：从3→6，识别更多棋盘格
+    PROPAGATION_MIN_QUALITY = 5.0  # 传播新增棋盘格的最低质量阈值
     scored_boards.sort(key=lambda x: x[4], reverse=True)
     final_two = []
     used_img_ranges = []
@@ -1631,11 +1719,15 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
 
             if best_propagated is not None:
                 qual, p_img, p_world, p_H, src_idx = best_propagated
-                final_two.append((p_img, p_world, p_H, set(), qual))
-                found_this_round = True
-                print(f"  [OK] 策略A单应传播: 棋盘格 #{len(final_two)} "
-                      f"(源自#{src_idx+1}, {len(p_img)}点, 质量{qual:.1f})")
-                continue
+                if qual < PROPAGATION_MIN_QUALITY:
+                    print(f"  [SKIP] 策略A最佳传播棋盘格质量过低 (q={qual:.2f} < {PROPAGATION_MIN_QUALITY:.1f})，跳过")
+                else:
+                    final_two.append((p_img, p_world, p_H, set(), qual))
+                    found_this_round = True
+                    print(f"  [OK] 策略A单应传播: 棋盘格 #{len(final_two)} "
+                          f"(源自#{src_idx+1}, {len(p_img)}点, 质量{qual:.1f})")
+                    continue
+
 
             # ---- 策略 B：凸包排除后重搜索 ----
             outside_v1 = final_v1[outside_mask]
@@ -1654,11 +1746,15 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
                 valid2, _ = validate_chessboard_grid_alignment(b_world)
                 if valid2 and len(b_img) >= 6:
                     qual2 = calculate_chessboard_quality(b_img, b_world)
+                    if qual2 < PROPAGATION_MIN_QUALITY:
+                        print(f"  [SKIP] 策略B棋盘格质量过低 (q={qual2:.2f} < {PROPAGATION_MIN_QUALITY:.1f})，跳过")
+                        continue
                     final_two.append((b_img, b_world, b_H, set(), qual2))
                     found_this_round = True
                     print(f"  [OK] 策略B凸包重搜索: 棋盘格 #{len(final_two)} "
                           f"({len(b_img)}点, 质量{qual2:.1f})")
                     break
+
             if found_this_round:
                 continue
 
@@ -1715,6 +1811,9 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
                             b_world, max_deviation=3.0)
                         if valid2 and len(b_img) >= 6:
                             qual2 = calculate_chessboard_quality(b_img, b_world)
+                            if qual2 < PROPAGATION_MIN_QUALITY:
+                                print(f"  [SKIP] 策略C棋盘格质量过低 (q={qual2:.2f} < {PROPAGATION_MIN_QUALITY:.1f})，跳过")
+                                continue
                             final_two.append((b_img, b_world, b_H, set(), qual2))
                             found_this_round = True
                             print(f"  [OK] 策略C降阈值重检: 棋盘格 #{len(final_two)} "
@@ -1730,13 +1829,31 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
 
     cleaned_final_two = []
     for img_pts, world_pts, H, used_idx, qual in final_two:
-        clean_img, clean_world, clean_H = complete_chessboard_from_candidates(img_pts, world_pts, final_points)
+        # 保存重建前的原始点，用于剔除外扩/插值引入的凸包外点
+        orig_img = img_pts.copy()
+        orig_world = world_pts.copy()
+
+        # 关闭外扩 margin：只补当前 bbox 内部的缺失点，避免把外围候选点拉进来
+        clean_img, clean_world, clean_H = complete_chessboard_from_candidates(
+            img_pts, world_pts, final_points, expand_margin=0)
+        # 过滤重建阶段引入的凸包外点
+        clean_img, clean_world = _filter_points_inside_polygon(clean_img, clean_world, orig_img)
+
         before_fill = len(clean_img)
-        clean_img, clean_world = interpolate_missing_grid_points(clean_img, clean_world, min_neighbors=2)
+        # 根据当前完整度决定插值策略：高完整度棋盘格直接补齐 bbox 内所有缺失网格点，
+        # 避免细长棋盘格的顶角/边角因邻居不足而遗漏；低完整度棋盘格仍保守插值。
+        snapped = np.round(clean_world / 15.0).astype(int)
+        grid_cells = len(np.unique(snapped[:, 0])) * len(np.unique(snapped[:, 1]))
+        fill_ratio = len(clean_img) / max(1, grid_cells)
+        min_n = 0 if fill_ratio > 0.70 else 2
+        clean_img, clean_world = interpolate_missing_grid_points(clean_img, clean_world, min_neighbors=min_n)
+        # 注：插值得到的是规则网格单应投影点，不再用原始凸包过滤，避免边界缺失点被误删。
+
         if len(clean_img) != before_fill:
             print(f"  网格插值填补: {before_fill} -> {len(clean_img)} 个交叉点")
             clean_H = compute_homography(clean_world, clean_img)
         cleaned_final_two.append((clean_img, clean_world, clean_H if clean_H is not None else H, used_idx, qual))
+
     final_two = cleaned_final_two
     # 提取各棋盘格数据（支持任意数量）
     board_results = []  # [(xy, uv, jilu), ...]
@@ -1757,7 +1874,10 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         xy_b, uv_b, jilu_b = get_mark_cord(
             final_points, corner, xy_b, uv_b, H_n,
             nn, spij3, spij7, [], xcsp, Im0, mm, img_gray)
+        # 过滤普通棋盘格角点被误标为 X 角点的情况
+        jilu_b = _filter_false_positive_x_corners(jilu_b, img_n)
         board_results.append((xy_b, uv_b, jilu_b))
+
 
     # 收集所有棋盘格实际检测到的X角点（不仅限于中央棋盘格，用于可视化）
     all_detected = []
@@ -1904,7 +2024,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     ax.plot(points[near_board, 0], points[near_board, 1], 'yo', markersize=3,
             alpha=0.4, label=f'鞍点({np.sum(near_board)}/{len(points)})')
     for idx, (im, wo, _, _, _) in enumerate(final_two):
-        draw_chessboard_grid(ax, im, wo)
+        draw_chessboard_grid(ax, im, wo, img_shape=img_gray.shape)
         ax.plot(im[:, 0], im[:, 1], 'w+', markersize=9, markeredgewidth=1.6,
                 label=f'棋盘格{idx + 1}', zorder=8)
 
