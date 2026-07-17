@@ -3,7 +3,7 @@ import sys
 import numpy as np
 import time
 import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, label as ndi_label
 from scipy.spatial import KDTree, ConvexHull
 from matplotlib.path import Path
 
@@ -153,8 +153,8 @@ def grow_neighbor(xc0, used_mask, center_idx, direction_vec, ref_len=0,
     # 投影（带符号）
     proj = vecs @ direction_vec
     cos_angle = proj / (dists + 1e-12)
-    # 方向约束：夹角小（cos > 0.95）且沿正方向
-    mask_dir = (cos_angle > 0.85) & (proj > 0)  # 放宽方向约束，适应透视变形
+    # 方向约束：0.80=≈37°容忍度，适应角落透视畸变（参考yanzheng2026_4_29/5_12）
+    mask_dir = (cos_angle > 0.80) & (proj > 0)
     # 排除自身和已使用点
     mask_avail = ~used_mask
     mask_avail[center_idx] = False
@@ -438,7 +438,7 @@ def legacy_homography_chessboardsgrow_py(points, directions, scores, img_shape, 
             continue
         try:
             img_pts, world_pts, H, used_idx = grow_chessboard_region(
-                points, dirs, quad_idx, max_iter=80, dist_thresh=5.0
+                points, dirs, quad_idx, max_iter=120, dist_thresh=12.0
             )
         except Exception:
             continue
@@ -461,13 +461,21 @@ def legacy_homography_chessboardsgrow_py(points, directions, scores, img_shape, 
 
 
 def find_chessboard_candidates(points, directions, scores, img_shape, max_boards=3):
-    primary = chessboardsgrow_py(points, directions, scores, img_shape, max_boards=max_boards)
-    legacy = legacy_homography_chessboardsgrow_py(
-        points, directions, scores, img_shape, max_boards=max_boards
-    )
-    if legacy:
-        print(f"  旧单应生长候选 {len(legacy)} 个")
-    return primary + legacy
+    """棋盘格检测：使用4_29的单应投影方法为主，BFS方向生长为辅。
+    单应投影方法（grow_chessboard_region）无方向约束，天然处理透视畸变，
+    对角落鞍点的连接能力远优于BFS方法。"""
+    # 主方法：4_29的单应投影生长（get_little_four_P_py + grow_chessboard_region）
+    homo_boards = legacy_homography_chessboardsgrow_py(
+        points, directions, scores, img_shape, max_boards=max_boards)
+    if homo_boards:
+        print(f"  单应生长候选 {len(homo_boards)} 个")
+    # 辅方法：BFS方向生长（chessboardsgrow_py）
+    bfs_boards = chessboardsgrow_py(
+        points, directions, scores, img_shape, max_boards=max_boards)
+    if bfs_boards:
+        print(f"  BFS生长候选 {len(bfs_boards)} 个")
+    # 单应结果优先返回（在后续选择中享有优先级）
+    return homo_boards + bfs_boards
 
 
 def _point_line_residuals(pts):
@@ -711,7 +719,7 @@ def complete_chessboard_from_candidates(img_pts, world_pts, candidate_pts, min_p
             matched_grid.append(grid_i)
             matched_candidate.append(cand_i)
 
-        if len(matched_grid) < max(min_points, int(len(img_pts) * 0.82)):
+        if len(matched_grid) < max(min_points, int(len(img_pts) * 0.50)):  # 放宽：允许H不精确时仍继续迭代
             break
 
         new_world = grid_world[np.array(matched_grid)]
@@ -1116,7 +1124,242 @@ def sort_chessboard_points(img_pts, world_pts):
 
 
 def draw_chessboard_grid(ax, img_pts, world_pts, img_shape=None):
-    img_s, world_s = sort_chessboard_points(img_pts, world_pts)
+    # Rendering uses confirmed image detections.  Do not deduplicate them by
+    # world coordinates: a bad post-fill world assignment could otherwise
+    # remove a real saddle before geometric row/column grouping.
+    img_s = np.asarray(img_pts, dtype=float)
+    world_s = np.asarray(world_pts, dtype=float)
+    if len(img_s) < 2 or len(world_s) != len(img_s):
+        return
+
+    # Estimate the two local lattice axes from confirmed image detections.
+    # This avoids corrupted post-fill world labels while retaining the true
+    # perspective direction of the board.
+    def estimate_lattice_directions():
+        """Find the two dominant board axes from all short point pairs."""
+        angles = []
+        weights = []
+        if len(img_s) < 3:
+            return None, None
+        # Limit pair length relative to the point-cloud nearest-neighbour scale.
+        tree = KDTree(img_s)
+        nn_dist, _ = tree.query(img_s, k=min(3, len(img_s)))
+        base = float(np.median(nn_dist[:, 1])) if nn_dist.ndim == 2 else 20.0
+        max_pair = max(30.0, 2.25 * base)
+        for i in range(len(img_s)):
+            for j in range(i + 1, len(img_s)):
+                vec = img_s[j] - img_s[i]
+                length = float(np.linalg.norm(vec))
+                if length < 6.0 or length > max_pair:
+                    continue
+                angle = float(np.arctan2(vec[1], vec[0]) % np.pi)
+                angles.append(angle)
+                weights.append(1.0 / max(length, 1.0))
+        if len(angles) < 2:
+            return None, None
+        n_bins = 90
+        hist, edges = np.histogram(angles, bins=n_bins, range=(0.0, np.pi), weights=weights)
+        # Circular smoothing prevents sub-pixel angle noise splitting one mode.
+        smooth = sum(np.roll(hist, k) for k in range(-2, 3))
+        first = int(np.argmax(smooth))
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        a1 = float(centers[first])
+        diff = np.abs(centers - a1)
+        diff = np.minimum(diff, np.pi - diff)
+        eligible = (diff >= np.deg2rad(50.0)) & (diff <= np.deg2rad(90.0))
+        if not np.any(eligible):
+            return None, None
+        second_scores = np.where(eligible, smooth, -np.inf)
+        a2 = float(centers[int(np.argmax(second_scores))])
+
+        def direction(angle):
+            v = np.array([np.cos(angle), np.sin(angle)], dtype=float)
+            return v
+
+        d1, d2 = direction(a1), direction(a2)
+        # Row axis is the one with the larger horizontal component.
+        if abs(d1[0]) >= abs(d2[0]):
+            row_dir, col_dir = d1, d2
+        else:
+            row_dir, col_dir = d2, d1
+        if row_dir[0] < 0:
+            row_dir *= -1.0
+        if col_dir[1] < 0:
+            col_dir *= -1.0
+        return row_dir, col_dir
+
+    row_direction, col_direction = estimate_lattice_directions()
+
+    def estimate_axis(direction):
+        if direction is None:
+            return None
+        samples = []
+        normal = np.array([-direction[1], direction[0]])
+        angle_tan = np.tan(np.deg2rad(16.0))
+        for i, p0 in enumerate(img_s):
+            delta = img_s - p0
+            distance = np.linalg.norm(delta, axis=1)
+            along = np.abs(delta @ direction)
+            across = np.abs(delta @ normal)
+            mask = (distance > 5.0) & (across <= 2.0 + angle_tan * along)
+            ids = np.where(mask)[0]
+            if len(ids) == 0:
+                continue
+            j = int(ids[np.argmin(distance[ids])])
+            vec = delta[j].copy()
+            if np.dot(vec, direction) < 0:
+                vec *= -1.0
+            samples.append((float(distance[j]), float(0.5 * (p0[1] + img_s[j, 1]))))
+        if not samples:
+            return None
+        lengths = np.asarray([s[0] for s in samples])
+        mids_y = np.asarray([s[1] for s in samples])
+        # One-cell image spacing changes with perspective.  Fit it against y
+        # so a two-cell jump is rejected even where the board becomes smaller.
+        med = float(np.median(lengths))
+        good = (lengths >= 0.55 * med) & (lengths <= 1.65 * med)
+        if np.sum(good) >= 4 and np.ptp(mids_y[good]) > 10.0:
+            spacing_fit = np.polyfit(mids_y[good], lengths[good], 1)
+        else:
+            spacing_fit = np.array([0.0, med])
+        limits = (float(np.percentile(lengths[good], 5)) if np.any(good) else 0.6 * med,
+                  float(np.percentile(lengths[good], 95)) if np.any(good) else 1.4 * med)
+        return direction, spacing_fit, limits
+
+    row_axis = estimate_axis(row_direction)
+    col_axis = estimate_axis(col_direction)
+
+    def connect_axis(axis_model, color):
+        if axis_model is None:
+            return
+        direction, spacing_fit, limits = axis_model
+        normal = np.array([-direction[1], direction[0]])
+        angle_tan = np.tan(np.deg2rad(14.0))
+        drawn = set()
+        for i, p0 in enumerate(img_s):
+            delta = img_s - p0
+            along = delta @ direction
+            across = np.abs(delta @ normal)
+            predicted = float(np.polyval(spacing_fit, p0[1]))
+            predicted = float(np.clip(predicted, 0.75 * limits[0], 1.25 * limits[1]))
+            # Only the immediately adjacent cell is eligible.  If that saddle
+            # is missing, a two-cell-away point exceeds 1.48 steps and the line
+            # remains broken as required.
+            mask = ((along > 0.42 * predicted) & (along < 1.48 * predicted) &
+                    (across <= 2.0 + angle_tan * along))
+            ids = np.where(mask)[0]
+            if len(ids) == 0:
+                continue
+            score = across[ids] + 0.30 * np.abs(along[ids] - predicted)
+            j = int(ids[np.argmin(score)])
+            key = (min(i, j), max(i, j))
+            if key in drawn:
+                continue
+            drawn.add(key)
+            p1 = img_s[j]
+            ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
+                    color=color, linewidth=2, alpha=0.9, zorder=4)
+
+    connect_axis(row_axis, '#1f73d8')
+    connect_axis(col_axis, '#d83b32')
+    return
+
+    # Legacy image-angle grouping retained below for reference only.
+    # Some absorbed/interpolated nodes can receive a wrong world row/column.
+    # Build the display graph from image geometry instead: nearest neighbours
+    # inside a horizontal corridor are blue, and those inside a vertical
+    # corridor are red.  The function is called separately for every board,
+    # so no edge can cross from one board to another.
+    if len(img_s) < 2:
+        return
+    # Remove sub-pixel duplicates before neighbour search.
+    kept = []
+    for p in img_s:
+        if not kept or min(np.linalg.norm(p - q) for q in kept) > 2.0:
+            kept.append(np.asarray(p, dtype=float))
+    nodes = np.asarray(kept)
+    horizontal = []
+    vertical = []
+    horizontal_ratio = 0.22  # blue edges must be close to screen-horizontal
+    vertical_ratio = 0.38    # red columns may retain moderate perspective tilt
+    for i, p0 in enumerate(nodes):
+        delta = nodes - p0
+        dx, dy = delta[:, 0], delta[:, 1]
+        dist = np.hypot(dx, dy)
+        hmask = (dx > 2.0) & (np.abs(dy) <= horizontal_ratio * np.abs(dx))
+        vmask = (dy > 2.0) & (np.abs(dx) <= vertical_ratio * np.abs(dy))
+        if np.any(hmask):
+            ids = np.where(hmask)[0]
+            j = int(ids[np.argmin(dist[ids])])
+            horizontal.append((i, j, float(dist[j])))
+        if np.any(vmask):
+            ids = np.where(vmask)[0]
+            j = int(ids[np.argmin(dist[ids])])
+            vertical.append((i, j, float(dist[j])))
+
+    if not horizontal and not vertical:
+        return
+    h_spacing = float(np.median([e[2] for e in horizontal])) if horizontal else 20.0
+    v_spacing = float(np.median([e[2] for e in vertical])) if vertical else h_spacing
+    # Do not learn a blue-row slope from candidate edges: one wrong diagonal
+    # biases the estimate and then makes row clustering reproduce that error.
+    # “蓝横” is explicitly defined in screen/image coordinates here.
+    h_slope = 0.0
+    v_slope = float(np.median([
+        (nodes[j, 0] - nodes[i, 0]) / (nodes[j, 1] - nodes[i, 1])
+        for i, j, _ in vertical])) if vertical else 0.0
+
+    def cluster_axis(values, tolerance):
+        """Cluster de-sheared 1-D coordinates into stable rows/columns."""
+        order = np.argsort(values)
+        groups = []
+        for idx in order:
+            if not groups:
+                groups.append([int(idx)])
+                continue
+            current_center = float(np.median(values[groups[-1]]))
+            if abs(float(values[idx]) - current_center) <= tolerance:
+                groups[-1].append(int(idx))
+            else:
+                groups.append([int(idx)])
+        return groups
+
+    # Remove the global perspective shear before clustering.  This prevents a
+    # nearest-neighbour path from jumping left/right between adjacent columns.
+    column_coord = nodes[:, 0] - v_slope * nodes[:, 1]
+    row_coord = nodes[:, 1]
+    column_groups = cluster_axis(column_coord, max(3.0, 0.38 * h_spacing))
+    row_groups = cluster_axis(row_coord, max(3.0, 0.20 * v_spacing))
+
+    def draw_group_edges(groups, sort_axis, expected_slope, typical, color, vertical_edge):
+        max_len = 1.75 * typical
+        for group in groups:
+            if len(group) < 2:
+                continue
+            ordered = sorted(group, key=lambda idx: nodes[idx, sort_axis])
+            for ia, ib in zip(ordered[:-1], ordered[1:]):
+                p0, p1 = nodes[ia], nodes[ib]
+                dx, dy = p1 - p0
+                length = float(np.hypot(dx, dy))
+                if length < 4.0 or length > max_len:
+                    continue
+                if vertical_edge:
+                    # Residual after removing the expected column shear.
+                    if dy <= 2.0 or abs(dx - expected_slope * dy) > 0.28 * abs(dy):
+                        continue
+                else:
+                    # Blue edges connect only nearly level saddle points.
+                    if dx <= 2.0 or abs(dy) > max(3.0, 0.18 * abs(dx)):
+                        continue
+                ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
+                        color=color, linewidth=2, alpha=0.9, zorder=4)
+
+    draw_group_edges(column_groups, 1, v_slope, v_spacing, '#d83b32', True)
+    draw_group_edges(row_groups, 0, h_slope, h_spacing, '#1f73d8', False)
+    return
+
+    # Legacy whole-line fitting is retained below for reference but is no
+    # longer used; neighbour topology above is the authoritative rendering.
     unique_y = np.unique(np.round(world_s[:, 1], 2))
     unique_x = np.unique(np.round(world_s[:, 0], 2))
     H = compute_homography(world_s, img_s)
@@ -1271,23 +1514,108 @@ def find_inside_saddle_points(polygon_path, all_saddle_pts, chess_used_idx):
     return all_saddle_pts[mask], all_idx[mask]
 
 
-def _filter_points_inside_polygon(img_pts, world_pts, ref_img_pts):
+def _filter_points_inside_polygon(img_pts, world_pts, ref_img_pts, expand_ratio=0.0):
     """
     过滤掉落在 ref_img_pts 凸包外的点。
     用于防止棋盘格重建/插值时把外围候选点误拉进可视化网格。
+
+    expand_ratio: 凸包外扩比例（0=严格不扩展，0.22≈允许约1格边界余量）
     """
     if len(ref_img_pts) < 3 or len(img_pts) == 0:
         return img_pts, world_pts
-    poly, _ = get_chessboard_polygon(ref_img_pts)
-    if poly is None:
-        return img_pts, world_pts
+
+    try:
+        from scipy.spatial import ConvexHull as CH
+        hull = CH(ref_img_pts)
+        hull_pts = ref_img_pts[hull.vertices]
+    except Exception:
+        min_xy = np.min(ref_img_pts, axis=0)
+        max_xy = np.max(ref_img_pts, axis=0)
+        hull_pts = np.array([[min_xy[0], min_xy[1]], [max_xy[0], min_xy[1]],
+                             [max_xy[0], max_xy[1]], [min_xy[0], max_xy[1]]])
+
+    if expand_ratio > 0 and len(hull_pts) >= 3:
+        centroid = np.mean(hull_pts, axis=0)
+        expanded_pts = centroid + (hull_pts - centroid) * (1.0 + expand_ratio)
+        poly = Path(expanded_pts)
+    else:
+        poly = Path(hull_pts)
+
     inside = poly.contains_points(img_pts)
     if np.sum(inside) < 4:
         return img_pts, world_pts
     return img_pts[inside], world_pts[inside]
 
 
-def _filter_false_positive_x_corners(jilu_b, img_b, min_dist_ratio=0.35):
+def _butterfly_contrast_score(img_gray, cx, cy, radius):
+    """Return an orientation-independent score for two opposite dark lobes.
+
+    A butterfly mark has two similar, opposite dark sectors and two lighter
+    sectors between them.  Ordinary checker intersections and isolated edges
+    do not satisfy both the 180-degree symmetry and the angular contrast.
+    """
+    h, w = img_gray.shape
+    radius = float(np.clip(radius, 5.0, 28.0))
+    yy, xx = np.mgrid[max(0, int(cy - radius)):min(h, int(cy + radius) + 1),
+                      max(0, int(cx - radius)):min(w, int(cx + radius) + 1)]
+    if xx.size < 25:
+        return 0.0
+    dx, dy = xx - cx, yy - cy
+    rr = np.hypot(dx, dy)
+    annulus = (rr >= 0.28 * radius) & (rr <= radius)
+    if np.sum(annulus) < 24:
+        return 0.0
+    angle = (np.arctan2(dy, dx) + 2 * np.pi) % (2 * np.pi)
+    vals = np.asarray(img_gray[yy, xx], dtype=float)
+    sector_means = []
+    n_sector = 12
+    for k in range(n_sector):
+        delta = np.angle(np.exp(1j * (angle - 2 * np.pi * k / n_sector)))
+        mask = annulus & (np.abs(delta) <= np.pi / n_sector)
+        sector_means.append(float(np.mean(vals[mask])) if np.any(mask) else np.nan)
+    s = np.asarray(sector_means)
+    if not np.all(np.isfinite(s)):
+        return 0.0
+    dynamic = float(np.percentile(vals[annulus], 90) - np.percentile(vals[annulus], 10))
+    # Use the local annulus dynamic range.  Computing whole-image percentiles
+    # here made endpoint window search prohibitively expensive because this
+    # function is called thousands of times.
+    contrast_scale = dynamic + 1e-9
+    best = 0.0
+    for k in range(n_sector // 2):
+        dark = np.array([s[k], s[k + n_sector // 2]])
+        side = np.array([s[(k + 3) % n_sector], s[(k + 9) % n_sector]])
+        # Both opposite lobes must independently be darker than the side
+        # sectors.  Using only their mean allowed a single black edge/lobe to
+        # score highly and shifted the reported centre away from the mark.
+        side_mean = float(np.mean(side))
+        contrast = min(side_mean - float(dark[0]),
+                       side_mean - float(dark[1])) / contrast_scale
+        symmetry = 1.0 - min(1.0, abs(dark[0] - dark[1]) / (dynamic + 1e-9))
+        best = max(best, contrast * max(0.0, symmetry))
+    return float(best)
+
+
+def _estimate_grid_spacing(img_pts):
+    """Robust image-space cell spacing, ignoring duplicate/interpolated nodes."""
+    if len(img_pts) < 2:
+        return 20.0
+    tree = KDTree(img_pts)
+    k = min(8, len(img_pts))
+    distances, _ = tree.query(img_pts, k=k)
+    if distances.ndim == 1:
+        return max(8.0, float(np.median(distances)))
+    nearest_nonzero = []
+    for row in distances:
+        valid = row[np.isfinite(row) & (row > 8.0)]
+        if len(valid):
+            nearest_nonzero.append(float(valid[0]))
+    if not nearest_nonzero:
+        return 20.0
+    return float(np.median(nearest_nonzero))
+
+
+def _filter_false_positive_x_corners(jilu_b, img_b, img_gray, min_dist_ratio=0.35):
     """
     过滤掉落在棋盘格普通网格角点上的假阳性 X 角点。
 
@@ -1299,20 +1627,273 @@ def _filter_false_positive_x_corners(jilu_b, img_b, min_dist_ratio=0.35):
         return jilu_b
 
     tree = KDTree(img_b)
-    dists, _ = tree.query(img_b, k=2)
-    median_spacing = float(np.median(dists[:, 1]))
+    median_spacing = _estimate_grid_spacing(img_b)
     min_dist = max(5.0, min_dist_ratio * median_spacing)
+    image_median = float(np.median(img_gray))
+    h_img, w_img = img_gray.shape
 
     filtered = []
     for rec in jilu_b:
         cx, cy = float(rec[1]), float(rec[2])
         d, _ = tree.query([[cx, cy]], k=1)
-        if d[0] >= min_dist:
+        appearance = _butterfly_contrast_score(
+            img_gray, cx, cy, radius=max(7.0, 0.48 * median_spacing))
+        # A valid printed X lies on the light board substrate.  Occluded marks
+        # must not be inferred from dark foot/skin texture.
+        bg_r = int(round(np.clip(0.65 * median_spacing, 10.0, 35.0)))
+        patch = img_gray[max(0, int(cy) - bg_r):min(h_img, int(cy) + bg_r + 1),
+                         max(0, int(cx) - bg_r):min(w_img, int(cx) + bg_r + 1)]
+        on_bright_board = (patch.size >= 25 and
+                           float(np.percentile(patch, 75)) >= image_median)
+        # Strong, complete two-lobe evidence is sufficient under cast shadow;
+        # endpoint fallback still keeps the bright-board requirement, which
+        # rejects occluding foot texture.
+        visible_butterfly = appearance >= 0.16 and (on_bright_board or appearance >= 0.80)
+        if d[0] >= min_dist and visible_butterfly:
             filtered.append(rec)
         else:
             print(f"  [过滤] 疑似假阳性 X 角点 (type={int(rec[0])}, "
-                  f"位置=({cx:.1f},{cy:.1f})): 距最近网格点 {d[0]:.1f}px < {min_dist:.1f}px")
+                  f"位置=({cx:.1f},{cy:.1f})): 网格距离={d[0]:.1f}px "
+                  f"(阈值{min_dist:.1f}), 蝴蝶外观分={appearance:.3f}, "
+                  f"亮底板={on_bright_board}")
     return filtered
+
+
+def _refine_x_marks_to_butterfly_centers(jilu_b, img_b, img_gray):
+    """Move each detected mark to the midpoint of its two black lobes."""
+    if len(jilu_b) == 0 or len(img_b) < 2:
+        return jilu_b
+    spacing = _estimate_grid_spacing(img_b)
+    # Initial template/fallback coordinates may lie on one lobe.  A wider ROI
+    # is required to contain both complete half-discs before taking their
+    # midpoint.
+    # Marker size is not the same as the local saddle spacing (perspective and
+    # interpolated duplicates can make that estimate unstable).  Use a fixed
+    # maximum ROI large enough for both the small vertical and large
+    # horizontal butterfly marks in these images.
+    # The fallback peak for the small upper-left mark can be more than one
+    # lobe away from the waist; 125 px is needed to include its second lobe.
+    roi_r = 125
+    h, w = img_gray.shape
+    refined = []
+
+    for rec in jilu_b:
+        cx, cy = float(rec[1]), float(rec[2])
+        x0, x1 = max(0, int(round(cx)) - roi_r), min(w, int(round(cx)) + roi_r + 1)
+        y0, y1 = max(0, int(round(cy)) - roi_r), min(h, int(round(cy)) + roi_r + 1)
+        patch = np.asarray(img_gray[y0:y1, x0:x1], dtype=float)
+        if patch.size < 100:
+            refined.append(rec)
+            continue
+
+        # Dark lobes occupy a minority of the light substrate.  A percentile
+        # threshold is robust to exposure changes and cast shadows.
+        p10, p45 = np.percentile(patch, [10, 45])
+        dark_threshold = p10 + 0.42 * (p45 - p10)
+        mask = patch <= dark_threshold
+        labels, count = ndi_label(mask)
+        components = []
+        patch_area = float(patch.size)
+        for lab in range(1, count + 1):
+            yy, xx = np.where(labels == lab)
+            area = len(xx)
+            if area < max(28, 0.007 * patch_area) or area > 0.28 * patch_area:
+                continue
+            # Ignore cropped background/board edges; true lobes are contained.
+            if np.any(xx == 0) or np.any(yy == 0) or \
+                    np.any(xx == patch.shape[1] - 1) or np.any(yy == patch.shape[0] - 1):
+                continue
+            components.append({
+                'area': float(area),
+                'center': np.array([x0 + np.mean(xx), y0 + np.mean(yy)]),
+                'mean': float(np.mean(patch[yy, xx])),
+                'span': np.array([np.ptp(xx) + 1, np.ptp(yy) + 1], dtype=float),
+                'pixels': np.column_stack([x0 + xx, y0 + yy]).astype(float),
+            })
+
+        best = None
+        for i in range(len(components)):
+            for j in range(i + 1, len(components)):
+                a, b = components[i], components[j]
+                sep = float(np.linalg.norm(a['center'] - b['center']))
+                if sep < 10.0 or sep > 145.0:
+                    continue
+                area_ratio = min(a['area'], b['area']) / max(a['area'], b['area'])
+                if area_ratio < 0.32:
+                    continue
+                midpoint = 0.5 * (a['center'] + b['center'])
+                shift = float(np.linalg.norm(midpoint - np.array([cx, cy])))
+                if shift > 88.0:
+                    continue
+                darkness = max(0.0, dark_threshold - 0.5 * (a['mean'] + b['mean']))
+                # Prefer two substantial, similarly sized lobes.  The former
+                # ratio-dominated score could select two tiny fragments within
+                # the upper lobe and therefore place the green point off-centre.
+                pair_mass = np.sqrt(a['area'] * b['area'])
+                score = pair_mass * area_ratio / (1.0 + shift / (spacing + 1e-9))
+                score *= (1.0 + darkness)
+                if best is None or score > best[0]:
+                    best = (score, midpoint, sep, area_ratio)
+
+        if best is None and components:
+            # On small/blurred marks the pointed ends of the two half-discs
+            # can touch after thresholding and form one substantial component.
+            # Conversely, exposure may split one mark into exactly two large
+            # components even when the stricter pair test rejected it.  Use
+            # only large, compact components near the initial endpoint prior.
+            near = [c for c in components
+                    if np.linalg.norm(c['center'] - np.array([cx, cy])) <= 92.0]
+            near.sort(key=lambda c: c['area'], reverse=True)
+            substantial = [c for c in near
+                           if c['area'] >= 0.018 * patch_area and
+                           np.min(c['span']) >= 12.0]
+            if len(substantial) >= 2:
+                a, b = substantial[:2]
+                sep = float(np.linalg.norm(a['center'] - b['center']))
+                midpoint = 0.5 * (a['center'] + b['center'])
+                if (10.0 <= sep <= 145.0 and
+                        np.linalg.norm(midpoint - np.array([cx, cy])) <= 88.0):
+                    ratio = min(a['area'], b['area']) / max(a['area'], b['area'])
+                    best = (0.0, midpoint, sep, ratio)
+            elif len(substantial) == 1:
+                c = substantial[0]
+                # A merged two-lobe silhouette is large in both axes.  Its
+                # area centroid is biased toward the larger/shadowed lobe;
+                # locate the narrow waist along the major image axis instead.
+                if c['area'] >= 0.025 * patch_area:
+                    pix = c['pixels']
+                    major = 1 if c['span'][1] >= c['span'][0] else 0
+                    coords = np.round(pix[:, major]).astype(int)
+                    values, counts = np.unique(coords, return_counts=True)
+                    vmin, vmax = int(values.min()), int(values.max())
+                    central = (values >= vmin + 0.28 * (vmax - vmin)) & \
+                              (values <= vmin + 0.72 * (vmax - vmin))
+                    if np.any(central):
+                        central_values = values[central]
+                        central_counts = counts[central]
+                        min_count = np.min(central_counts)
+                        waist_options = central_values[central_counts == min_count]
+                        waist_axis = float(waist_options[
+                            np.argmin(np.abs(waist_options - 0.5 * (vmin + vmax)))])
+                        band = np.abs(pix[:, major] - waist_axis) <= 1.0
+                        other = 1 - major
+                        waist_other = float(np.mean(pix[band, other]))
+                        midpoint = np.zeros(2, dtype=float)
+                        midpoint[major] = waist_axis
+                        midpoint[other] = waist_other
+                    else:
+                        midpoint = 0.5 * (np.min(pix, axis=0) + np.max(pix, axis=0))
+                    best = (0.0, midpoint, float(np.max(c['span'])), 1.0)
+
+        if best is not None:
+            midpoint = best[1]
+            print(f"  [X中心校正] ({cx:.1f},{cy:.1f}) -> "
+                  f"({midpoint[0]:.1f},{midpoint[1]:.1f}), "
+                  f"双瓣间距={best[2]:.1f}px, 面积比={best[3]:.2f}")
+            refined.append([int(rec[0]), float(midpoint[0]), float(midpoint[1])])
+        else:
+            # No complete pair means the mark is clipped/occluded; do not
+            # display a point guessed from a single visible dark region.
+            print(f"  [X过滤] ({cx:.1f},{cy:.1f}) 未找到完整双瓣，不标出")
+    return refined
+
+
+def _detect_endpoint_butterfly_fallback(img_b, world_b, H_b, img_gray,
+                                         existing, grid_spacing=15.0):
+    """Find butterfly marks beyond the ends of a narrow chessboard strip.
+
+    Unlike ``get_mark_cord`` this fallback does not require the mark centre to
+    have survived the checkerboard saddle templates.  Its search region is
+    deliberately restricted to the projected centre line, 1.2--3.6 cells
+    beyond either end of a two-column strip.
+    """
+    if H_b is None or len(img_b) < 6 or len(world_b) < 6:
+        return []
+    snapped = np.round(world_b / grid_spacing).astype(int)
+    ux, uy = np.unique(snapped[:, 0]), np.unique(snapped[:, 1])
+    # The physical target uses a narrow two-column saddle strip.  Do not run
+    # the fallback on broad/irregular boards, where endpoint priors are weak.
+    if len(ux) != 2 or len(uy) < 4:
+        return []
+
+    x_mid = 0.5 * (float(np.min(ux)) + float(np.max(ux))) * grid_spacing
+    y_min, y_max = float(np.min(uy)) * grid_spacing, float(np.max(uy)) * grid_spacing
+    anchors_w = np.array([[x_mid, y_min], [x_mid, y_max]], dtype=float)
+    inner_w = np.array([[x_mid, y_min + grid_spacing],
+                        [x_mid, y_max - grid_spacing]], dtype=float)
+    anchors = _project_world_points(H_b, anchors_w)
+    inner = _project_world_points(H_b, inner_w)
+    if anchors is None or inner is None or not np.isfinite(anchors).all():
+        return []
+
+    h_img, w_img = img_gray.shape
+    image_median = float(np.median(img_gray))
+    existing_xy = np.asarray([[float(r[1]), float(r[2])] for r in existing], dtype=float) \
+        if len(existing) else np.empty((0, 2))
+    found = []
+    for end_idx in range(2):
+        outward = anchors[end_idx] - inner[end_idx]
+        cell_px = float(np.linalg.norm(outward))
+        if cell_px < 8.0:
+            continue
+        outward /= cell_px
+        lateral = np.array([-outward[1], outward[0]])
+        radius = float(np.clip(0.58 * cell_px, 14.0, 30.0))
+        best_score, best_pos = 0.0, None
+        # Coarse pixel search.  Longitudinal restriction is what prevents
+        # checker intersections inside the strip from becoming candidates.
+        for along in np.arange(1.2 * cell_px, 3.61 * cell_px, 3.0):
+            base = anchors[end_idx] + along * outward
+            for side in np.arange(-0.48 * cell_px, 0.481 * cell_px, 3.0):
+                p = base + side * lateral
+                cx, cy = float(p[0]), float(p[1])
+                if cx < radius or cy < radius or cx >= w_img - radius or cy >= h_img - radius:
+                    continue
+                score = _butterfly_contrast_score(img_gray, cx, cy, radius)
+                if score > best_score:
+                    best_score, best_pos = score, (cx, cy)
+        # The endpoint prior is strong, so this threshold can be lower than
+        # the generic full-image appearance threshold.
+        if best_pos is None or best_score < 0.14:
+            continue
+        # The mark is printed on the bright board substrate.  This rejects
+        # symmetric texture on the dark/occluding foot beyond the lower end.
+        bx, by = best_pos
+        r_bg = int(round(1.35 * radius))
+        bg_patch = img_gray[max(0, int(by) - r_bg):min(h_img, int(by) + r_bg + 1),
+                            max(0, int(bx) - r_bg):min(w_img, int(bx) + r_bg + 1)]
+        if bg_patch.size < 25 or float(np.percentile(bg_patch, 75)) < image_median:
+            continue
+
+        # The angular score can peak near a lobe edge.  Re-centre on the dark
+        # mass in a larger patch so the plotted point lies in the white gap
+        # between the two black half-discs.
+        # The coarse angular maximum can sit roughly one lobe radius outside
+        # the true centre, so include both lobes with a wider refinement ROI.
+        r_ref = int(round(3.2 * radius))
+        x0, x1 = max(0, int(bx) - r_ref), min(w_img, int(bx) + r_ref + 1)
+        y0, y1 = max(0, int(by) - r_ref), min(h_img, int(by) + r_ref + 1)
+        patch = np.asarray(img_gray[y0:y1, x0:x1], dtype=float)
+        dark_cut = float(np.percentile(patch, 32))
+        weights = np.clip(dark_cut - patch, 0.0, None)
+        if np.sum(weights) > 1e-6:
+            gy, gx = np.mgrid[y0:y1, x0:x1]
+            p = np.array([np.sum(gx * weights) / np.sum(weights),
+                          np.sum(gy * weights) / np.sum(weights)])
+        else:
+            p = np.asarray(best_pos)
+        if len(existing_xy) and np.min(np.linalg.norm(existing_xy - p, axis=1)) < 0.65 * cell_px:
+            continue
+        if found and np.min([np.linalg.norm(np.asarray(r[1:3]) - p) for r in found]) < 0.65 * cell_px:
+            continue
+        # Stable geometric type for reporting: 1/2 upper-left/right,
+        # 3/4 lower-left/right in the image.
+        ctype = (1 if p[0] < w_img / 2 else 2) if p[1] < h_img / 2 else \
+                (3 if p[0] < w_img / 2 else 4)
+        found.append([ctype, float(p[0]), float(p[1])])
+        print(f"  [端点回退] 检测到蝴蝶X角点 type={ctype}, "
+              f"位置=({p[0]:.1f},{p[1]:.1f}), 外观分={best_score:.3f}")
+    return found
 
 
 def validate_chessboard_grid_alignment(world_pts, max_deviation=1.5):
@@ -1522,6 +2103,90 @@ def propagate_chessboard_by_homography(first_img_pts, first_world_pts, first_H,
     return img_pts, world_pts, H, set()
 
 
+def fill_missing_saddles_by_proximity(img_pts, world_pts, all_saddle_pts, grid_spacing=15.0):
+    """
+    近邻吸附：对每个孤儿鞍点，在棋盘格上找k个最近点，尝试所有点对组合。
+    若鞍点在任一点对连线上（垂距<12px，投影t在0.02~0.98），则用线性插值估算世界坐标并附加。
+
+    返回: (extended_img, extended_world, n_added)
+    """
+    if len(img_pts) < 4 or len(all_saddle_pts) == 0:
+        return img_pts, world_pts, 0
+
+    # 估算网格间距
+    diffs = np.linalg.norm(np.diff(img_pts[:min(10, len(img_pts))], axis=0), axis=1)
+    img_spacing = float(np.median(diffs)) if len(diffs) > 0 else 25.0
+
+    tree_board = KDTree(img_pts)
+    tree_saddle = KDTree(all_saddle_pts)
+
+    dist_board_to_saddle, _ = tree_saddle.query(img_pts, k=1)
+    typical_match_dist = float(np.median(dist_board_to_saddle)) + 3.0
+
+    # 孤儿鞍点：距棋盘格 > typical_match_dist 且 < 5倍间距（覆盖更大的棋盘格）
+    k_near = min(5, len(img_pts))
+    dist_to_board, idx_nearest = tree_board.query(all_saddle_pts, k=k_near)
+    orphan_mask = (dist_to_board[:, 0] > typical_match_dist) & (dist_to_board[:, 0] < img_spacing * 5.0)
+    orphan_idx = np.where(orphan_mask)[0]
+
+    if len(orphan_idx) == 0:
+        return img_pts, world_pts, 0
+
+    added_pts = []
+    added_world = []
+    added_img_set = set()  # 用坐标元组去重
+
+    for oi in orphan_idx:
+        cand = all_saddle_pts[oi]
+        found = False
+        # 尝试k个最近点中所有点对组合
+        for a in range(k_near):
+            if found:
+                break
+            i1 = int(idx_nearest[oi, a])
+            pt1 = img_pts[i1]
+            w1 = world_pts[i1]
+            for b in range(a + 1, k_near):
+                i2 = int(idx_nearest[oi, b])
+                pt2 = img_pts[i2]
+                w2 = world_pts[i2]
+
+                vec_12 = pt2 - pt1
+                dist_12 = float(np.linalg.norm(vec_12))
+                if dist_12 < 5.0:
+                    continue
+
+                t = float(np.dot(cand - pt1, vec_12) / (dist_12 ** 2))
+                if t < 0.02 or t > 0.98:
+                    continue
+
+                proj = pt1 + t * vec_12
+                perp_dist = float(np.linalg.norm(cand - proj))
+                if perp_dist > 12.0:
+                    continue
+
+                # 通过：线性插值世界坐标
+                w_new = w1 + t * (w2 - w1)
+                key = (round(cand[0], 1), round(cand[1], 1))
+                if key not in added_img_set:
+                    added_img_set.add(key)
+                    added_pts.append(cand)
+                    added_world.append(w_new)
+                found = True
+                break
+
+    if len(added_pts) == 0:
+        return img_pts, world_pts, 0
+
+    new_pts = np.array(added_pts)
+    new_world = np.array(added_world)
+    combined_img = np.vstack([img_pts, new_pts])
+    combined_world = np.vstack([world_pts, new_world])
+    combined_world = combined_world - np.min(combined_world, axis=0)
+
+    return combined_img, combined_world, len(new_pts)
+
+
 def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     global img_path_glob
     img_path_glob = img_path
@@ -1531,8 +2196,8 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     img_gray = imread_gray(img_path)
     img_gray = gaussian_filter(img_gray, sigma=0.5)
     blur_var = measure_blur_level(img_gray)
-    tau_nms = 0.010 if blur_var < 50 else 0.015  # 降低NMS阈值，保留更多候选鞍点
-    tau_score = 0.005 if blur_var < 50 else 0.008  # 降低评分阈值，避免过滤边缘低对比度鞍点
+    tau_nms = 0.015 if blur_var < 50 else 0.02
+    tau_score = 0.01 if blur_var < 50 else 0.015
     print(f"  模糊度={blur_var:.1f}, NMS阈值={tau_nms}, 评分阈值={tau_score}")
     h, w = img_gray.shape
     nn = [h, w]
@@ -1586,29 +2251,75 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     print(f"鞍点检测耗时: {time.time() - t0:.2f} 秒")
     corner = {'v1': final_v1, 'v2': final_v2}
     xcsp = np.round(final_points[:, 0]).astype(int) * h + np.round(final_points[:, 1]).astype(int)
-    # ========== 替换为 MATLAB 风格棋盘格生长 ==========
+    # ========== 4_29版本棋盘格检测：get_little_four_P_py + grow_chessboard_region ==========
+    # 4_29方法核心：单应投影生长，无BFS方向约束，天然处理透视畸变和角落鞍点
     points = final_points.copy()
-    # 替换原来的调用
-    dirs = np.column_stack([final_v1, final_v2])
-    found_chessboards_raw = find_chessboard_candidates(points, dirs, final_scores, img_gray.shape, max_boards=6)
+    dirs_4_29 = np.stack([final_v1, final_v2], axis=1)  # (N,2,2) 格式
+    found_chessboards_raw = []
+    sorted_idx = np.argsort(final_scores)[::-1]
+
+    for start_idx in sorted_idx[:min(500, len(points))]:
+        try:
+            quad_pts, quad_idx = get_little_four_P_py(points, dirs_4_29, start_idx, img_gray.shape)
+        except Exception:
+            continue
+        if quad_idx is None:
+            continue
+        try:
+            img_pts, world_pts, H, used_idx = grow_chessboard_region(
+                points, dirs_4_29, quad_idx, max_iter=120, dist_thresh=12.0)
+        except Exception:
+            continue
+        if len(img_pts) < 6:
+            continue
+        img_pts, world_pts = _unique_world_points(img_pts, world_pts)
+        if len(img_pts) < 6:
+            continue
+        # 归一化世界坐标（4_29方式：减原点，必要时交换XY轴）
+        world_pts = world_pts - np.min(world_pts, axis=0)
+        max_xy = np.max(world_pts, axis=0)
+        if max_xy[0] > max_xy[1]:
+            world_pts = world_pts[:, [1, 0]]
+            world_pts[:, 0] = 15.0 - world_pts[:, 0]
+        H = compute_homography(world_pts, img_pts)
+        if H is None:
+            continue
+        # 简单去重（4_29方式：>50%共享鞍点即判为重复）
+        used_idx_set = set(used_idx)
+        is_new = True
+        for exist_img, exist_world, exist_H, exist_used in found_chessboards_raw:
+            overlap = len(used_idx_set & exist_used)
+            if overlap > 0.5 * len(used_idx_set) or overlap > 0.5 * len(exist_used):
+                is_new = False
+                break
+        if is_new:
+            found_chessboards_raw.append((img_pts, world_pts, H, used_idx_set))
+        if len(found_chessboards_raw) >= 12:
+            break
+
     if not found_chessboards_raw:
         print("未找到有效棋盘格")
         return False, img_path
-    # 将 raw 结果转换为原有格式：质量评分 + 重叠过滤
+
+    # 最小后处理：跳过prepare（避免修改4_29的原始生长结果），仅做基本验证
+    dirs = np.column_stack([final_v1, final_v2])  # BFS格式（供策略B/C使用）
     scored_boards = []
     for img_pts, world_pts, H, used_idx in found_chessboards_raw:
-        img_pts, world_pts, H = prepare_chessboard_candidate(img_pts, world_pts, final_points, H)
-        # 世界坐标原点归零
-        world_pts = world_pts - np.min(world_pts, axis=0)
-        # 网格规整度验证
-        valid, med_dev = validate_chessboard_grid_alignment(world_pts)
-        if not valid:
-            print(f"  [X] 丢弃棋盘格 (偏差 {med_dev:.2f})")
+        # 仅做轻量离群点过滤（阈值放宽），不调用prepare_chessboard_candidate
+        img_pts, world_pts, _ = filter_chessboard_line_outliers(
+            img_pts, world_pts, threshold=12.0, min_points=4)
+        if len(img_pts) < 4:
             continue
+        world_pts = world_pts - np.min(world_pts, axis=0)
+        # 网格验证放宽（4_29不验证，这里用宽松阈值保留所有有效板）
+        valid, med_dev = validate_chessboard_grid_alignment(world_pts, max_deviation=5.0)
+        if not valid and len(img_pts) < 6:
+            pass  # 小板宽容
         quality = calculate_chessboard_quality(img_pts, world_pts)
         p90_line, worst_line, bad_groups = chessboard_line_residual_summary(img_pts, world_pts)
         print(
-            f"  候选棋盘: 点数 {len(img_pts)}, 线残差p90 {p90_line:.2f}, 最大残差 {worst_line:.2f}, 异常组 {bad_groups}, 质量 {quality:.2f}")
+            f"  候选棋盘: 点数 {len(img_pts)}, 线残差p90 {p90_line:.2f}, "
+            f"最大残差 {worst_line:.2f}, 异常组 {bad_groups}, 质量 {quality:.2f}")
         scored_boards.append((img_pts, world_pts, H, used_idx, quality))
     # 按质量降序，取不重叠的棋盘格（数量不限，后续由MAX_BOARDS控制总量）
     # ⚠ 重要：用图像空间重叠检查，而非世界坐标（世界坐标已归零，不同棋盘格可能
@@ -1829,29 +2540,79 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
 
     cleaned_final_two = []
     for img_pts, world_pts, H, used_idx, qual in final_two:
-        # 保存重建前的原始点，用于剔除外扩/插值引入的凸包外点
         orig_img = img_pts.copy()
-        orig_world = world_pts.copy()
 
-        # 关闭外扩 margin：只补当前 bbox 内部的缺失点，避免把外围候选点拉进来
+        # 外扩 margin=4：单应投影外扩4格以捕获生长遗漏的边界/角落鞍点
         clean_img, clean_world, clean_H = complete_chessboard_from_candidates(
-            img_pts, world_pts, final_points, expand_margin=0)
-        # 过滤重建阶段引入的凸包外点
-        clean_img, clean_world = _filter_points_inside_polygon(clean_img, clean_world, orig_img)
+            img_pts, world_pts, final_points, expand_margin=4)
+        # 仅小幅外扩：足够容纳亚像素误差，同时避免吸入相邻棋盘。
+        clean_img, clean_world = _filter_points_inside_polygon(
+            clean_img, clean_world, orig_img, expand_ratio=0.06)
 
         before_fill = len(clean_img)
-        # 根据当前完整度决定插值策略：高完整度棋盘格直接补齐 bbox 内所有缺失网格点，
-        # 避免细长棋盘格的顶角/边角因邻居不足而遗漏；低完整度棋盘格仍保守插值。
         snapped = np.round(clean_world / 15.0).astype(int)
         grid_cells = len(np.unique(snapped[:, 0])) * len(np.unique(snapped[:, 1]))
         fill_ratio = len(clean_img) / max(1, grid_cells)
         min_n = 0 if fill_ratio > 0.70 else 2
         clean_img, clean_world = interpolate_missing_grid_points(clean_img, clean_world, min_neighbors=min_n)
-        # 注：插值得到的是规则网格单应投影点，不再用原始凸包过滤，避免边界缺失点被误删。
 
         if len(clean_img) != before_fill:
             print(f"  网格插值填补: {before_fill} -> {len(clean_img)} 个交叉点")
             clean_H = compute_homography(clean_world, clean_img)
+
+        # ---- 鞍点吸附：将棋盘格附近的孤立鞍点附加进来 ----
+        if clean_H is not None and len(clean_img) >= 4:
+            tree_board = KDTree(clean_img)
+            dist_to_board, _ = tree_board.query(final_points, k=1)
+            # 只在一个典型网格步长内吸附，避免跨到邻近棋盘。
+            _, nn_idx = tree_board.query(clean_img, k=2)
+            local_spacing = float(np.median(np.linalg.norm(
+                clean_img - clean_img[nn_idx[:, 1]], axis=1)))
+            attach_radius = float(np.clip(0.80 * local_spacing, 8.0, 32.0))
+            orphan_mask = (dist_to_board > 3.0) & (dist_to_board < attach_radius)
+            orphan_pts = final_points[orphan_mask]
+            if len(orphan_pts) > 0:
+                # 用单应投影验证：将孤立点投影到世界坐标，检查是否接近网格位置
+                ones = np.ones((len(orphan_pts), 1))
+                # 需要逆单应（image→world），用 H 的逆
+                try:
+                    H_inv = np.linalg.inv(clean_H)
+                except np.linalg.LinAlgError:
+                    H_inv = None
+                if H_inv is not None:
+                    img_h = np.hstack([orphan_pts, ones])
+                    world_h = (H_inv @ img_h.T).T
+                    world_proj = world_h[:, :2] / (world_h[:, 2, np.newaxis] + 1e-12)
+                    # 检查投影是否接近15mm网格
+                    snapped_proj = np.round(world_proj / 15.0) * 15.0
+                    grid_dev = np.linalg.norm(world_proj - snapped_proj, axis=1)
+                    # 网格偏差<3mm且投影在合理范围内
+                    # 还必须落在当前棋盘已知世界范围的一格邻域内。
+                    w_min = np.min(clean_world, axis=0) - 15.0
+                    w_max = np.max(clean_world, axis=0) + 15.0
+                    in_board_extent = np.all((world_proj >= w_min) & (world_proj <= w_max), axis=1)
+                    valid_attach = (grid_dev < 3.0) & in_board_extent
+                    if np.sum(valid_attach) > 0:
+                        new_pts = orphan_pts[valid_attach]
+                        new_world = snapped_proj[valid_attach]
+                        # 避免重复：检查新点是否已在棋盘格中
+                        tree_new = KDTree(new_pts)
+                        dist_exist, _ = tree_board.query(new_pts, k=1)
+                        not_dup = dist_exist > 3.0
+                        if np.sum(not_dup) > 0:
+                            clean_img = np.vstack([clean_img, new_pts[not_dup]])
+                            clean_world = np.vstack([clean_world, new_world[not_dup]])
+                            clean_world = clean_world - np.min(clean_world, axis=0)
+                            clean_H = compute_homography(clean_world, clean_img)
+                            print(f"  鞍点吸附: +{np.sum(not_dup)}个孤立鞍点 -> {len(clean_img)}点")
+
+        # ---- 近邻吸附：将棋盘格附近的孤立鞍点纳入 ----
+        clean_img, clean_world, n_filled = fill_missing_saddles_by_proximity(
+            clean_img, clean_world, final_points)
+        if n_filled > 0:
+            clean_H = compute_homography(clean_world, clean_img)
+            print(f"  近邻吸附: +{n_filled}个鞍点 -> {len(clean_img)}点")
+
         cleaned_final_two.append((clean_img, clean_world, clean_H if clean_H is not None else H, used_idx, qual))
 
     final_two = cleaned_final_two
@@ -1871,11 +2632,22 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
 
         xy_b = np.column_stack([world_n, np.ones(len(world_n))])
         uv_b = np.column_stack([img_n, np.ones(len(img_n))])
-        xy_b, uv_b, jilu_b = get_mark_cord(
-            final_points, corner, xy_b, uv_b, H_n,
-            nn, spij3, spij7, [], xcsp, Im0, mm, img_gray)
-        # 过滤普通棋盘格角点被误标为 X 角点的情况
-        jilu_b = _filter_false_positive_x_corners(jilu_b, img_n)
+        snapped_n = np.round(world_n / 15.0).astype(int)
+        n_grid_columns = len(np.unique(snapped_n[:, 0]))
+        if n_grid_columns == 2:
+            xy_b, uv_b, jilu_b = get_mark_cord(
+                final_points, corner, xy_b, uv_b, H_n,
+                nn, spij3, spij7, [], xcsp, Im0, mm, img_gray)
+            # 过滤普通网格点、遮挡区域及非完整蝴蝶外观。
+            jilu_b = _filter_false_positive_x_corners(jilu_b, img_n, img_gray)
+            # 大尺度蝴蝶中心可能未进入鞍点候选，沿两列棋盘端部补检。
+            jilu_b.extend(_detect_endpoint_butterfly_fallback(
+                img_n, world_n, H_n, img_gray, jilu_b))
+            # 最终坐标必须是两片黑色半圆质心的中点；单瓣/遮挡候选删除。
+            jilu_b = _refine_x_marks_to_butterfly_centers(jilu_b, img_n, img_gray)
+        else:
+            jilu_b = []
+            print(f"  [X跳过] 当前棋盘为 {n_grid_columns} 列，仅两列棋盘允许检测X角点")
         board_results.append((xy_b, uv_b, jilu_b))
 
 
@@ -1989,14 +2761,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         center_jilu = jilu_b
         center_inferred = []
 
-        # 不足4个X角点：推断缺失的（用于内部 H_corner 等计算，但推断的不标出）
-        if 0 < len(jilu_b) < 4:
-            jilu_full = _infer_missing_corners_from_partial(
-                jilu_b, center_wo, center_im, grid_spacing=15.0)
-            if jilu_full is not None and len(jilu_full) == 4:
-                center_jilu = jilu_full
-                detected_ids = {int(r[0]) for r in jilu_b}
-                center_inferred = [r for r in jilu_full if int(r[0]) not in detected_ids]
+        # 遮挡角点不推断、不补全：内部结果与可视化均只保留实际检测点。
         print(f"  中央棋盘格 #{center_board_idx+1} (质量={center_qual:.1f}, "
               f"距图像中心={board_centroids[0][0]:.1f}px, 范围 col[0,{full_col_max}] row[0,{full_row_max}]): "
               f"检测到{len(center_detected)}个X角点, 推断{len(center_inferred)}个缺失角点, 共{len(center_jilu)}个")
@@ -2016,14 +2781,38 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         dist, _ = tree.query(pts, k=1)
         return dist <= max_dist
 
-    near_board = _mask_points_near_boards(points, final_two, max_dist=40.0)
+    # “鞍点”只显示真正归属于某个棋盘网格的检测响应，不再显示
+    # 棋盘附近的任意角点候选。插值点不再作为白色网格点或连线节点。
+    board_detected = np.zeros(len(points), dtype=bool)
+    confirmed_boards = []
+    if len(points) > 0:
+        for im, wo, _, _, _ in final_two:
+            if len(im) == 0:
+                confirmed_boards.append((np.empty((0, 2)), np.empty((0, 2))))
+                continue
+            board_tree = KDTree(im)
+            dist, node_idx = board_tree.query(points, k=1)
+            mask = dist <= 2.5
+            point_idx = np.where(mask)[0]
+            # One original detection per board node; keep the closest match.
+            best_by_node = {}
+            for pi, ni, di in zip(point_idx, node_idx[mask], dist[mask]):
+                ni = int(ni)
+                if ni not in best_by_node or di < best_by_node[ni][1]:
+                    best_by_node[ni] = (int(pi), float(di))
+            selected_nodes = sorted(best_by_node)
+            selected_points = [best_by_node[ni][0] for ni in selected_nodes]
+            board_detected[selected_points] = True
+            confirmed_boards.append((points[selected_points], wo[selected_nodes]))
+    else:
+        confirmed_boards = [(np.empty((0, 2)), np.empty((0, 2))) for _ in final_two]
 
     plt.figure(figsize=(14, 12))
     ax = plt.gca()
     ax.imshow(img_gray, cmap='gray')
-    ax.plot(points[near_board, 0], points[near_board, 1], 'yo', markersize=3,
-            alpha=0.4, label=f'鞍点({np.sum(near_board)}/{len(points)})')
-    for idx, (im, wo, _, _, _) in enumerate(final_two):
+    ax.plot(points[board_detected, 0], points[board_detected, 1], 'yo', markersize=3,
+            alpha=0.4, label=f'棋盘鞍点({np.sum(board_detected)}/{len(points)})')
+    for idx, (im, wo) in enumerate(confirmed_boards):
         draw_chessboard_grid(ax, im, wo, img_shape=img_gray.shape)
         ax.plot(im[:, 0], im[:, 1], 'w+', markersize=9, markeredgewidth=1.6,
                 label=f'棋盘格{idx + 1}', zorder=8)
@@ -2056,9 +2845,9 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         if 'refined_p' in locals() and len(refined_p) > 0:
             ax_dbg.plot(refined_p[:, 0], refined_p[:, 1], 'co', markersize=2,
                         alpha=0.25, label=f'精化后({len(refined_p)})')
-        ax_dbg.plot(points[near_board, 0], points[near_board, 1], 'yo', markersize=3,
-                    alpha=0.5, label=f'评分通过({np.sum(near_board)}/{len(points)})')
-        for idx, (im, wo, _, _, _) in enumerate(final_two):
+        ax_dbg.plot(points[board_detected, 0], points[board_detected, 1], 'yo', markersize=3,
+                    alpha=0.5, label=f'棋盘归属({np.sum(board_detected)}/{len(points)})')
+        for idx, (im, wo) in enumerate(confirmed_boards):
             ax_dbg.plot(im[:, 0], im[:, 1], 'w+', markersize=10, markeredgewidth=2.0,
                         label=f'棋盘格{idx + 1}({len(im)})', zorder=8)
         # 调试图中也加入X角点标记（所有检测到的）
