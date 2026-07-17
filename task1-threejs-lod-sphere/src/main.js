@@ -8,7 +8,6 @@ import {
   findRegionAtDirection,
   invalidateCourseLayouts,
   prepareCourse,
-  readableTextColor,
   regionLayout,
   sampleClosedBoundary,
   slerpUnit,
@@ -81,6 +80,7 @@ const outerGeometry = new THREE.SphereGeometry(0.17, 18, 14);
 const handleGeometry = new THREE.SphereGeometry(0.22, 18, 14);
 const knowledgeGeometry = new THREE.SphereGeometry(0.12, 16, 12);
 const knowledgeLabelCache = new Map();
+const surfaceLabelColor = '#ffffff';
 
 function isMobileView() {
   return window.innerWidth < 720;
@@ -166,7 +166,7 @@ function makeSurfaceLabel(text, color, layout, options = {}) {
   let height = width / aspect;
   const maxHeight = Math.max(0.45, available * 0.62);
   const fitScale = Math.min(1, available / width, maxHeight / height);
-  // 标签使用同一目标字号；极小区域最多缩小 20%，其余拥挤情况交给遮挡检测处理。
+  // 标签使用同一目标字号；极小区域最多缩小 20%。
   // 这样能保持整体字级统一，同时避免小区域文字无限缩小到不可读。
   const labelScale = Math.max(options.minScale || 0.8, fitScale);
   width *= labelScale;
@@ -175,7 +175,9 @@ function makeSurfaceLabel(text, color, layout, options = {}) {
     map: texture,
     transparent: true,
     alphaTest: 0.025,
-    depthTest: true,
+    // 球面深度和标签网格非常接近，旋转时继续参与深度测试会产生闪烁。
+    // 标签的前后面显隐由 updateSurfaceLabelVisibility 统一处理。
+    depthTest: false,
     depthWrite: false,
     side: THREE.DoubleSide,
     toneMapped: false
@@ -207,8 +209,15 @@ function makeBillboardLabel(text, color = '#17202a', scale = 1, depthTest = fals
 
 function makeKnowledgeLabel(text) {
   if (!knowledgeLabelCache.has(text)) {
-    const { texture, aspect } = makeTextTexture(text, '#0f172a', 3);
-    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true, depthWrite: false });
+    const { texture, aspect } = makeTextTexture(text, surfaceLabelColor, 3);
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      alphaTest: 0.025,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false
+    });
     material.userData.baseOpacity = 1;
     material.userData.sharedMaterial = true;
     knowledgeLabelCache.set(text, { material, aspect });
@@ -339,7 +348,7 @@ function buildLabelsAndKnowledge(courseGroup) {
 
   course.chapters.forEach((chapter) => {
     const layout = regionLayout(course, chapter);
-    const label = makeSurfaceLabel(chapter.title, readableTextColor(chapter.__color), layout, {
+    const label = makeSurfaceLabel(chapter.title, surfaceLabelColor, layout, {
       maxChars: 8,
       targetWidth: 5.4,
       minScale: 0.8,
@@ -353,7 +362,7 @@ function buildLabelsAndKnowledge(courseGroup) {
 
   course.sections.forEach((section) => {
     const layout = regionLayout(course, section);
-    const label = makeSurfaceLabel(section.title, readableTextColor(section.__color), layout, {
+    const label = makeSurfaceLabel(section.title, surfaceLabelColor, layout, {
       maxChars: 9,
       targetWidth: 5.4,
       minScale: 0.8,
@@ -578,40 +587,27 @@ function updateLod() {
   updateLayerBlend(distance);
 }
 
-function labelScreenRect(label, courseGroup) {
+function isSurfaceLabelVisible(label, courseGroup) {
   const material = Array.isArray(label.material) ? label.material[0] : label.material;
-  if (!label.userData?.isSurfaceLabel || !material || material.opacity < 0.12) return null;
+  if (!label.userData?.isSurfaceLabel || !material || material.opacity < 0.12) return false;
   const localAnchor = label.userData.anchorLocal;
-  if (!localAnchor) return null;
+  if (!localAnchor) return false;
   const world = courseGroup.group.localToWorld(localAnchor.clone());
   const center = new THREE.Vector3();
   courseGroup.group.getWorldPosition(center);
   const normal = world.clone().sub(center).normalize();
   const view = camera.position.clone().sub(world).normalize();
-  if (normal.dot(view) < 0.25) return null;
+  // 使用显隐滞回区间，避免标签在球体轮廓附近因浮点误差反复跳变。
+  const facingThreshold = label.visible ? -0.06 : 0.06;
+  if (normal.dot(view) <= facingThreshold) return false;
   const projected = world.clone().project(camera);
-  if (Math.abs(projected.x) > 1.08 || Math.abs(projected.y) > 1.08 || projected.z < -1 || projected.z > 1) return null;
-  const size = label.userData.labelSize || { width: 1, height: 0.4 };
-  const distance = Math.max(1, camera.position.distanceTo(world));
-  const pixelsPerWorld = renderer.domElement.clientHeight
-    / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * distance);
-  return {
-    x: (projected.x * 0.5 + 0.5) * renderer.domElement.clientWidth,
-    y: (-projected.y * 0.5 + 0.5) * renderer.domElement.clientHeight,
-    w: size.width * pixelsPerWorld * 1.08,
-    h: size.height * pixelsPerWorld * 1.25,
-    priority: label.userData.labelPriority || 0,
-    opacity: material.opacity,
-    label
-  };
-}
-
-function rectsOverlap(a, b) {
-  return Math.abs(a.x - b.x) * 2 < a.w + b.w && Math.abs(a.y - b.y) * 2 < a.h + b.h;
+  return Math.abs(projected.x) <= 1.08
+    && Math.abs(projected.y) <= 1.08
+    && projected.z >= -1
+    && projected.z <= 1;
 }
 
 function updateSurfaceLabelVisibility() {
-  const entries = [];
   courseGroups.forEach((courseGroup) => {
     if (!courseGroup.group.visible) return;
     courseGroup.group.updateMatrixWorld();
@@ -620,20 +616,8 @@ function updateSurfaceLabelVisibility() {
       ...courseGroup.sectionLabels.children,
       ...courseGroup.knowledgeLabels.children
     ].forEach((label) => {
-      const rect = labelScreenRect(label, courseGroup);
-      if (!rect) {
-        label.visible = false;
-        return;
-      }
-      entries.push(rect);
+      label.visible = isSurfaceLabelVisible(label, courseGroup);
     });
-  });
-  entries.sort((a, b) => b.priority - a.priority || b.opacity - a.opacity || b.w * b.h - a.w * a.h);
-  const accepted = [];
-  entries.forEach((entry) => {
-    const overlaps = accepted.some((item) => rectsOverlap(entry, item));
-    entry.label.visible = !overlaps;
-    if (!overlaps) accepted.push(entry);
   });
 }
 

@@ -214,34 +214,48 @@ export function regionLayout(course, region) {
     : null;
   const parentBoundary = parent ? regionBoundaryVectors(course, parent, 1) : null;
   const denseBoundary = sampleClosedBoundary(course, region, 7, 1);
-  const center = centroidDirection(boundary);
-  const candidates = [center];
+  const vertexCenter = centroidDirection(boundary);
+  const isInsideRegion = (candidate) => sphericalContains(candidate, boundary)
+    && (!parentBoundary || sphericalContains(candidate, parentBoundary));
+
+  // Fibonacci 点在球面上近似等面积分布。对落在区域内部的点求平均，得到的
+  // 是区域的面积中心，比“离边界最远点”更符合标签视觉居中的预期。
+  const interiorSamples = fibonacciCandidates.filter(isInsideRegion);
+  const areaCenter = centroidDirection(interiorSamples.length >= 3 ? interiorSamples : boundary);
+  const candidates = [areaCenter, vertexCenter];
   boundary.forEach((point) => {
-    candidates.push(slerpUnit(center, point, 0.22));
-    candidates.push(slerpUnit(center, point, 0.44));
+    candidates.push(slerpUnit(areaCenter, point, 0.22));
+    candidates.push(slerpUnit(areaCenter, point, 0.44));
   });
   // 全球候选点让凹多边形也能找到真正位于内部的标签锚点。
   // 仅按顶点质心附近搜索时，质心落在凹口外会把标签放错区域。
-  candidates.push(...fibonacciCandidates);
+  candidates.push(...interiorSamples);
 
-  let best = null;
+  const evaluated = [];
   let bestClearance = -1;
   candidates.forEach((candidate) => {
-    if (!sphericalContains(candidate, boundary)) return;
-    if (parentBoundary && !sphericalContains(candidate, parentBoundary)) return;
+    if (!isInsideRegion(candidate)) return;
     let clearance = Infinity;
     denseBoundary.forEach((edgePoint) => {
       clearance = Math.min(clearance, candidate.angleTo(edgePoint));
     });
-    if (clearance > bestClearance) {
-      best = candidate.clone().normalize();
-      bestClearance = clearance;
-    }
+    evaluated.push({ candidate, clearance });
+    bestClearance = Math.max(bestClearance, clearance);
   });
 
+  // 面积中心若靠近凹口或窄边，向区域内部做有限调整；在仍有一半最大边距的
+  // 候选点中优先选择最接近面积中心的位置，而不是直接移到最大内切圆中心。
+  const minimumClearance = Math.max(0.012, bestClearance * 0.5);
+  const best = evaluated
+    .filter((entry) => entry.clearance >= minimumClearance)
+    .sort((a, b) => (
+      a.candidate.angleTo(areaCenter) - b.candidate.angleTo(areaCenter)
+      || b.clearance - a.clearance
+    ))[0];
+
   region.__layout = {
-    anchor: best || center,
-    clearance: Math.max(0.035, bestClearance > 0 ? bestClearance : 0.08)
+    anchor: best?.candidate.clone().normalize() || vertexCenter,
+    clearance: Math.max(0.035, best?.clearance || (bestClearance > 0 ? bestClearance : 0.08))
   };
   return region.__layout;
 }
