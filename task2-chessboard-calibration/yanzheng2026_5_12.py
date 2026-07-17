@@ -88,7 +88,7 @@ def evaluate_collinearity_consistency(existing_pts, new_pt, grid_dir):
     # 计算共线性残差
     residual = calculate_collinearity_residual(collinear_pts)
     # 转换为评分（残差越小评分越高）
-    max_residual = 5.0  # 最大容忍残差（像素）
+    max_residual = 10.0  # 最大容忍残差（像素），放宽以适应镜头畸变和透视
     score = max(0.0, 1.0 - residual / max_residual)
 
     return score
@@ -101,7 +101,7 @@ def evaluate_local_grid_alignment(new_local_pt, anchor_local_pt, grid_dir, ref_l
     """
     perpendicular_axis = 1 if grid_dir == 0 else 0
     travel_axis = 0 if grid_dir == 0 else 1
-    tolerance = max(2.5, ref_len * 0.16) if ref_len > 0 else 3.0
+    tolerance = max(3.5, ref_len * 0.28) if ref_len > 0 else 5.0  # 放宽垂直容差
 
     perp_error = abs(new_local_pt[perpendicular_axis] - anchor_local_pt[perpendicular_axis])
     perp_score = np.exp(-0.5 * (perp_error / (tolerance + 1e-12)) ** 2)
@@ -111,7 +111,7 @@ def evaluate_local_grid_alignment(new_local_pt, anchor_local_pt, grid_dir, ref_l
 
     step = abs(new_local_pt[travel_axis] - anchor_local_pt[travel_axis])
     step_error = abs(step - ref_len)
-    step_score = np.exp(-0.5 * (step_error / (ref_len * 0.22 + 1e-12)) ** 2)
+    step_score = np.exp(-0.5 * (step_error / (ref_len * 0.38 + 1e-12)) ** 2)  # 放宽步长容差
     return float(0.72 * perp_score + 0.28 * step_score)
 
 
@@ -154,14 +154,14 @@ def grow_neighbor(xc0, used_mask, center_idx, direction_vec, ref_len=0,
     proj = vecs @ direction_vec
     cos_angle = proj / (dists + 1e-12)
     # 方向约束：夹角小（cos > 0.95）且沿正方向
-    mask_dir = (cos_angle > 0.95) & (proj > 0)
+    mask_dir = (cos_angle > 0.85) & (proj > 0)  # 放宽方向约束，适应透视变形
     # 排除自身和已使用点
     mask_avail = ~used_mask
     mask_avail[center_idx] = False
     mask = mask_dir & mask_avail
     if ref_len > 0:
         ratio = dists / (ref_len + 1e-12)
-        mask &= (ratio > 0.7) & (ratio < 1.35)
+        mask &= (ratio > 0.50) & (ratio < 1.60)  # 放宽间距比例，适应透视压缩/拉伸
     candidates = np.where(mask)[0]
     if len(candidates) == 0:
         return -1
@@ -321,7 +321,7 @@ def chessboardsgrow_py(points, directions, scores, img_shape, max_boards=3):
                 existing_board_pts, new_pt, grid_dir
             )
             # 共线性一致性阈值（可调整）
-            collinearity_thresh = 0.52
+            collinearity_thresh = 0.20  # 降低共线性一致性阈值，避免畸变/透视区域误拒
             if collinearity_score < collinearity_thresh:
                 print(f"  跳过共线性不一致的点（评分：{collinearity_score:.2f} < {collinearity_thresh}）")
                 continue  # 跳过不一致的点
@@ -558,7 +558,7 @@ def _projected_grid_spacing(projected, x_units, y_units):
     return float(np.median(distances))
 
 
-def _trim_sparse_border_grid(img_pts, world_pts, min_fill=0.45, min_points=9):
+def _trim_sparse_border_grid(img_pts, world_pts, min_fill=0.25, min_points=9):  # 降低边界填充率要求
     img_pts, world_pts = _unique_world_points(img_pts, world_pts)
     if len(img_pts) < min_points:
         return img_pts, world_pts
@@ -1531,8 +1531,8 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     img_gray = imread_gray(img_path)
     img_gray = gaussian_filter(img_gray, sigma=0.5)
     blur_var = measure_blur_level(img_gray)
-    tau_nms = 0.015 if blur_var < 50 else 0.02
-    tau_score = 0.01 if blur_var < 50 else 0.015
+    tau_nms = 0.010 if blur_var < 50 else 0.015  # 降低NMS阈值，保留更多候选鞍点
+    tau_score = 0.005 if blur_var < 50 else 0.008  # 降低评分阈值，避免过滤边缘低对比度鞍点
     print(f"  模糊度={blur_var:.1f}, NMS阈值={tau_nms}, 评分阈值={tau_score}")
     h, w = img_gray.shape
     nn = [h, w]
@@ -2005,7 +2005,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     # ========================================================================
 
     # ---------- 可视化 ----------
-    def _mask_points_near_boards(pts, boards, max_dist=40.0):
+    def _mask_points_near_boards(pts, boards, max_dist=80.0):  # 增大显示半径，确保棋盘格周边鞍点可见
         """保留距离任一已检测棋盘格网格点不超过 max_dist 像素的候选点"""
         if not boards or len(pts) == 0:
             return np.zeros(len(pts), dtype=bool)
