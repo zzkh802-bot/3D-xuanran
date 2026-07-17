@@ -10,6 +10,11 @@ const CHAPTER_PALETTE = [
   '#db4fa4', '#e3b341', '#2d9c5a', '#6b5bd2'
 ];
 
+const COURSE_CHAPTER_PALETTES = {
+  // 与线性代数原始区域图的章节配色保持一致，避免第三章和第五章都呈橙色。
+  'linear-algebra': ['#ff4444', '#00cc99', '#3366ff', '#ff9933', '#9966ff', '#ff66cc']
+};
+
 const fibonacciCandidates = Array.from({ length: 640 }, (_, index) => {
   const offset = 2 / 640;
   const y = index * offset - 1 + offset / 2;
@@ -80,8 +85,9 @@ function sectionColor(baseColor, index, total) {
 
 export function prepareCourse(course) {
   course.__vertexMap = new Map(course.vertices.map((vertex) => [vertex.id, vertex]));
+  const chapterPalette = COURSE_CHAPTER_PALETTES[course.id] || CHAPTER_PALETTE;
   course.chapters.forEach((chapter, chapterIndex) => {
-    chapter.__color = new THREE.Color(CHAPTER_PALETTE[chapterIndex % CHAPTER_PALETTE.length]);
+    chapter.__color = new THREE.Color(chapterPalette[chapterIndex % chapterPalette.length]);
   });
   course.sections.forEach((section) => {
     const chapterIndex = Math.max(0, course.chapters.findIndex((chapter) => chapter.id === section.chapterId));
@@ -166,13 +172,28 @@ export function sphericalContains(point, boundary) {
   return result.winding * interiorSign > Math.PI;
 }
 
+function chapterRegionFromField(course, regions, direction) {
+  const ids = course.__chapterRegionIds;
+  if (regions !== course.chapters || ids?.length !== FIELD_WIDTH * FIELD_HEIGHT) return null;
+  const local = direction.clone().normalize();
+  let u = Math.atan2(local.z, -local.x) / TAU;
+  if (u < 0) u += 1;
+  const v = Math.asin(THREE.MathUtils.clamp(local.y, -1, 1)) / Math.PI + 0.5;
+  const x = Math.min(FIELD_WIDTH - 1, Math.floor(u * FIELD_WIDTH));
+  const y = Math.min(FIELD_HEIGHT - 1, Math.max(0, Math.floor((1 - v) * FIELD_HEIGHT)));
+  return regions[ids[y * FIELD_WIDTH + x]] || null;
+}
+
 export function findRegionAtDirection(course, regions, direction) {
+  const fieldChapter = chapterRegionFromField(course, regions, direction);
+  if (fieldChapter) return fieldChapter;
   let candidates = regions;
   if (regions.some((region) => region.chapterId)) {
     const chapter = findRegionAtDirection(course, course.chapters, direction);
     const siblings = regions.filter((region) => region.chapterId === chapter?.id);
-    if (!siblings.length) return null;
-    candidates = siblings;
+    // “新手村”没有直属小节，但与四个入门小节区域相交；空章节沿用
+    // 全部小节候选，才能与小节语义图保持相同的显示和点击归属。
+    if (siblings.length) candidates = siblings;
   }
   let bestRegion = null;
   let bestDot = -Infinity;
@@ -423,6 +444,137 @@ function chooseRegionIndex(infos, directions, offset, candidateIndices) {
     : nearestRegionIndex(infos, px, py, pz, candidateIndices);
 }
 
+function smoothRegionIdEdges(sourceIds, passes = 2) {
+  let current = sourceIds;
+  for (let pass = 0; pass < passes; pass += 1) {
+    const next = current.slice();
+    for (let y = 0; y < FIELD_HEIGHT; y += 1) {
+      for (let x = 0; x < FIELD_WIDTH; x += 1) {
+        const pixel = y * FIELD_WIDTH + x;
+        const ownId = current[pixel];
+        const left = current[y * FIELD_WIDTH + ((x - 1 + FIELD_WIDTH) % FIELD_WIDTH)];
+        const right = current[y * FIELD_WIDTH + ((x + 1) % FIELD_WIDTH)];
+        const up = current[Math.max(0, y - 1) * FIELD_WIDTH + x];
+        const down = current[Math.min(FIELD_HEIGHT - 1, y + 1) * FIELD_WIDTH + x];
+        let replacement = -1;
+        if (left === right && (left === up || left === down)) replacement = left;
+        else if (left === up && left === down) replacement = left;
+        else if (right === up && right === down) replacement = right;
+        // 只修正被同一区域从至少三个方向包围的单像素凹口或尖刺。
+        if (replacement >= 0 && replacement !== ownId) next[pixel] = replacement;
+      }
+    }
+    current = next;
+  }
+  return current;
+}
+
+function mergeSmallRegionIdIslands(sourceIds, regionCount) {
+  const componentIds = new Int32Array(sourceIds.length);
+  componentIds.fill(-1);
+  const queue = new Int32Array(sourceIds.length);
+  const componentRegions = [];
+  const componentSizes = [];
+  const largestComponents = new Int32Array(regionCount);
+  const largestSizes = new Int32Array(regionCount);
+  largestComponents.fill(-1);
+
+  for (let start = 0; start < sourceIds.length; start += 1) {
+    if (componentIds[start] >= 0) continue;
+    const componentId = componentSizes.length;
+    const regionId = sourceIds[start];
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = start;
+    componentIds[start] = componentId;
+
+    while (head < tail) {
+      const pixel = queue[head++];
+      const y = Math.floor(pixel / FIELD_WIDTH);
+      const x = pixel - y * FIELD_WIDTH;
+      const left = y * FIELD_WIDTH + ((x - 1 + FIELD_WIDTH) % FIELD_WIDTH);
+      const right = y * FIELD_WIDTH + ((x + 1) % FIELD_WIDTH);
+      if (componentIds[left] < 0 && sourceIds[left] === regionId) {
+        componentIds[left] = componentId;
+        queue[tail++] = left;
+      }
+      if (componentIds[right] < 0 && sourceIds[right] === regionId) {
+        componentIds[right] = componentId;
+        queue[tail++] = right;
+      }
+      if (y > 0) {
+        const up = pixel - FIELD_WIDTH;
+        if (componentIds[up] < 0 && sourceIds[up] === regionId) {
+          componentIds[up] = componentId;
+          queue[tail++] = up;
+        }
+      }
+      if (y + 1 < FIELD_HEIGHT) {
+        const down = pixel + FIELD_WIDTH;
+        if (componentIds[down] < 0 && sourceIds[down] === regionId) {
+          componentIds[down] = componentId;
+          queue[tail++] = down;
+        }
+      }
+    }
+
+    componentRegions.push(regionId);
+    componentSizes.push(tail);
+    if (tail > largestSizes[regionId]) {
+      largestSizes[regionId] = tail;
+      largestComponents[regionId] = componentId;
+    }
+  }
+
+  // 章节区域按定义应为单一连通面。仅归并占整张图不到千分之一的次级
+  // 连通块，既去掉重叠边界产生的浮岛，也保留主体和真实的窄区域。
+  const maximumIslandSize = Math.max(12, Math.round(sourceIds.length * 0.001));
+  const borderCounts = componentSizes.map((size, componentId) => (
+    componentId !== largestComponents[componentRegions[componentId]] && size <= maximumIslandSize
+      ? new Map()
+      : null
+  ));
+
+  for (let pixel = 0; pixel < sourceIds.length; pixel += 1) {
+    const componentId = componentIds[pixel];
+    const counts = borderCounts[componentId];
+    if (!counts) continue;
+    const y = Math.floor(pixel / FIELD_WIDTH);
+    const x = pixel - y * FIELD_WIDTH;
+    const neighbors = [
+      y * FIELD_WIDTH + ((x - 1 + FIELD_WIDTH) % FIELD_WIDTH),
+      y * FIELD_WIDTH + ((x + 1) % FIELD_WIDTH)
+    ];
+    if (y > 0) neighbors.push(pixel - FIELD_WIDTH);
+    if (y + 1 < FIELD_HEIGHT) neighbors.push(pixel + FIELD_WIDTH);
+    neighbors.forEach((neighbor) => {
+      const neighborId = sourceIds[neighbor];
+      if (neighborId !== sourceIds[pixel]) {
+        counts.set(neighborId, (counts.get(neighborId) || 0) + 1);
+      }
+    });
+  }
+
+  const replacements = borderCounts.map((counts) => {
+    if (!counts?.size) return -1;
+    let replacement = -1;
+    let bestCount = -1;
+    counts.forEach((count, regionId) => {
+      if (count > bestCount) {
+        replacement = regionId;
+        bestCount = count;
+      }
+    });
+    return replacement;
+  });
+  const cleaned = sourceIds.slice();
+  for (let pixel = 0; pixel < cleaned.length; pixel += 1) {
+    const replacement = replacements[componentIds[pixel]];
+    if (replacement >= 0) cleaned[pixel] = replacement;
+  }
+  return cleaned;
+}
+
 function buildSphericalIds(course, regions, parentIds = null) {
   const infos = buildRegionInfos(course, regions);
   const directions = getDirectionGrid();
@@ -444,7 +596,11 @@ function buildSphericalIds(course, regions, parentIds = null) {
     ids[pixel] = chooseRegionIndex(infos, directions, offset, candidateIndices);
   }
 
-  return ids;
+  if (regions !== course.chapters) return ids;
+  const cleaned = mergeSmallRegionIdIslands(smoothRegionIdEdges(ids), regions.length);
+  // 点击检测复用同一份 ID，避免清理后的视觉边界与章节命中边界不一致。
+  course.__chapterRegionIds = cleaned;
+  return cleaned;
 }
 
 function buildField(course, regions, level, ids = buildSphericalIds(course, regions)) {
@@ -534,18 +690,7 @@ function buildField(course, regions, level, ids = buildSphericalIds(course, regi
 
 export function createSemanticFields(course) {
   const chapterIds = buildSphericalIds(course, course.chapters);
-  const chaptersWithSections = new Set(course.sections.map((section) => section.chapterId));
-  const sectionRegions = [
-    ...course.sections,
-    ...course.chapters
-      .filter((chapter) => !chaptersWithSections.has(chapter.id))
-      .map((chapter) => ({
-        ...chapter,
-        id: `${chapter.id}-empty-section`,
-        chapterId: chapter.id,
-        __color: chapter.__color
-      }))
-  ];
+  const sectionRegions = course.sections;
   const sectionIds = buildSphericalIds(course, sectionRegions, chapterIds);
   return {
     chapter: buildField(course, course.chapters, 'chapter', chapterIds),

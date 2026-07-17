@@ -560,7 +560,8 @@ function updateLayerBlend(distance) {
   const regionReveal = 1 - smoothstep(78, 92, distance);
   const sectionBlend = 1 - smoothstep(43, 56, distance);
   const knowledgeAlpha = 1 - smoothstep(24, 31, distance);
-  const outerAlpha = smoothstep(24, 31, distance);
+  // 微调控制球与部分抽样外层点位于同一径向位置，二者同时显示会形成重影。
+  const outerAlpha = editMode ? 0 : smoothstep(24, 31, distance);
   const titleAlpha = smoothstep(74, 94, distance);
   const chapterLabelAlpha = regionReveal * (1 - sectionBlend);
   const sectionLabelAlpha = regionReveal * sectionBlend;
@@ -712,7 +713,7 @@ function raycastScene(event) {
   const targets = visible.flatMap((item) => [
     ...(editMode ? item.handles.children : []),
     ...item.knowledge.children,
-    ...item.outer.children,
+    ...(editMode ? [] : item.outer.children),
     item.base
   ]);
   const hit = raycaster.intersectObjects(targets, false)[0];
