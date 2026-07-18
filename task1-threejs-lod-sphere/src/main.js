@@ -2,6 +2,16 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import data from './data/course-data.json';
 import {
+  ConfigValidationError,
+  createEmptyCourse,
+  createEntityId,
+  exportConfig,
+  normalizeConfig,
+  pointFromAngles,
+  replaceConfig,
+  serializeConfig
+} from './config-model.js';
+import {
   createSemanticFields,
   createSemanticMaterial,
   disposeSemanticFields,
@@ -12,6 +22,7 @@ import {
   sampleClosedBoundary,
   slerpUnit,
   smoothstep,
+  sphericalContains,
   sourceToVector,
   updateMaterialFields,
   vectorToSource
@@ -20,16 +31,39 @@ import './styles.css';
 
 const sceneEl = document.querySelector('#scene');
 const tabsEl = document.querySelector('#courseTabs');
+const outlineEl = document.querySelector('#outline');
 const lodLabel = document.querySelector('#lodLabel');
 const courseTitle = document.querySelector('#courseTitle');
 const selectionText = document.querySelector('#selectionText');
 const overviewBtn = document.querySelector('#overviewBtn');
 const editBtn = document.querySelector('#editBtn');
+const addVertexBtn = document.querySelector('#addVertexBtn');
+const addCourseBtn = document.querySelector('#addCourseBtn');
+const importBtn = document.querySelector('#importBtn');
+const exportBtn = document.querySelector('#exportBtn');
+const undoBtn = document.querySelector('#undoBtn');
+const redoBtn = document.querySelector('#redoBtn');
+const fileInput = document.querySelector('#fileInput');
+const dirtyBadge = document.querySelector('#dirtyBadge');
+const configSummary = document.querySelector('#configSummary');
+const inspectorEl = document.querySelector('#inspector');
+const selectionActionsEl = document.querySelector('#selectionActions');
 const editorEl = document.querySelector('#editor');
 const phiInput = document.querySelector('#phiInput');
 const psiInput = document.querySelector('#psiInput');
+const placementBar = document.querySelector('#placementBar');
+const placementTitle = document.querySelector('#placementTitle');
+const placementHint = document.querySelector('#placementHint');
+const draftNameField = document.querySelector('#draftNameField');
+const draftNameInput = document.querySelector('#draftNameInput');
+const finishPlacementBtn = document.querySelector('#finishPlacementBtn');
+const cancelPlacementBtn = document.querySelector('#cancelPlacementBtn');
+const toastEl = document.querySelector('#toast');
 
-const radius = data.radius || 10;
+const initialConfig = normalizeConfig(data);
+replaceConfig(data, initialConfig.config);
+
+let radius = data.radius || 10;
 const overviewDistance = 122;
 const overviewSpacing = 26.5;
 const focusDistance = 55;
@@ -38,7 +72,7 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xeef2f7);
 
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1200);
-camera.position.set(0, 10, overviewDistance);
+camera.position.set(0, 10, currentOverviewDistance());
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -75,6 +109,13 @@ let editMode = false;
 let draggingPoint = null;
 let currentLodLevel = 0;
 let rebuildTimer = null;
+let placementMode = null;
+let toastTimer = null;
+let sliderBefore = null;
+let savedSnapshot = serializeConfig(data, 0);
+const undoStack = [];
+const redoStack = [];
+const expandedIds = new Set();
 
 const outerGeometry = new THREE.SphereGeometry(0.17, 18, 14);
 const handleGeometry = new THREE.SphereGeometry(0.22, 18, 14);
@@ -87,14 +128,26 @@ function isMobileView() {
 }
 
 function currentOverviewDistance() {
-  return isMobileView() ? 150 : overviewDistance;
+  const columns = isMobileView()
+    ? Math.min(2, Math.max(1, data.courses.length))
+    : Math.ceil(Math.sqrt(Math.max(1, data.courses.length)));
+  const rows = Math.ceil(Math.max(1, data.courses.length) / columns);
+  const layoutScale = Math.max(columns, rows);
+  return Math.max(isMobileView() ? 150 : overviewDistance, 70 + layoutScale * 25);
 }
 
 function overviewPosition(index) {
-  if (!isMobileView()) return new THREE.Vector3((index - 1.5) * overviewSpacing, 0, 0);
-  const column = index % 2 === 0 ? -1 : 1;
-  const row = index < 2 ? 18 : -5;
-  return new THREE.Vector3(column * 10.5, row, 0);
+  const count = Math.max(1, data.courses.length);
+  const columns = isMobileView() ? Math.min(2, count) : Math.ceil(Math.sqrt(count));
+  const rows = Math.ceil(count / columns);
+  const column = index % columns;
+  const row = Math.floor(index / columns);
+  const spacing = isMobileView() ? 22 : overviewSpacing;
+  return new THREE.Vector3(
+    (column - (columns - 1) / 2) * spacing,
+    ((rows - 1) / 2 - row) * spacing,
+    0
+  );
 }
 
 function wrapText(text, maxChars) {
@@ -303,7 +356,7 @@ function buildOuterPoints(courseGroup) {
 
 function buildHandles(courseGroup) {
   const { course, handles } = courseGroup;
-  (course.__boundaryVertices || []).forEach((point) => {
+  course.vertices.forEach((point) => {
     const material = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       emissive: 0x1677ff,
@@ -320,15 +373,10 @@ function buildHandles(courseGroup) {
 }
 
 function ensureKnowledge(section, course) {
+  if (!Array.isArray(section.knowledge)) section.knowledge = [];
+  if (!section.knowledge.length) return;
   const layout = regionLayout(course, section);
   const boundary = sampleClosedBoundary(course, section, 6, 1);
-  if (!section.knowledge.length) {
-    section.knowledge = [0, 1, 2].map((index) => ({
-      id: `${section.id}-knowledge-${index + 1}`,
-      label: `K${index + 1}`,
-      generated: true
-    }));
-  }
   section.knowledge.forEach((point, index) => {
     if (point.manual) return;
     const target = boundary[Math.floor(((index + 0.65) / section.knowledge.length) * boundary.length) % boundary.length];
@@ -443,6 +491,7 @@ function updateFocusDirection(courseGroup) {
 }
 
 function buildCourse(course, index) {
+  invalidateCourseLayouts(course);
   prepareCourse(course);
   buildVertexUsage(course);
 
@@ -476,7 +525,8 @@ function buildCourse(course, index) {
   const knowledge = new THREE.Group();
   const knowledgeLabels = new THREE.Group();
   const handles = new THREE.Group();
-  group.add(outer, chapterLabels, sectionLabels, knowledge, knowledgeLabels, handles);
+  const draft = new THREE.Group();
+  group.add(outer, chapterLabels, sectionLabels, knowledge, knowledgeLabels, handles, draft);
 
   const previewMaterial = new THREE.LineBasicMaterial({
     color: 0x0b76d1,
@@ -518,6 +568,7 @@ function buildCourse(course, index) {
     knowledge,
     knowledgeLabels,
     handles,
+    draft,
     preview,
     knowledgeMaterial,
     title
@@ -530,6 +581,172 @@ function buildCourse(course, index) {
 }
 
 data.courses.forEach(buildCourse);
+
+function showToast(message, duration = 2600) {
+  clearTimeout(toastTimer);
+  toastEl.textContent = message;
+  toastEl.classList.remove('hidden');
+  toastTimer = setTimeout(() => toastEl.classList.add('hidden'), duration);
+}
+
+function snapshotConfig() {
+  return serializeConfig(data, 0);
+}
+
+function updateHistoryUI() {
+  undoBtn.disabled = undoStack.length === 0;
+  redoBtn.disabled = redoStack.length === 0;
+  const dirty = snapshotConfig() !== savedSnapshot;
+  dirtyBadge.textContent = dirty ? '未导出' : '已保存';
+  dirtyBadge.classList.toggle('dirty', dirty);
+}
+
+function commitHistory(before, message) {
+  const after = snapshotConfig();
+  if (before === after) return false;
+  undoStack.push(before);
+  if (undoStack.length > 80) undoStack.shift();
+  redoStack.length = 0;
+  updateHistoryUI();
+  if (message) showToast(message);
+  return true;
+}
+
+function selectionLocator(item = selectedNode) {
+  if (!item?.course) return null;
+  const base = { type: item.type, courseId: item.course.id };
+  if (item.chapter) base.id = item.chapter.id;
+  if (item.section) {
+    if (item.type === 'section') base.id = item.section.id;
+    else base.sectionId = item.section.id;
+  }
+  if (item.point) {
+    base.id = item.point.id;
+    if (item.type === 'control' || item.type === 'point') base.type = 'vertex';
+  }
+  return base;
+}
+
+function resolveLocator(locator) {
+  if (!locator) return null;
+  const course = data.courses.find((item) => item.id === locator.courseId);
+  if (!course) return null;
+  if (locator.type === 'course') return { type: 'course', course };
+  if (locator.type === 'chapter') {
+    const chapter = course.chapters.find((item) => item.id === locator.id);
+    return chapter ? { type: 'chapter', course, chapter } : null;
+  }
+  if (locator.type === 'section') {
+    const section = course.sections.find((item) => item.id === locator.id);
+    return section ? { type: 'section', course, section } : null;
+  }
+  if (locator.type === 'knowledge') {
+    const section = course.sections.find((item) => item.id === locator.sectionId);
+    const point = section?.knowledge.find((item) => item.id === locator.id);
+    return point ? { type: 'knowledge', course, section, point } : null;
+  }
+  if (locator.type === 'vertex') {
+    const point = course.vertices.find((item) => item.id === locator.id);
+    return point ? { type: 'control', course, point } : null;
+  }
+  return null;
+}
+
+function disposeCourseGroup(courseGroup) {
+  disposeSemanticFields(courseGroup.fields);
+  courseGroup.group.traverse((child) => {
+    if (child.geometry && !child.userData?.sharedGeometry) child.geometry.dispose();
+    const materials = child.material
+      ? (Array.isArray(child.material) ? child.material : [child.material])
+      : [];
+    materials.forEach((material) => {
+      if (material.userData?.sharedMaterial) return;
+      if (material.map && material.map !== shadowTexture) material.map.dispose();
+      material.dispose();
+    });
+  });
+  courseGroup.knowledgeMaterial.dispose();
+  root.remove(courseGroup.group);
+}
+
+function clearKnowledgeLabelCache() {
+  knowledgeLabelCache.forEach(({ material }) => {
+    material.map?.dispose();
+    material.dispose();
+  });
+  knowledgeLabelCache.clear();
+}
+
+function rebuildAllCourses(locator = selectionLocator(), focusId = selectedCourse?.course.id || null) {
+  clearTimeout(rebuildTimer);
+  rebuildTimer = null;
+  const cameraPosition = camera.position.clone();
+  const target = controls.target.clone();
+  courseGroups.forEach(disposeCourseGroup);
+  courseGroups.length = 0;
+  clearKnowledgeLabelCache();
+  selectedCourse = null;
+  selectedNode = null;
+  radius = Number(data.radius) || 10;
+  data.courses.forEach(buildCourse);
+  focusCourse(focusId && data.courses.some((course) => course.id === focusId) ? focusId : null);
+  camera.position.copy(cameraPosition);
+  controls.target.copy(target);
+  const resolved = resolveLocator(locator);
+  if (resolved) selectNode(resolved);
+  else renderEditorUI();
+  renderDraft();
+}
+
+function rebuildSingleCourse(courseId, locator = selectionLocator()) {
+  const course = data.courses.find((item) => item.id === courseId);
+  if (!course) {
+    rebuildAllCourses(locator, null);
+    return;
+  }
+  const cameraPosition = camera.position.clone();
+  const target = controls.target.clone();
+  const oldIndex = courseGroups.findIndex((item) => item.course.id === courseId);
+  if (oldIndex >= 0) {
+    disposeCourseGroup(courseGroups[oldIndex]);
+    courseGroups.splice(oldIndex, 1);
+  }
+  const dataIndex = data.courses.indexOf(course);
+  selectedCourse = null;
+  selectedNode = null;
+  buildCourse(course, dataIndex);
+  const created = courseGroups.pop();
+  courseGroups.splice(Math.min(dataIndex, courseGroups.length), 0, created);
+  focusCourse(courseId);
+  camera.position.copy(cameraPosition);
+  controls.target.copy(target);
+  const resolved = resolveLocator(locator);
+  if (resolved) selectNode(resolved);
+  else renderEditorUI();
+  renderDraft();
+}
+
+function applyHistorySnapshot(snapshot, direction) {
+  const current = snapshotConfig();
+  const parsed = JSON.parse(snapshot);
+  replaceConfig(data, parsed);
+  cancelPlacement(false);
+  if (direction === 'undo') redoStack.push(current);
+  else undoStack.push(current);
+  rebuildAllCourses(null, null);
+  updateHistoryUI();
+  showToast(direction === 'undo' ? '已撤销' : '已重做');
+}
+
+function undo() {
+  if (!undoStack.length) return;
+  applyHistorySnapshot(undoStack.pop(), 'undo');
+}
+
+function redo() {
+  if (!redoStack.length) return;
+  applyHistorySnapshot(redoStack.pop(), 'redo');
+}
 
 function rebuildCourseVisuals(courseGroup) {
   invalidateCourseLayouts(courseGroup.course);
@@ -658,7 +875,7 @@ function focusCourse(courseId) {
       camera.position.y = targetY + 7;
     }
   } else {
-    courseTitle.textContent = '四个教材';
+    courseTitle.textContent = `${data.courses.length} 门课程`;
     selectionText.textContent = '未选择节点';
     if (changed) {
       controls.target.set(0, 0, 0);
@@ -666,6 +883,410 @@ function focusCourse(courseId) {
     }
   }
   renderTabs();
+  renderOutline();
+  updateConfigSummary();
+}
+
+function selectedOutlineKey() {
+  const locator = selectionLocator();
+  if (!locator) return '';
+  return `${locator.type}:${locator.courseId}:${locator.sectionId || ''}:${locator.id || ''}`;
+}
+
+function outlineKey(type, courseId, id = '', sectionId = '') {
+  return `${type}:${courseId}:${sectionId}:${id}`;
+}
+
+function makeOutlineButton(text, key, onClick) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'outline-button';
+  button.textContent = text;
+  button.title = text;
+  button.classList.toggle('active', selectedOutlineKey() === key);
+  button.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onClick();
+  });
+  return button;
+}
+
+function createOutlineDetails(id, text, key, onSelect, forceOpen = false) {
+  const details = document.createElement('details');
+  details.open = forceOpen || expandedIds.has(id);
+  details.addEventListener('toggle', () => {
+    if (details.open) expandedIds.add(id);
+    else expandedIds.delete(id);
+  });
+  const summary = document.createElement('summary');
+  summary.appendChild(makeOutlineButton(text, key, onSelect));
+  const children = document.createElement('div');
+  children.className = 'outline-children';
+  details.append(summary, children);
+  return { details, children };
+}
+
+function renderOutline() {
+  outlineEl.innerHTML = '';
+  if (!data.courses.length) {
+    const empty = document.createElement('p');
+    empty.className = 'outline-empty';
+    empty.textContent = '还没有课程。点击“＋课程”开始创建。';
+    outlineEl.appendChild(empty);
+    return;
+  }
+
+  data.courses.forEach((course) => {
+    const courseSelected = selectedCourse?.course.id === course.id;
+    const courseTree = createOutlineDetails(
+      course.id,
+      course.title,
+      outlineKey('course', course.id),
+      () => {
+        focusCourse(course.id);
+        selectNode({ type: 'course', course });
+      },
+      courseSelected
+    );
+    course.chapters.forEach((chapter) => {
+      const chapterSelected = selectedNode?.chapter?.id === chapter.id
+        || selectedNode?.section?.chapterId === chapter.id;
+      const chapterTree = createOutlineDetails(
+        chapter.id,
+        chapter.title,
+        outlineKey('chapter', course.id, chapter.id),
+        () => {
+          focusCourse(course.id);
+          selectNode({ type: 'chapter', course, chapter });
+        },
+        chapterSelected
+      );
+      const sections = course.sections.filter((section) => section.chapterId === chapter.id);
+      if (!sections.length) {
+        const empty = document.createElement('p');
+        empty.className = 'outline-empty';
+        empty.textContent = '暂无小节';
+        chapterTree.children.appendChild(empty);
+      }
+      sections.forEach((section) => {
+        const sectionHasKnowledge = section.knowledge?.length > 0;
+        const sectionSelected = selectedNode?.section?.id === section.id;
+        if (sectionHasKnowledge) {
+          const sectionTree = createOutlineDetails(
+            section.id,
+            section.title,
+            outlineKey('section', course.id, section.id),
+            () => {
+              focusCourse(course.id);
+              selectNode({ type: 'section', course, section });
+            },
+            sectionSelected
+          );
+          sectionTree.children.classList.add('outline-knowledge');
+          section.knowledge.forEach((point) => {
+            sectionTree.children.appendChild(makeOutlineButton(
+              point.label,
+              outlineKey('knowledge', course.id, point.id, section.id),
+              () => {
+                focusCourse(course.id);
+                selectNode({ type: 'knowledge', course, section, point });
+              }
+            ));
+          });
+          chapterTree.children.appendChild(sectionTree.details);
+        } else {
+          chapterTree.children.appendChild(makeOutlineButton(
+            section.title,
+            outlineKey('section', course.id, section.id),
+            () => {
+              focusCourse(course.id);
+              selectNode({ type: 'section', course, section });
+            }
+          ));
+        }
+      });
+      courseTree.children.appendChild(chapterTree.details);
+    });
+    if (!course.chapters.length) {
+      const empty = document.createElement('p');
+      empty.className = 'outline-empty';
+      empty.textContent = '暂无章节';
+      courseTree.children.appendChild(empty);
+    }
+    outlineEl.appendChild(courseTree.details);
+  });
+}
+
+function updateConfigSummary() {
+  const chapterCount = data.courses.reduce((sum, course) => sum + course.chapters.length, 0);
+  const sectionCount = data.courses.reduce((sum, course) => sum + course.sections.length, 0);
+  const knowledgeCount = data.courses.reduce(
+    (sum, course) => sum + course.sections.reduce(
+      (sectionSum, section) => sectionSum + (section.knowledge?.length || 0),
+      0
+    ),
+    0
+  );
+  configSummary.textContent = `${data.courses.length} 门课程 · ${chapterCount} 章 · ${sectionCount} 节 · ${knowledgeCount} 个知识点`;
+}
+
+function appendInspectorField(labelText, value, onChange, options = {}) {
+  const label = document.createElement('label');
+  label.textContent = labelText;
+  const input = options.multiline ? document.createElement('textarea') : document.createElement('input');
+  input.type = options.type || 'text';
+  input.value = value ?? '';
+  if (options.step) input.step = options.step;
+  if (options.min !== undefined) input.min = options.min;
+  if (options.max !== undefined) input.max = options.max;
+  input.addEventListener('change', () => onChange(input.value));
+  label.appendChild(input);
+  inspectorEl.appendChild(label);
+  return input;
+}
+
+function mutateAndRebuild(mutator, locator, message, focusId = locator?.courseId) {
+  const before = snapshotConfig();
+  mutator();
+  if (!commitHistory(before, message)) {
+    renderEditorUI();
+    return;
+  }
+  if (focusId) rebuildSingleCourse(focusId, locator);
+  else rebuildAllCourses(locator, null);
+}
+
+function renderBoundaryInspector(course, region, type) {
+  const title = document.createElement('h2');
+  title.textContent = `边界顶点（${region.vertexIds.length}）`;
+  inspectorEl.appendChild(title);
+  const list = document.createElement('div');
+  list.className = 'boundary-list';
+  region.vertexIds.forEach((vertexId, index) => {
+    const vertex = course.vertices.find((item) => item.id === vertexId);
+    const row = document.createElement('div');
+    row.className = 'boundary-item';
+    const name = document.createElement('span');
+    name.textContent = `${index + 1}. ${vertex?.label || vertexId}`;
+    name.title = vertexId;
+    const up = document.createElement('button');
+    up.type = 'button';
+    up.textContent = '↑';
+    up.title = '前移';
+    up.disabled = index === 0;
+    up.addEventListener('click', () => {
+      mutateAndRebuild(() => {
+        [region.vertexIds[index - 1], region.vertexIds[index]] = [
+          region.vertexIds[index],
+          region.vertexIds[index - 1]
+        ];
+      }, { type, courseId: course.id, id: region.id }, '边界顶点已前移');
+    });
+    const down = document.createElement('button');
+    down.type = 'button';
+    down.textContent = '↓';
+    down.title = '后移';
+    down.disabled = index === region.vertexIds.length - 1;
+    down.addEventListener('click', () => {
+      mutateAndRebuild(() => {
+        [region.vertexIds[index], region.vertexIds[index + 1]] = [
+          region.vertexIds[index + 1],
+          region.vertexIds[index]
+        ];
+      }, { type, courseId: course.id, id: region.id }, '边界顶点已后移');
+    });
+    const unlink = document.createElement('button');
+    unlink.type = 'button';
+    unlink.textContent = '×';
+    unlink.title = '从此边界移除';
+    unlink.className = 'danger';
+    unlink.disabled = new Set(region.vertexIds).size <= 3;
+    unlink.addEventListener('click', () => {
+      if (new Set(region.vertexIds).size <= 3) {
+        showToast('边界至少需要 3 个不同顶点');
+        return;
+      }
+      mutateAndRebuild(
+        () => region.vertexIds.splice(index, 1),
+        { type, courseId: course.id, id: region.id },
+        '顶点已从边界移除'
+      );
+    });
+    row.append(name, up, down, unlink);
+    list.appendChild(row);
+  });
+  inspectorEl.appendChild(list);
+}
+
+function addAction(label, handler, options = {}) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  if (options.danger) button.classList.add('danger');
+  button.addEventListener('click', handler);
+  selectionActionsEl.appendChild(button);
+}
+
+function renderSelectionActions() {
+  selectionActionsEl.innerHTML = '';
+  const item = selectedNode;
+  if (!item?.course) return;
+  if (item.type === 'course') {
+    addAction('＋新建章', () => startBoundaryDraft('chapter', item.course));
+    addAction('删除课程', () => deleteSelection(), { danger: true });
+  } else if (item.type === 'chapter') {
+    addAction('＋新建小节', () => startBoundaryDraft('section', item.course, item.chapter));
+    addAction('＋边界点', () => startBoundaryPointPlacement('chapter', item.course, item.chapter));
+    addAction('删除章', () => deleteSelection(), { danger: true });
+  } else if (item.type === 'section') {
+    addAction('＋知识点', () => startKnowledgePlacement(item.course, item.section));
+    addAction('＋边界点', () => startBoundaryPointPlacement('section', item.course, item.section));
+    addAction('删除小节', () => deleteSelection(), { danger: true });
+  } else if (item.type === 'knowledge') {
+    addAction('删除知识点', () => deleteSelection(), { danger: true });
+  } else if (item.type === 'control' || item.type === 'point') {
+    addAction('删除顶点', () => deleteSelection(), { danger: true });
+  }
+}
+
+function renderEditorUI() {
+  renderOutline();
+  updateConfigSummary();
+  updateHistoryUI();
+  renderSelectionActions();
+  inspectorEl.innerHTML = '';
+  const item = selectedNode;
+  if (!item?.course) {
+    const empty = document.createElement('p');
+    empty.className = 'empty-state';
+    empty.textContent = '从左侧结构树或球面选择一个对象。';
+    inspectorEl.appendChild(empty);
+    return;
+  }
+
+  const heading = document.createElement('h2');
+  const headings = {
+    course: '课程属性',
+    chapter: '章节属性',
+    section: '小节属性',
+    knowledge: '知识点属性',
+    control: '球面顶点属性',
+    point: '球面顶点属性'
+  };
+  heading.textContent = headings[item.type] || '属性';
+  inspectorEl.appendChild(heading);
+
+  if (item.type === 'course') {
+    appendInspectorField('课程名称', item.course.title, (value) => {
+      mutateAndRebuild(
+        () => { item.course.title = value.trim() || '未命名课程'; },
+        { type: 'course', courseId: item.course.id },
+        '课程名称已更新'
+      );
+    });
+    appendInspectorField('课程颜色', item.course.color, (value) => {
+      mutateAndRebuild(
+        () => { item.course.color = value; },
+        { type: 'course', courseId: item.course.id },
+        '课程颜色已更新'
+      );
+    }, { type: 'color' });
+    appendInspectorField('说明', item.course.description || '', (value) => {
+      mutateAndRebuild(
+        () => { item.course.description = value; },
+        { type: 'course', courseId: item.course.id },
+        '课程说明已更新'
+      );
+    }, { multiline: true });
+  }
+
+  if (item.type === 'chapter') {
+    appendInspectorField('章节名称', item.chapter.title, (value) => {
+      mutateAndRebuild(
+        () => { item.chapter.title = value.trim() || '未命名章节'; },
+        { type: 'chapter', courseId: item.course.id, id: item.chapter.id },
+        '章节名称已更新'
+      );
+    });
+    appendInspectorField('说明', item.chapter.description || '', (value) => {
+      mutateAndRebuild(
+        () => { item.chapter.description = value; },
+        { type: 'chapter', courseId: item.course.id, id: item.chapter.id },
+        '章节说明已更新'
+      );
+    }, { multiline: true });
+    renderBoundaryInspector(item.course, item.chapter, 'chapter');
+  }
+
+  if (item.type === 'section') {
+    appendInspectorField('小节名称', item.section.title, (value) => {
+      mutateAndRebuild(
+        () => { item.section.title = value.trim() || '未命名小节'; },
+        { type: 'section', courseId: item.course.id, id: item.section.id },
+        '小节名称已更新'
+      );
+    });
+    appendInspectorField('说明', item.section.description || '', (value) => {
+      mutateAndRebuild(
+        () => { item.section.description = value; },
+        { type: 'section', courseId: item.course.id, id: item.section.id },
+        '小节说明已更新'
+      );
+    }, { multiline: true });
+    renderBoundaryInspector(item.course, item.section, 'section');
+  }
+
+  if (item.point) {
+    appendInspectorField(
+      item.type === 'knowledge' ? '知识点名称' : '顶点名称',
+      item.point.label,
+      (value) => {
+        const locator = selectionLocator(item);
+        mutateAndRebuild(
+          () => { item.point.label = value.trim() || item.point.id; },
+          locator,
+          '名称已更新'
+        );
+      }
+    );
+    const coordinateGrid = document.createElement('div');
+    coordinateGrid.className = 'coordinate-grid';
+    inspectorEl.appendChild(coordinateGrid);
+    const phi = appendInspectorField('phi（弧度）', item.point.phi, () => {}, {
+      type: 'number', step: '0.01', min: -Math.PI, max: Math.PI
+    });
+    const psi = appendInspectorField('psi（弧度）', item.point.psi, () => {}, {
+      type: 'number', step: '0.01', min: -Math.PI / 2, max: Math.PI / 2
+    });
+    coordinateGrid.append(phi.parentElement, psi.parentElement);
+    const commitCoordinates = () => {
+      const nextPhi = Number(phi.value);
+      const nextPsi = Number(psi.value);
+      if (!Number.isFinite(nextPhi) || !Number.isFinite(nextPsi)) {
+        showToast('请输入有效坐标');
+        return;
+      }
+      const locator = selectionLocator(item);
+      mutateAndRebuild(() => {
+        Object.assign(
+          item.point,
+          pointFromAngles(item.point.id, item.point.label, nextPhi, nextPsi, radius)
+        );
+      }, locator, '坐标已更新');
+    };
+    phi.onchange = commitCoordinates;
+    psi.onchange = commitCoordinates;
+    if (item.type === 'knowledge') {
+      appendInspectorField('说明', item.point.description || '', (value) => {
+        mutateAndRebuild(
+          () => { item.point.description = value; },
+          selectionLocator(item),
+          '知识点说明已更新'
+        );
+      }, { multiline: true });
+    }
+  }
 }
 
 function sectionNeighborText(course, section) {
@@ -678,7 +1299,7 @@ function sectionNeighborText(course, section) {
 
 function describeSelection(item) {
   if (!item?.type) return '未选择节点';
-  if (item.type === 'course') return `教材：${item.course.title}`;
+  if (item.type === 'course') return `课程：${item.course.title}`;
   if (item.type === 'chapter') return `章节：${item.chapter.title}\n小节数：${item.chapter.sectionIds.length}`;
   if (item.type === 'section') return `小节：${item.section.title}\n${sectionNeighborText(item.course, item.section)}`;
   if (item.type === 'knowledge') return `知识点：${item.section.title} / ${item.point.label}\n${sectionNeighborText(item.course, item.section)}`;
@@ -698,6 +1319,8 @@ function selectNode(item, object = null) {
     phiInput.value = item.point.phi || 0;
     psiInput.value = item.point.psi || 0;
   }
+  editorEl.classList.toggle('hidden', !editMode || !item.point);
+  renderEditorUI();
 }
 
 function setPointer(event) {
@@ -765,10 +1388,423 @@ function applyPointMove(courseGroup, point, localVector, queueRebuild = false) {
   return isSurfaceVertex;
 }
 
+function setEditMode(next) {
+  editMode = Boolean(next);
+  editBtn.classList.toggle('active', editMode);
+  editBtn.setAttribute('aria-pressed', editMode ? 'true' : 'false');
+  editorEl.classList.toggle('hidden', !editMode || !selectedNode?.point);
+}
+
+function nextEntityId(course, type) {
+  const base = createEntityId(course, type);
+  const extraIds = new Set(placementMode?.newVertices?.map((point) => point.id) || []);
+  if (!extraIds.has(base)) return base;
+  let index = 2;
+  let candidate = `${base}-${index}`;
+  while (extraIds.has(candidate)) {
+    index += 1;
+    candidate = `${base}-${index}`;
+  }
+  return candidate;
+}
+
+function pointFromLocalVector(course, localVector, type = 'vertex') {
+  const normalized = localVector.clone().normalize();
+  const phi = Math.atan2(normalized.z, normalized.x);
+  const psi = Math.asin(THREE.MathUtils.clamp(normalized.y, -1, 1));
+  const id = nextEntityId(course, type);
+  const label = type === 'knowledge'
+    ? `知识点 ${course.sections.reduce((sum, section) => sum + section.knowledge.length, 0) + 1}`
+    : `P${course.vertices.length + (placementMode?.newVertices?.length || 0) + 1}`;
+  return pointFromAngles(id, label, phi, psi, radius);
+}
+
+function renderPlacementUI() {
+  placementBar.classList.toggle('hidden', !placementMode);
+  if (!placementMode) return;
+  const isDraft = placementMode.type === 'boundary-draft';
+  draftNameField.classList.toggle('hidden', !isDraft);
+  finishPlacementBtn.classList.toggle('hidden', !isDraft);
+  if (isDraft) {
+    const noun = placementMode.regionType === 'chapter' ? '章节' : '小节';
+    placementTitle.textContent = `新建${noun}边界`;
+    draftNameInput.value = placementMode.title;
+    placementHint.textContent = `依次点击现有顶点或球面空白处，当前 ${placementMode.vertexIds.length} 个点`;
+  } else if (placementMode.type === 'boundary-point') {
+    placementTitle.textContent = '向边界添加顶点';
+    placementHint.textContent = '点击球面，新点会插入最近的边界线段';
+  } else if (placementMode.type === 'knowledge') {
+    placementTitle.textContent = '新建知识点';
+    placementHint.textContent = '请在目标小节区域内点击球面';
+  } else {
+    placementTitle.textContent = '新建球面顶点';
+    placementHint.textContent = '点击球面放置一个可复用顶点';
+  }
+}
+
+function renderDraft() {
+  courseGroups.forEach((courseGroup) => clearDynamicGroup(courseGroup.draft));
+  if (placementMode?.type !== 'boundary-draft') return;
+  const courseGroup = courseGroups.find((item) => item.course.id === placementMode.courseId);
+  if (!courseGroup) return;
+  const pointsById = new Map(courseGroup.course.vertices.map((point) => [point.id, point]));
+  placementMode.newVertices.forEach((point) => pointsById.set(point.id, point));
+  const vectors = placementMode.vertexIds
+    .map((id) => pointsById.get(id))
+    .filter(Boolean)
+    .map((point) => sourceToVector(point, radius + 0.56));
+
+  vectors.forEach((position) => {
+    const material = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      emissive: 0xff8a00,
+      emissiveIntensity: 0.75,
+      roughness: 0.35,
+      depthTest: false
+    });
+    const dot = new THREE.Mesh(handleGeometry, material);
+    dot.position.copy(position);
+    dot.userData.sharedGeometry = true;
+    dot.renderOrder = 25;
+    courseGroup.draft.add(dot);
+  });
+
+  if (vectors.length >= 2) {
+    const positions = [];
+    const edgeCount = vectors.length >= 3 ? vectors.length : vectors.length - 1;
+    for (let index = 0; index < edgeCount; index += 1) {
+      const start = vectors[index];
+      const end = vectors[(index + 1) % vectors.length];
+      for (let step = 0; step <= 16; step += 1) {
+        const point = slerpUnit(start, end, step / 16).multiplyScalar(radius + 0.55);
+        positions.push(point.x, point.y, point.z);
+      }
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    const material = new THREE.LineBasicMaterial({
+      color: 0xff7a00,
+      depthTest: false,
+      transparent: true,
+      opacity: 0.95
+    });
+    const line = new THREE.Line(geometry, material);
+    line.renderOrder = 24;
+    courseGroup.draft.add(line);
+  }
+}
+
+function cancelPlacement(notify = true) {
+  placementMode = null;
+  renderPlacementUI();
+  renderDraft();
+  if (notify) showToast('已取消放置');
+}
+
+function startBoundaryDraft(regionType, course, chapter = null) {
+  cancelPlacement(false);
+  focusCourse(course.id);
+  setEditMode(true);
+  placementMode = {
+    type: 'boundary-draft',
+    regionType,
+    courseId: course.id,
+    chapterId: chapter?.id || null,
+    title: regionType === 'chapter'
+      ? `新章节 ${course.chapters.length + 1}`
+      : `新小节 ${course.sections.filter((section) => section.chapterId === chapter?.id).length + 1}`,
+    vertexIds: [],
+    newVertices: []
+  };
+  renderPlacementUI();
+  renderDraft();
+}
+
+function startBoundaryPointPlacement(regionType, course, region) {
+  cancelPlacement(false);
+  focusCourse(course.id);
+  setEditMode(true);
+  placementMode = {
+    type: 'boundary-point',
+    regionType,
+    courseId: course.id,
+    regionId: region.id
+  };
+  renderPlacementUI();
+}
+
+function startKnowledgePlacement(course, section) {
+  cancelPlacement(false);
+  focusCourse(course.id);
+  setEditMode(true);
+  placementMode = {
+    type: 'knowledge',
+    courseId: course.id,
+    sectionId: section.id
+  };
+  renderPlacementUI();
+}
+
+function startFreeVertexPlacement(course) {
+  cancelPlacement(false);
+  focusCourse(course.id);
+  setEditMode(true);
+  placementMode = { type: 'vertex', courseId: course.id };
+  renderPlacementUI();
+}
+
+function finishBoundaryDraft() {
+  if (placementMode?.type !== 'boundary-draft') return;
+  placementMode.title = draftNameInput.value.trim() || placementMode.title;
+  const uniqueIds = [...new Set(placementMode.vertexIds)];
+  if (uniqueIds.length < 3) {
+    showToast('闭合边界至少需要 3 个不同顶点');
+    return;
+  }
+  const course = data.courses.find((item) => item.id === placementMode.courseId);
+  const chapter = course?.chapters.find((item) => item.id === placementMode.chapterId);
+  if (!course || (placementMode.regionType === 'section' && !chapter)) {
+    showToast('目标课程或章节已不存在');
+    cancelPlacement(false);
+    return;
+  }
+  const pointsById = new Map(course.vertices.map((point) => [point.id, point]));
+  placementMode.newVertices.forEach((point) => pointsById.set(point.id, point));
+  const boundaryDirections = uniqueIds
+    .map((id) => pointsById.get(id))
+    .filter(Boolean)
+    .map((point) => sourceToVector(point, 1));
+  const areaNormal = new THREE.Vector3();
+  boundaryDirections.forEach((point, index) => {
+    areaNormal.add(new THREE.Vector3().crossVectors(
+      point,
+      boundaryDirections[(index + 1) % boundaryDirections.length]
+    ));
+  });
+  if (boundaryDirections.length < 3 || areaNormal.lengthSq() < 1e-5) {
+    showToast('这些顶点无法构成有效球面区域，请调整点位或顺序');
+    return;
+  }
+  if (placementMode.regionType === 'section') {
+    const chapterBoundary = sampleClosedBoundary(course, chapter, 8, 1);
+    const outside = uniqueIds.some((id) => {
+      const point = pointsById.get(id);
+      return !point || !sphericalContains(sourceToVector(point, 1), chapterBoundary);
+    });
+    if (outside) {
+      showToast('小节边界点必须位于所属章节内');
+      return;
+    }
+  }
+  const mode = placementMode;
+  const before = snapshotConfig();
+  course.vertices.push(...mode.newVertices);
+  let locator;
+  if (mode.regionType === 'chapter') {
+    const id = createEntityId(course, 'chapter');
+    course.chapters.push({
+      id,
+      title: mode.title,
+      vertexIds: uniqueIds,
+      sectionIds: []
+    });
+    locator = { type: 'chapter', courseId: course.id, id };
+  } else {
+    const id = createEntityId(course, 'section');
+    course.sections.push({
+      id,
+      title: mode.title,
+      chapterId: chapter.id,
+      vertexIds: uniqueIds,
+      knowledge: []
+    });
+    chapter.sectionIds.push(id);
+    locator = { type: 'section', courseId: course.id, id };
+  }
+  cancelPlacement(false);
+  commitHistory(before, mode.regionType === 'chapter' ? '章节已创建' : '小节已创建');
+  rebuildSingleCourse(course.id, locator);
+}
+
+function closestBoundaryInsertionIndex(course, region, direction) {
+  let bestIndex = region.vertexIds.length;
+  let bestDot = -Infinity;
+  region.vertexIds.forEach((vertexId, index) => {
+    const start = course.__vertexMap.get(vertexId);
+    const end = course.__vertexMap.get(region.vertexIds[(index + 1) % region.vertexIds.length]);
+    if (!start || !end) return;
+    const a = sourceToVector(start, 1);
+    const b = sourceToVector(end, 1);
+    for (let step = 0; step <= 12; step += 1) {
+      const dot = slerpUnit(a, b, step / 12).dot(direction);
+      if (dot > bestDot) {
+        bestDot = dot;
+        bestIndex = index + 1;
+      }
+    }
+  });
+  return bestIndex;
+}
+
+function addDraftVertex(course, point, isNew = false) {
+  if (placementMode.vertexIds.includes(point.id)) {
+    showToast('这个顶点已经在当前边界中');
+    return;
+  }
+  placementMode.vertexIds.push(point.id);
+  if (isNew) placementMode.newVertices.push(point);
+  renderPlacementUI();
+  renderDraft();
+}
+
+function handlePlacement(result) {
+  if (!placementMode) return false;
+  const { hit, courseGroup, item } = result;
+  if (courseGroup.course.id !== placementMode.courseId) {
+    showToast('请在当前目标课程球上操作');
+    return true;
+  }
+
+  if (placementMode.type === 'boundary-draft' && item.type === 'control') {
+    addDraftVertex(courseGroup.course, item.point);
+    return true;
+  }
+  if (hit.object !== courseGroup.base) {
+    showToast('请点击球面空白区域');
+    return true;
+  }
+  const direction = courseGroup.group.worldToLocal(hit.point.clone()).normalize();
+
+  if (placementMode.type === 'boundary-draft') {
+    addDraftVertex(
+      courseGroup.course,
+      pointFromLocalVector(courseGroup.course, direction, 'vertex'),
+      true
+    );
+    return true;
+  }
+
+  if (placementMode.type === 'boundary-point') {
+    const course = courseGroup.course;
+    const regions = placementMode.regionType === 'chapter' ? course.chapters : course.sections;
+    const region = regions.find((entry) => entry.id === placementMode.regionId);
+    if (!region) {
+      cancelPlacement(false);
+      return true;
+    }
+    const before = snapshotConfig();
+    const point = pointFromLocalVector(course, direction, 'vertex');
+    const insertionIndex = closestBoundaryInsertionIndex(course, region, direction);
+    course.vertices.push(point);
+    region.vertexIds.splice(insertionIndex, 0, point.id);
+    const locator = {
+      type: placementMode.regionType,
+      courseId: course.id,
+      id: region.id
+    };
+    cancelPlacement(false);
+    commitHistory(before, '边界顶点已添加');
+    rebuildSingleCourse(course.id, locator);
+    return true;
+  }
+
+  if (placementMode.type === 'knowledge') {
+    const course = courseGroup.course;
+    const section = course.sections.find((entry) => entry.id === placementMode.sectionId);
+    const clickedSection = findRegionAtDirection(course, course.sections, direction);
+    if (!section || clickedSection?.id !== section.id) {
+      showToast('知识点必须放在目标小节区域内');
+      return true;
+    }
+    const before = snapshotConfig();
+    const point = pointFromLocalVector(course, direction, 'knowledge');
+    section.knowledge.push(point);
+    const locator = {
+      type: 'knowledge',
+      courseId: course.id,
+      sectionId: section.id,
+      id: point.id
+    };
+    cancelPlacement(false);
+    commitHistory(before, '知识点已创建');
+    rebuildSingleCourse(course.id, locator);
+    return true;
+  }
+
+  if (placementMode.type === 'vertex') {
+    const course = courseGroup.course;
+    const before = snapshotConfig();
+    const point = pointFromLocalVector(course, direction, 'vertex');
+    course.vertices.push(point);
+    const locator = { type: 'vertex', courseId: course.id, id: point.id };
+    cancelPlacement(false);
+    commitHistory(before, '球面顶点已创建');
+    rebuildSingleCourse(course.id, locator);
+    return true;
+  }
+  return false;
+}
+
+function deleteSelection() {
+  const item = selectedNode;
+  if (!item?.course) return;
+  const course = item.course;
+  const before = snapshotConfig();
+  let locator = { type: 'course', courseId: course.id };
+  let message = '';
+
+  if (item.type === 'course') {
+    if (!window.confirm(`删除课程“${course.title}”及其全部内容？`)) return;
+    data.courses.splice(data.courses.indexOf(course), 1);
+    locator = null;
+    message = '课程已删除';
+  } else if (item.type === 'chapter') {
+    const childSections = course.sections.filter((section) => section.chapterId === item.chapter.id);
+    if (!window.confirm(`删除“${item.chapter.title}”及其 ${childSections.length} 个小节？`)) return;
+    course.chapters.splice(course.chapters.indexOf(item.chapter), 1);
+    course.sections = course.sections.filter((section) => section.chapterId !== item.chapter.id);
+    message = '章节已删除';
+  } else if (item.type === 'section') {
+    if (!window.confirm(`删除小节“${item.section.title}”及其知识点？`)) return;
+    course.sections.splice(course.sections.indexOf(item.section), 1);
+    const chapter = course.chapters.find((entry) => entry.id === item.section.chapterId);
+    if (chapter) chapter.sectionIds = chapter.sectionIds.filter((id) => id !== item.section.id);
+    locator = chapter ? { type: 'chapter', courseId: course.id, id: chapter.id } : locator;
+    message = '小节已删除';
+  } else if (item.type === 'knowledge') {
+    item.section.knowledge.splice(item.section.knowledge.indexOf(item.point), 1);
+    locator = { type: 'section', courseId: course.id, id: item.section.id };
+    message = '知识点已删除';
+  } else if (item.type === 'control' || item.type === 'point') {
+    const regions = [...course.chapters, ...course.sections]
+      .filter((region) => region.vertexIds.includes(item.point.id));
+    const invalidRegion = regions.find((region) => (
+      new Set(region.vertexIds.filter((id) => id !== item.point.id)).size < 3
+    ));
+    if (invalidRegion) {
+      showToast(`无法删除：会使“${invalidRegion.title}”少于 3 个边界顶点`);
+      return;
+    }
+    if (regions.length && !window.confirm(`该顶点被 ${regions.length} 个区域引用，确定从所有边界中删除？`)) return;
+    regions.forEach((region) => {
+      region.vertexIds = region.vertexIds.filter((id) => id !== item.point.id);
+    });
+    course.vertices.splice(course.vertices.indexOf(item.point), 1);
+    message = '顶点已删除';
+  } else {
+    return;
+  }
+
+  commitHistory(before, message);
+  if (locator?.courseId) rebuildSingleCourse(locator.courseId, locator);
+  else rebuildAllCourses(null, null);
+}
+
 renderer.domElement.addEventListener('pointerdown', (event) => {
   const result = raycastScene(event);
   if (!result) return;
   const { hit, courseGroup, item } = result;
+  if (handlePlacement(result)) return;
   if (!selectedCourse || selectedCourse.course.id !== courseGroup.course.id) focusCourse(courseGroup.course.id);
   selectNode(item, hit.object);
   if (editMode && item.point) {
@@ -776,7 +1812,8 @@ renderer.domElement.addEventListener('pointerdown', (event) => {
       courseGroup,
       point: item.point,
       startVector: sourceToVector(item.point, radius),
-      surfaceChanged: false
+      surfaceChanged: false,
+      before: snapshotConfig()
     };
     controls.enabled = false;
     renderer.domElement.setPointerCapture(event.pointerId);
@@ -803,6 +1840,8 @@ renderer.domElement.addEventListener('pointermove', (event) => {
 function finishPointerDrag(event) {
   if (!draggingPoint) return;
   if (draggingPoint.surfaceChanged) rebuildCourseVisuals(draggingPoint.courseGroup);
+  commitHistory(draggingPoint.before, draggingPoint.surfaceChanged ? '边界顶点已移动' : '知识点已移动');
+  renderEditorUI();
   draggingPoint = null;
   controls.enabled = true;
   if (renderer.domElement.hasPointerCapture(event.pointerId)) renderer.domElement.releasePointerCapture(event.pointerId);
@@ -813,6 +1852,7 @@ renderer.domElement.addEventListener('pointercancel', finishPointerDrag);
 
 function updateSelectedPoint() {
   if (!selectedNode?.point || !selectedNode?.course) return;
+  if (!sliderBefore) sliderBefore = snapshotConfig();
   const courseGroup = courseGroups.find((item) => item.course === selectedNode.course);
   if (!courseGroup) return;
   const phi = Number(phiInput.value);
@@ -826,25 +1866,159 @@ function updateSelectedPoint() {
   applyPointMove(courseGroup, selectedNode.point, local, true);
 }
 
-overviewBtn.addEventListener('click', () => focusCourse(null));
-editBtn.addEventListener('click', () => {
-  editMode = !editMode;
-  editBtn.classList.toggle('active', editMode);
-  editBtn.setAttribute('aria-pressed', editMode ? 'true' : 'false');
-  editorEl.classList.toggle('hidden', !editMode);
+function importConfigFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.addEventListener('load', () => {
+    try {
+      const parsed = JSON.parse(String(reader.result));
+      const normalized = normalizeConfig(parsed);
+      replaceConfig(data, normalized.config);
+      undoStack.length = 0;
+      redoStack.length = 0;
+      savedSnapshot = snapshotConfig();
+      cancelPlacement(false);
+      rebuildAllCourses(null, null);
+      updateHistoryUI();
+      const warningText = normalized.warnings.length
+        ? `；已自动处理 ${normalized.warnings.length} 个兼容问题`
+        : '';
+      showToast(`配置导入成功${warningText}`, 4200);
+    } catch (error) {
+      const details = error instanceof ConfigValidationError
+        ? error.messages.slice(0, 6).join('\n')
+        : error.message;
+      window.alert(`配置导入失败：\n${details}`);
+    } finally {
+      fileInput.value = '';
+    }
+  });
+  reader.addEventListener('error', () => {
+    showToast('无法读取所选文件');
+    fileInput.value = '';
+  });
+  reader.readAsText(file);
+}
+
+function exportCurrentConfig() {
+  if (placementMode) {
+    showToast('请先完成或取消当前放置操作');
+    return;
+  }
+  try {
+    const clean = exportConfig(data);
+    const content = JSON.stringify(clean, null, 2);
+    const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
+    const link = document.createElement('a');
+    const firstTitle = clean.courses[0]?.title || 'sphere-knowledge-map';
+    const safeName = firstTitle.replace(/[\\/:*?"<>|\s]+/g, '-').replace(/^-|-$/g, '');
+    link.href = URL.createObjectURL(blob);
+    link.download = `${safeName || 'sphere-knowledge-map'}-config.json`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    savedSnapshot = snapshotConfig();
+    updateHistoryUI();
+    showToast('配置已导出');
+  } catch (error) {
+    const details = error instanceof ConfigValidationError
+      ? error.messages.slice(0, 6).join('\n')
+      : error.message;
+    window.alert(`导出失败：\n${details}`);
+  }
+}
+
+function addCourse() {
+  cancelPlacement(false);
+  const before = snapshotConfig();
+  const course = createEmptyCourse(data);
+  data.courses.push(course);
+  commitHistory(before, '空白课程已创建');
+  rebuildAllCourses({ type: 'course', courseId: course.id }, course.id);
+}
+
+overviewBtn.addEventListener('click', () => {
+  cancelPlacement(false);
+  selectedNode = null;
+  focusCourse(null);
+  renderEditorUI();
+});
+editBtn.addEventListener('click', () => setEditMode(!editMode));
+addVertexBtn.addEventListener('click', () => {
+  if (!selectedCourse) {
+    showToast('请先选择一门课程');
+    return;
+  }
+  startFreeVertexPlacement(selectedCourse.course);
+});
+addCourseBtn.addEventListener('click', addCourse);
+importBtn.addEventListener('click', () => {
+  const dirty = snapshotConfig() !== savedSnapshot;
+  if (dirty && !window.confirm('导入会替换当前未导出的编辑内容，确定继续？')) return;
+  fileInput.click();
+});
+exportBtn.addEventListener('click', exportCurrentConfig);
+undoBtn.addEventListener('click', undo);
+redoBtn.addEventListener('click', redo);
+fileInput.addEventListener('change', () => importConfigFile(fileInput.files?.[0]));
+finishPlacementBtn.addEventListener('click', finishBoundaryDraft);
+cancelPlacementBtn.addEventListener('click', () => cancelPlacement());
+draftNameInput.addEventListener('input', () => {
+  if (placementMode?.type === 'boundary-draft') placementMode.title = draftNameInput.value;
+});
+phiInput.addEventListener('pointerdown', () => {
+  sliderBefore = snapshotConfig();
+});
+psiInput.addEventListener('pointerdown', () => {
+  sliderBefore = snapshotConfig();
 });
 phiInput.addEventListener('input', updateSelectedPoint);
 psiInput.addEventListener('input', updateSelectedPoint);
+phiInput.addEventListener('change', () => {
+  if (sliderBefore) commitHistory(sliderBefore, '坐标已更新');
+  sliderBefore = null;
+  renderEditorUI();
+});
+psiInput.addEventListener('change', () => {
+  if (sliderBefore) commitHistory(sliderBefore, '坐标已更新');
+  sliderBefore = null;
+  renderEditorUI();
+});
 document.querySelectorAll('[data-nudge]').forEach((button) => {
   button.addEventListener('click', () => {
     if (!selectedNode?.point) return;
+    const before = snapshotConfig();
     const step = 0.025;
     if (button.dataset.nudge === 'left') phiInput.value = Number(phiInput.value) - step;
     if (button.dataset.nudge === 'right') phiInput.value = Number(phiInput.value) + step;
     if (button.dataset.nudge === 'up') psiInput.value = Number(psiInput.value) + step;
     if (button.dataset.nudge === 'down') psiInput.value = Number(psiInput.value) - step;
     updateSelectedPoint();
+    commitHistory(before, '坐标已微调');
+    sliderBefore = null;
+    renderEditorUI();
   });
+});
+
+window.addEventListener('keydown', (event) => {
+  const active = document.activeElement;
+  const editingText = active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement;
+  if (event.key === 'Escape' && placementMode) {
+    event.preventDefault();
+    cancelPlacement();
+    return;
+  }
+  if (editingText || !(event.ctrlKey || event.metaKey)) return;
+  if (event.key.toLowerCase() === 'z') {
+    event.preventDefault();
+    if (event.shiftKey) redo();
+    else undo();
+  } else if (event.key.toLowerCase() === 'y') {
+    event.preventDefault();
+    redo();
+  } else if (event.key.toLowerCase() === 's') {
+    event.preventDefault();
+    exportCurrentConfig();
+  }
 });
 
 window.addEventListener('resize', () => {
@@ -860,6 +2034,12 @@ window.addEventListener('resize', () => {
     controls.target.y = isMobileView() ? -3.2 : 0;
     camera.position.copy(controls.target).add(offset);
   }
+});
+
+window.addEventListener('beforeunload', (event) => {
+  if (snapshotConfig() === savedSnapshot) return;
+  event.preventDefault();
+  event.returnValue = '';
 });
 
 function animate() {
@@ -878,4 +2058,9 @@ renderTabs();
 const queryCourse = new URLSearchParams(window.location.search).get('course');
 if (queryCourse && data.courses.some((course) => course.id === queryCourse)) focusCourse(queryCourse);
 else focusCourse(null);
+renderEditorUI();
+renderPlacementUI();
+if (initialConfig.warnings.length) {
+  showToast(`示例配置已自动处理 ${initialConfig.warnings.length} 个兼容问题`, 4200);
+}
 animate();

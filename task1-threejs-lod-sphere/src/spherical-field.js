@@ -688,13 +688,38 @@ function buildField(course, regions, level, ids = buildSphericalIds(course, regi
   };
 }
 
+function createSolidField(color) {
+  const colorCanvas = createCanvas();
+  const heightCanvas = createCanvas();
+  const colorContext = colorCanvas.getContext('2d');
+  const heightContext = heightCanvas.getContext('2d');
+  colorContext.fillStyle = color;
+  colorContext.fillRect(0, 0, FIELD_WIDTH, FIELD_HEIGHT);
+  heightContext.fillStyle = '#ffffff';
+  heightContext.fillRect(0, 0, FIELD_WIDTH, FIELD_HEIGHT);
+  return {
+    color: createCanvasTexture(colorCanvas, true),
+    height: createCanvasTexture(heightCanvas)
+  };
+}
+
 export function createSemanticFields(course) {
+  if (!course.chapters.length) {
+    return {
+      chapter: createSolidField(course.color),
+      section: createSolidField(course.color)
+    };
+  }
   const chapterIds = buildSphericalIds(course, course.chapters);
   const sectionRegions = course.sections;
-  const sectionIds = buildSphericalIds(course, sectionRegions, chapterIds);
+  const sectionIds = sectionRegions.length
+    ? buildSphericalIds(course, sectionRegions, chapterIds)
+    : null;
   return {
     chapter: buildField(course, course.chapters, 'chapter', chapterIds),
-    section: buildField(course, sectionRegions, 'section', sectionIds)
+    section: sectionRegions.length
+      ? buildField(course, sectionRegions, 'section', sectionIds)
+      : createSolidField(course.color)
   };
 }
 
