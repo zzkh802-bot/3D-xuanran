@@ -7,6 +7,9 @@
     "dev": "vite --host 127.0.0.1 --port 5173",
     "build": "vite build",
     "check:config": "node scripts/check_config_model.mjs",
+    "check:template": "node scripts/check_template_config.mjs",
+    "generate:template": "node scripts/generate_template_config.mjs",
+    "test": "npm run check:config && npm run check:template",
     "preview": "vite preview --host 127.0.0.1 --port 4173"
   },
   "dependencies": {

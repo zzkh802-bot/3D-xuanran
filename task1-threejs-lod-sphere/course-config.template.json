@@ -1,0 +1,835 @@
+{
+  "$schema": "./course-config.schema.json",
+  "schema": 4,
+  "radius": 10,
+  "courses": [
+    {
+      "id": "template-course",
+      "title": "示例课程：从基础到综合实践",
+      "description": "一份可直接导入和继续编辑的完整课程模板。",
+      "color": "#2878d0",
+      "vertices": [
+        {
+          "id": "template-c1-level-1-left",
+          "label": "第1章 L1 左边界点",
+          "phi": -2.95,
+          "psi": -0.9,
+          "x": -6.10236,
+          "y": -1.18369,
+          "z": -7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c1-level-1-right",
+          "label": "第1章 L1 右边界点",
+          "phi": -1.65,
+          "psi": -0.9,
+          "x": -0.49182,
+          "y": -6.19661,
+          "z": -7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c1-level-2-left",
+          "label": "第1章 L2 左边界点",
+          "phi": -2.95,
+          "psi": -0.3,
+          "x": -9.37856,
+          "y": -1.81918,
+          "z": -2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c1-level-2-right",
+          "label": "第1章 L2 右边界点",
+          "phi": -1.65,
+          "psi": -0.3,
+          "x": -0.75587,
+          "y": -9.52342,
+          "z": -2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c1-level-3-left",
+          "label": "第1章 L3 左边界点",
+          "phi": -2.95,
+          "psi": 0.3,
+          "x": -9.37856,
+          "y": -1.81918,
+          "z": 2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c1-level-3-right",
+          "label": "第1章 L3 右边界点",
+          "phi": -1.65,
+          "psi": 0.3,
+          "x": -0.75587,
+          "y": -9.52342,
+          "z": 2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c1-level-4-left",
+          "label": "第1章 L4 左边界点",
+          "phi": -2.95,
+          "psi": 0.9,
+          "x": -6.10236,
+          "y": -1.18369,
+          "z": 7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c1-level-4-right",
+          "label": "第1章 L4 右边界点",
+          "phi": -1.65,
+          "psi": 0.9,
+          "x": -0.49182,
+          "y": -6.19661,
+          "z": 7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c2-level-1-left",
+          "label": "第2章 L1 左边界点",
+          "phi": -1.45,
+          "psi": -0.9,
+          "x": 0.74906,
+          "y": -6.1708,
+          "z": -7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c2-level-1-right",
+          "label": "第2章 L1 右边界点",
+          "phi": -0.15,
+          "psi": -0.9,
+          "x": 6.1463,
+          "y": -0.92892,
+          "z": -7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c2-level-2-left",
+          "label": "第2章 L2 左边界点",
+          "phi": -1.45,
+          "psi": -0.3,
+          "x": 1.15121,
+          "y": -9.48375,
+          "z": -2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c2-level-2-right",
+          "label": "第2章 L2 右边界点",
+          "phi": -0.15,
+          "psi": -0.3,
+          "x": 9.44609,
+          "y": -1.42764,
+          "z": -2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c2-level-3-left",
+          "label": "第2章 L3 左边界点",
+          "phi": -1.45,
+          "psi": 0.3,
+          "x": 1.15121,
+          "y": -9.48375,
+          "z": 2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c2-level-3-right",
+          "label": "第2章 L3 右边界点",
+          "phi": -0.15,
+          "psi": 0.3,
+          "x": 9.44609,
+          "y": -1.42764,
+          "z": 2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c2-level-4-left",
+          "label": "第2章 L4 左边界点",
+          "phi": -1.45,
+          "psi": 0.9,
+          "x": 0.74906,
+          "y": -6.1708,
+          "z": 7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c2-level-4-right",
+          "label": "第2章 L4 右边界点",
+          "phi": -0.15,
+          "psi": 0.9,
+          "x": 6.1463,
+          "y": -0.92892,
+          "z": 7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c3-level-1-left",
+          "label": "第3章 L1 左边界点",
+          "phi": 0.15,
+          "psi": -0.9,
+          "x": 6.1463,
+          "y": 0.92892,
+          "z": -7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c3-level-1-right",
+          "label": "第3章 L1 右边界点",
+          "phi": 1.45,
+          "psi": -0.9,
+          "x": 0.74906,
+          "y": 6.1708,
+          "z": -7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c3-level-2-left",
+          "label": "第3章 L2 左边界点",
+          "phi": 0.15,
+          "psi": -0.3,
+          "x": 9.44609,
+          "y": 1.42764,
+          "z": -2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c3-level-2-right",
+          "label": "第3章 L2 右边界点",
+          "phi": 1.45,
+          "psi": -0.3,
+          "x": 1.15121,
+          "y": 9.48375,
+          "z": -2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c3-level-3-left",
+          "label": "第3章 L3 左边界点",
+          "phi": 0.15,
+          "psi": 0.3,
+          "x": 9.44609,
+          "y": 1.42764,
+          "z": 2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c3-level-3-right",
+          "label": "第3章 L3 右边界点",
+          "phi": 1.45,
+          "psi": 0.3,
+          "x": 1.15121,
+          "y": 9.48375,
+          "z": 2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c3-level-4-left",
+          "label": "第3章 L4 左边界点",
+          "phi": 0.15,
+          "psi": 0.9,
+          "x": 6.1463,
+          "y": 0.92892,
+          "z": 7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c3-level-4-right",
+          "label": "第3章 L4 右边界点",
+          "phi": 1.45,
+          "psi": 0.9,
+          "x": 0.74906,
+          "y": 6.1708,
+          "z": 7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c4-level-1-left",
+          "label": "第4章 L1 左边界点",
+          "phi": 1.65,
+          "psi": -0.9,
+          "x": -0.49182,
+          "y": 6.19661,
+          "z": -7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c4-level-1-right",
+          "label": "第4章 L1 右边界点",
+          "phi": 2.95,
+          "psi": -0.9,
+          "x": -6.10236,
+          "y": 1.18369,
+          "z": -7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c4-level-2-left",
+          "label": "第4章 L2 左边界点",
+          "phi": 1.65,
+          "psi": -0.3,
+          "x": -0.75587,
+          "y": 9.52342,
+          "z": -2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c4-level-2-right",
+          "label": "第4章 L2 右边界点",
+          "phi": 2.95,
+          "psi": -0.3,
+          "x": -9.37856,
+          "y": 1.81918,
+          "z": -2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c4-level-3-left",
+          "label": "第4章 L3 左边界点",
+          "phi": 1.65,
+          "psi": 0.3,
+          "x": -0.75587,
+          "y": 9.52342,
+          "z": 2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c4-level-3-right",
+          "label": "第4章 L3 右边界点",
+          "phi": 2.95,
+          "psi": 0.3,
+          "x": -9.37856,
+          "y": 1.81918,
+          "z": 2.9552,
+          "manual": true
+        },
+        {
+          "id": "template-c4-level-4-left",
+          "label": "第4章 L4 左边界点",
+          "phi": 1.65,
+          "psi": 0.9,
+          "x": -0.49182,
+          "y": 6.19661,
+          "z": 7.83327,
+          "manual": true
+        },
+        {
+          "id": "template-c4-level-4-right",
+          "label": "第4章 L4 右边界点",
+          "phi": 2.95,
+          "psi": 0.9,
+          "x": -6.10236,
+          "y": 1.18369,
+          "z": 7.83327,
+          "manual": true
+        }
+      ],
+      "chapters": [
+        {
+          "id": "template-chapter-1",
+          "title": "第一章 课程基础",
+          "description": "建立课程全局认识，准备学习工具并掌握基本概念。",
+          "vertexIds": [
+            "template-c1-level-1-left",
+            "template-c1-level-1-right",
+            "template-c1-level-4-right",
+            "template-c1-level-4-left"
+          ],
+          "sectionIds": [
+            "template-section-1-1",
+            "template-section-1-2",
+            "template-section-1-3"
+          ]
+        },
+        {
+          "id": "template-chapter-2",
+          "title": "第二章 核心理论",
+          "description": "理解课程的基本原理、模型结构和分析方法。",
+          "vertexIds": [
+            "template-c2-level-1-left",
+            "template-c2-level-1-right",
+            "template-c2-level-4-right",
+            "template-c2-level-4-left"
+          ],
+          "sectionIds": [
+            "template-section-2-1",
+            "template-section-2-2",
+            "template-section-2-3"
+          ]
+        },
+        {
+          "id": "template-chapter-3",
+          "title": "第三章 实践应用",
+          "description": "通过案例、实验和评价环节应用核心理论。",
+          "vertexIds": [
+            "template-c3-level-1-left",
+            "template-c3-level-1-right",
+            "template-c3-level-4-right",
+            "template-c3-level-4-left"
+          ],
+          "sectionIds": [
+            "template-section-3-1",
+            "template-section-3-2",
+            "template-section-3-3"
+          ]
+        },
+        {
+          "id": "template-chapter-4",
+          "title": "第四章 综合提升",
+          "description": "完成综合项目，并形成总结、复盘与拓展能力。",
+          "vertexIds": [
+            "template-c4-level-1-left",
+            "template-c4-level-1-right",
+            "template-c4-level-4-right",
+            "template-c4-level-4-left"
+          ],
+          "sectionIds": [
+            "template-section-4-1",
+            "template-section-4-2",
+            "template-section-4-3"
+          ]
+        }
+      ],
+      "sections": [
+        {
+          "id": "template-section-1-1",
+          "title": "1.1 课程导论",
+          "description": "了解课程目标、内容结构与学习路线。",
+          "chapterId": "template-chapter-1",
+          "vertexIds": [
+            "template-c1-level-1-left",
+            "template-c1-level-1-right",
+            "template-c1-level-2-right",
+            "template-c1-level-2-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-1-1-1",
+              "label": "课程目标",
+              "phi": -2.48,
+              "psi": -0.645,
+              "x": -6.30502,
+              "y": -4.90946,
+              "z": -6.01198,
+              "manual": true,
+              "description": "1.1 课程导论中的“课程目标”知识点。"
+            },
+            {
+              "id": "template-knowledge-1-1-2",
+              "label": "学习路线",
+              "phi": -2.12,
+              "psi": -0.555,
+              "x": -4.43655,
+              "y": -7.24914,
+              "z": -5.26943,
+              "manual": true,
+              "description": "1.1 课程导论中的“学习路线”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-1-2",
+          "title": "1.2 基本概念",
+          "description": "建立后续学习所需的核心术语体系。",
+          "chapterId": "template-chapter-1",
+          "vertexIds": [
+            "template-c1-level-2-left",
+            "template-c1-level-2-right",
+            "template-c1-level-3-right",
+            "template-c1-level-3-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-1-2-1",
+              "label": "核心术语",
+              "phi": -2.48,
+              "psi": -0.045,
+              "x": -7.88216,
+              "y": -6.13752,
+              "z": -0.44985,
+              "manual": true,
+              "description": "1.2 基本概念中的“核心术语”知识点。"
+            },
+            {
+              "id": "template-knowledge-1-2-2",
+              "label": "概念关系",
+              "phi": -2.12,
+              "psi": 0.045,
+              "x": -5.2148,
+              "y": -8.52077,
+              "z": 0.44985,
+              "manual": true,
+              "description": "1.2 基本概念中的“概念关系”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-1-3",
+          "title": "1.3 工具与环境",
+          "description": "完成学习及实践环境的准备工作。",
+          "chapterId": "template-chapter-1",
+          "vertexIds": [
+            "template-c1-level-3-left",
+            "template-c1-level-3-right",
+            "template-c1-level-4-right",
+            "template-c1-level-4-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-1-3-1",
+              "label": "工具选择",
+              "phi": -2.48,
+              "psi": 0.555,
+              "x": -6.70584,
+              "y": -5.22157,
+              "z": 5.26943,
+              "manual": true,
+              "description": "1.3 工具与环境中的“工具选择”知识点。"
+            },
+            {
+              "id": "template-knowledge-1-3-2",
+              "label": "环境配置",
+              "phi": -2.12,
+              "psi": 0.645,
+              "x": -4.17137,
+              "y": -6.81585,
+              "z": 6.01198,
+              "manual": true,
+              "description": "1.3 工具与环境中的“环境配置”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-2-1",
+          "title": "2.1 基本原理",
+          "description": "学习支撑课程体系的主要规律。",
+          "chapterId": "template-chapter-2",
+          "vertexIds": [
+            "template-c2-level-1-left",
+            "template-c2-level-1-right",
+            "template-c2-level-2-right",
+            "template-c2-level-2-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-2-1-1",
+              "label": "关键定律",
+              "phi": -0.98,
+              "psi": -0.645,
+              "x": 4.45117,
+              "y": -6.6365,
+              "z": -6.01198,
+              "manual": true,
+              "description": "2.1 基本原理中的“关键定律”知识点。"
+            },
+            {
+              "id": "template-knowledge-2-1-2",
+              "label": "适用条件",
+              "phi": -0.62,
+              "psi": -0.555,
+              "x": 6.91716,
+              "y": -4.93822,
+              "z": -5.26943,
+              "manual": true,
+              "description": "2.1 基本原理中的“适用条件”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-2-2",
+          "title": "2.2 模型结构",
+          "description": "理解从问题抽象到模型表达的过程。",
+          "chapterId": "template-chapter-2",
+          "vertexIds": [
+            "template-c2-level-2-left",
+            "template-c2-level-2-right",
+            "template-c2-level-3-right",
+            "template-c2-level-3-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-2-2-1",
+              "label": "模型要素",
+              "phi": -0.98,
+              "psi": -0.045,
+              "x": 5.56459,
+              "y": -8.29657,
+              "z": -0.44985,
+              "manual": true,
+              "description": "2.2 模型结构中的“模型要素”知识点。"
+            },
+            {
+              "id": "template-knowledge-2-2-2",
+              "label": "结构关系",
+              "phi": -0.62,
+              "psi": 0.045,
+              "x": 8.13055,
+              "y": -5.80447,
+              "z": 0.44985,
+              "manual": true,
+              "description": "2.2 模型结构中的“结构关系”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-2-3",
+          "title": "2.3 分析方法",
+          "description": "掌握常用分析方法及其选择依据。",
+          "chapterId": "template-chapter-2",
+          "vertexIds": [
+            "template-c2-level-3-left",
+            "template-c2-level-3-right",
+            "template-c2-level-4-right",
+            "template-c2-level-4-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-2-3-1",
+              "label": "方法分类",
+              "phi": -0.98,
+              "psi": 0.555,
+              "x": 4.73414,
+              "y": -7.0584,
+              "z": 5.26943,
+              "manual": true,
+              "description": "2.3 分析方法中的“方法分类”知识点。"
+            },
+            {
+              "id": "template-knowledge-2-3-2",
+              "label": "选择策略",
+              "phi": -0.62,
+              "psi": 0.645,
+              "x": 6.5037,
+              "y": -4.64305,
+              "z": 6.01198,
+              "manual": true,
+              "description": "2.3 分析方法中的“选择策略”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-3-1",
+          "title": "3.1 案例分析",
+          "description": "将理论用于典型案例的拆解与解释。",
+          "chapterId": "template-chapter-3",
+          "vertexIds": [
+            "template-c3-level-1-left",
+            "template-c3-level-1-right",
+            "template-c3-level-2-right",
+            "template-c3-level-2-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-3-1-1",
+              "label": "问题识别",
+              "phi": 0.62,
+              "psi": -0.645,
+              "x": 6.5037,
+              "y": 4.64305,
+              "z": -6.01198,
+              "manual": true,
+              "description": "3.1 案例分析中的“问题识别”知识点。"
+            },
+            {
+              "id": "template-knowledge-3-1-2",
+              "label": "案例推演",
+              "phi": 0.98,
+              "psi": -0.555,
+              "x": 4.73414,
+              "y": 7.0584,
+              "z": -5.26943,
+              "manual": true,
+              "description": "3.1 案例分析中的“案例推演”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-3-2",
+          "title": "3.2 实验设计",
+          "description": "设计可执行、可复现的验证过程。",
+          "chapterId": "template-chapter-3",
+          "vertexIds": [
+            "template-c3-level-2-left",
+            "template-c3-level-2-right",
+            "template-c3-level-3-right",
+            "template-c3-level-3-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-3-2-1",
+              "label": "变量控制",
+              "phi": 0.62,
+              "psi": -0.045,
+              "x": 8.13055,
+              "y": 5.80447,
+              "z": -0.44985,
+              "manual": true,
+              "description": "3.2 实验设计中的“变量控制”知识点。"
+            },
+            {
+              "id": "template-knowledge-3-2-2",
+              "label": "实验步骤",
+              "phi": 0.98,
+              "psi": 0.045,
+              "x": 5.56459,
+              "y": 8.29657,
+              "z": 0.44985,
+              "manual": true,
+              "description": "3.2 实验设计中的“实验步骤”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-3-3",
+          "title": "3.3 结果评价",
+          "description": "使用合适指标分析实验和案例结果。",
+          "chapterId": "template-chapter-3",
+          "vertexIds": [
+            "template-c3-level-3-left",
+            "template-c3-level-3-right",
+            "template-c3-level-4-right",
+            "template-c3-level-4-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-3-3-1",
+              "label": "评价指标",
+              "phi": 0.62,
+              "psi": 0.555,
+              "x": 6.91716,
+              "y": 4.93822,
+              "z": 5.26943,
+              "manual": true,
+              "description": "3.3 结果评价中的“评价指标”知识点。"
+            },
+            {
+              "id": "template-knowledge-3-3-2",
+              "label": "误差分析",
+              "phi": 0.98,
+              "psi": 0.645,
+              "x": 4.45117,
+              "y": 6.6365,
+              "z": 6.01198,
+              "manual": true,
+              "description": "3.3 结果评价中的“误差分析”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-4-1",
+          "title": "4.1 项目设计",
+          "description": "明确综合项目的目标、范围和实施方案。",
+          "chapterId": "template-chapter-4",
+          "vertexIds": [
+            "template-c4-level-1-left",
+            "template-c4-level-1-right",
+            "template-c4-level-2-right",
+            "template-c4-level-2-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-4-1-1",
+              "label": "需求分析",
+              "phi": 2.12,
+              "psi": -0.645,
+              "x": -4.17137,
+              "y": 6.81585,
+              "z": -6.01198,
+              "manual": true,
+              "description": "4.1 项目设计中的“需求分析”知识点。"
+            },
+            {
+              "id": "template-knowledge-4-1-2",
+              "label": "方案设计",
+              "phi": 2.48,
+              "psi": -0.555,
+              "x": -6.70584,
+              "y": 5.22157,
+              "z": -5.26943,
+              "manual": true,
+              "description": "4.1 项目设计中的“方案设计”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-4-2",
+          "title": "4.2 项目实现",
+          "description": "按计划完成实现、验证和迭代。",
+          "chapterId": "template-chapter-4",
+          "vertexIds": [
+            "template-c4-level-2-left",
+            "template-c4-level-2-right",
+            "template-c4-level-3-right",
+            "template-c4-level-3-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-4-2-1",
+              "label": "任务实施",
+              "phi": 2.12,
+              "psi": -0.045,
+              "x": -5.2148,
+              "y": 8.52077,
+              "z": -0.44985,
+              "manual": true,
+              "description": "4.2 项目实现中的“任务实施”知识点。"
+            },
+            {
+              "id": "template-knowledge-4-2-2",
+              "label": "质量验证",
+              "phi": 2.48,
+              "psi": 0.045,
+              "x": -7.88216,
+              "y": 6.13752,
+              "z": 0.44985,
+              "manual": true,
+              "description": "4.2 项目实现中的“质量验证”知识点。"
+            }
+          ]
+        },
+        {
+          "id": "template-section-4-3",
+          "title": "4.3 总结拓展",
+          "description": "沉淀成果并探索进一步学习方向。",
+          "chapterId": "template-chapter-4",
+          "vertexIds": [
+            "template-c4-level-3-left",
+            "template-c4-level-3-right",
+            "template-c4-level-4-right",
+            "template-c4-level-4-left"
+          ],
+          "knowledge": [
+            {
+              "id": "template-knowledge-4-3-1",
+              "label": "成果复盘",
+              "phi": 2.12,
+              "psi": 0.555,
+              "x": -4.43655,
+              "y": 7.24914,
+              "z": 5.26943,
+              "manual": true,
+              "description": "4.3 总结拓展中的“成果复盘”知识点。"
+            },
+            {
+              "id": "template-knowledge-4-3-2",
+              "label": "拓展方向",
+              "phi": 2.48,
+              "psi": 0.645,
+              "x": -6.30502,
+              "y": 4.90946,
+              "z": 6.01198,
+              "manual": true,
+              "description": "4.3 总结拓展中的“拓展方向”知识点。"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

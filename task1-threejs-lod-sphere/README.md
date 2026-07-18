@@ -81,9 +81,12 @@ npm run check:config
 ## 数据
 
 - `src/data/course-data.json`：前端内置的 schema v3 示例数据，载入后会在内存中规范化为 schema v4。
+- `course-config.template.json`：可直接导入编辑器的 schema v4 单课程模板，包含 4 章、12 节和 24 个知识点。
 - `course-config.schema.json`：导出配置的 JSON Schema，可用于编辑器提示或外部数据校验。
 - `src/config-model.js`：配置清理、兼容升级、引用校验和序列化。
 - `scripts/generate_course_data.py`：读取 XLSX 中的节路径、球面坐标、点对和章范围，生成共享顶点 ID 数据。
+- `scripts/generate_template_config.mjs`：重新生成课程模板及球面坐标。
+- `scripts/check_template_config.mjs`：检查模板结构、唯一 ID、球面坐标、区域包含关系及异常配置。
 - `src/data/*.xlsx`：章、节和交点坐标的主要数据源。
 - `src/data/*.py`：保留的参考曲线脚本；目前仅用于补齐线性代数表格缺失的 `P34`。
 
@@ -92,6 +95,13 @@ npm run check:config
 ```powershell
 python -m pip install -r requirements.txt
 python scripts\generate_course_data.py
+```
+
+重新生成并测试模板配置：
+
+```powershell
+npm run generate:template
+npm test
 ```
 
 本次生成结果：

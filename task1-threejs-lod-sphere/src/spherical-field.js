@@ -133,11 +133,19 @@ function sphericalWinding(point, boundary) {
   for (let index = 0; index < boundary.length; index += 1) {
     const a = boundary[index].clone().normalize();
     const b = boundary[(index + 1) % boundary.length].clone().normalize();
+    const edgeAngle = a.angleTo(b);
+    const pointToEdgeEnds = a.angleTo(direction) + direction.angleTo(b);
+    if (
+      a.dot(direction) > 0.999999
+      || b.dot(direction) > 0.999999
+      || Math.abs(pointToEdgeEnds - edgeAngle) < 1e-5
+    ) {
+      return { winding: 0, onBoundary: true };
+    }
     const tangentA = a.addScaledVector(direction, -a.dot(direction));
     const tangentB = b.addScaledVector(direction, -b.dot(direction));
     if (tangentA.lengthSq() < 1e-10 || tangentB.lengthSq() < 1e-10) {
-      const onBoundary = a.dot(direction) > 0.999999 || b.dot(direction) > 0.999999;
-      return { winding: 0, onBoundary };
+      return { winding: 0, onBoundary: false };
     }
     tangentA.normalize();
     tangentB.normalize();
