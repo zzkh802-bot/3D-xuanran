@@ -133,11 +133,19 @@ function sphericalWinding(point, boundary) {
   for (let index = 0; index < boundary.length; index += 1) {
     const a = boundary[index].clone().normalize();
     const b = boundary[(index + 1) % boundary.length].clone().normalize();
+    const edgeAngle = a.angleTo(b);
+    const pointToEdgeEnds = a.angleTo(direction) + direction.angleTo(b);
+    if (
+      a.dot(direction) > 0.999999
+      || b.dot(direction) > 0.999999
+      || Math.abs(pointToEdgeEnds - edgeAngle) < 1e-5
+    ) {
+      return { winding: 0, onBoundary: true };
+    }
     const tangentA = a.addScaledVector(direction, -a.dot(direction));
     const tangentB = b.addScaledVector(direction, -b.dot(direction));
     if (tangentA.lengthSq() < 1e-10 || tangentB.lengthSq() < 1e-10) {
-      const onBoundary = a.dot(direction) > 0.999999 || b.dot(direction) > 0.999999;
-      return { winding: 0, onBoundary };
+      return { winding: 0, onBoundary: false };
     }
     tangentA.normalize();
     tangentB.normalize();
@@ -688,13 +696,38 @@ function buildField(course, regions, level, ids = buildSphericalIds(course, regi
   };
 }
 
+function createSolidField(color) {
+  const colorCanvas = createCanvas();
+  const heightCanvas = createCanvas();
+  const colorContext = colorCanvas.getContext('2d');
+  const heightContext = heightCanvas.getContext('2d');
+  colorContext.fillStyle = color;
+  colorContext.fillRect(0, 0, FIELD_WIDTH, FIELD_HEIGHT);
+  heightContext.fillStyle = '#ffffff';
+  heightContext.fillRect(0, 0, FIELD_WIDTH, FIELD_HEIGHT);
+  return {
+    color: createCanvasTexture(colorCanvas, true),
+    height: createCanvasTexture(heightCanvas)
+  };
+}
+
 export function createSemanticFields(course) {
+  if (!course.chapters.length) {
+    return {
+      chapter: createSolidField(course.color),
+      section: createSolidField(course.color)
+    };
+  }
   const chapterIds = buildSphericalIds(course, course.chapters);
   const sectionRegions = course.sections;
-  const sectionIds = buildSphericalIds(course, sectionRegions, chapterIds);
+  const sectionIds = sectionRegions.length
+    ? buildSphericalIds(course, sectionRegions, chapterIds)
+    : null;
   return {
     chapter: buildField(course, course.chapters, 'chapter', chapterIds),
-    section: buildField(course, sectionRegions, 'section', sectionIds)
+    section: sectionRegions.length
+      ? buildField(course, sectionRegions, 'section', sectionIds)
+      : createSolidField(course.color)
   };
 }
 
