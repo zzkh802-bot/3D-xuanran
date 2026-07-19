@@ -374,7 +374,16 @@ function buildHandles(courseGroup) {
 
 function ensureKnowledge(section, course) {
   if (!Array.isArray(section.knowledge)) section.knowledge = [];
-  if (!section.knowledge.length) return;
+  // 内置课程的源表只有章/节边界，没有独立的知识点记录。沿用展示版行为，
+  // 为这类小节生成三个仅运行时存在的球面知识点；序列化时 generated 点会被过滤，
+  // 因而不会污染用户导出的课程配置。
+  if (!section.knowledge.length) {
+    section.knowledge = [0, 1, 2].map((index) => ({
+      id: `${section.id}-knowledge-${index + 1}`,
+      label: `K${index + 1}`,
+      generated: true
+    }));
+  }
   const layout = regionLayout(course, section);
   const boundary = sampleClosedBoundary(course, section, 6, 1);
   section.knowledge.forEach((point, index) => {
@@ -778,8 +787,7 @@ function updateLayerBlend(distance) {
   const sectionBlend = 1 - smoothstep(43, 56, distance);
   const knowledgeAlpha = 1 - smoothstep(24, 31, distance);
   // 微调控制球与部分抽样外层点位于同一径向位置，二者同时显示会形成重影。
-  // 普通查看时球面点位应在所有缩放层级持续显示。
-  const outerAlpha = editMode ? 0 : 1;
+  const outerAlpha = editMode ? 0 : smoothstep(24, 31, distance);
   const titleAlpha = smoothstep(74, 94, distance);
   const chapterLabelAlpha = regionReveal * (1 - sectionBlend);
   const sectionLabelAlpha = regionReveal * sectionBlend;
