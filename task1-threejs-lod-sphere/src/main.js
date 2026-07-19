@@ -119,7 +119,7 @@ const expandedIds = new Set();
 
 const outerGeometry = new THREE.SphereGeometry(0.17, 18, 14);
 const handleGeometry = new THREE.SphereGeometry(0.22, 18, 14);
-const knowledgeGeometry = new THREE.SphereGeometry(0.12, 16, 12);
+const knowledgeGeometry = new THREE.SphereGeometry(0.17, 18, 14);
 const knowledgeLabelCache = new Map();
 const surfaceLabelColor = '#ffffff';
 
@@ -778,7 +778,8 @@ function updateLayerBlend(distance) {
   const sectionBlend = 1 - smoothstep(43, 56, distance);
   const knowledgeAlpha = 1 - smoothstep(24, 31, distance);
   // 微调控制球与部分抽样外层点位于同一径向位置，二者同时显示会形成重影。
-  const outerAlpha = editMode ? 0 : smoothstep(24, 31, distance);
+  // 普通查看时球面点位应在所有缩放层级持续显示。
+  const outerAlpha = editMode ? 0 : 1;
   const titleAlpha = smoothstep(74, 94, distance);
   const chapterLabelAlpha = regionReveal * (1 - sectionBlend);
   const sectionLabelAlpha = regionReveal * sectionBlend;
