@@ -6,6 +6,7 @@ import {
   createEmptyCourse,
   createEntityId,
   exportConfig,
+  materializeGeneratedKnowledge,
   normalizeConfig,
   pointFromAngles,
   replaceConfig,
@@ -21,6 +22,7 @@ import {
   regionLayout,
   sampleClosedBoundary,
   slerpUnit,
+  slerpWithinBoundary,
   smoothstep,
   sphericalContains,
   sourceToVector,
@@ -389,7 +391,9 @@ function ensureKnowledge(section, course) {
   section.knowledge.forEach((point, index) => {
     if (point.manual) return;
     const target = boundary[Math.floor(((index + 0.65) / section.knowledge.length) * boundary.length) % boundary.length];
-    const direction = target ? slerpUnit(layout.anchor, target, index === 0 ? 0.18 : 0.34) : layout.anchor;
+    const direction = target
+      ? slerpWithinBoundary(layout.anchor, target, index === 0 ? 0.18 : 0.34, boundary)
+      : layout.anchor;
     vectorToSource(direction.multiplyScalar(radius), point, radius);
   });
 }
@@ -1253,7 +1257,10 @@ function renderEditorUI() {
       (value) => {
         const locator = selectionLocator(item);
         mutateAndRebuild(
-          () => { item.point.label = value.trim() || item.point.id; },
+          () => {
+            if (item.type === 'knowledge') materializeGeneratedKnowledge(item.section);
+            item.point.label = value.trim() || item.point.id;
+          },
           locator,
           '名称已更新'
         );
@@ -1278,6 +1285,7 @@ function renderEditorUI() {
       }
       const locator = selectionLocator(item);
       mutateAndRebuild(() => {
+        if (item.type === 'knowledge') materializeGeneratedKnowledge(item.section);
         Object.assign(
           item.point,
           pointFromAngles(item.point.id, item.point.label, nextPhi, nextPsi, radius)
@@ -1289,7 +1297,10 @@ function renderEditorUI() {
     if (item.type === 'knowledge') {
       appendInspectorField('说明', item.point.description || '', (value) => {
         mutateAndRebuild(
-          () => { item.point.description = value; },
+          () => {
+            materializeGeneratedKnowledge(item.section);
+            item.point.description = value;
+          },
           selectionLocator(item),
           '知识点说明已更新'
         );
@@ -1385,9 +1396,13 @@ function syncPointObjects(courseGroup, point) {
 }
 
 function applyPointMove(courseGroup, point, localVector, queueRebuild = false) {
-  vectorToSource(localVector, point, radius);
   const isSurfaceVertex = courseGroup.course.__vertexMap.has(point.id);
-  if (!isSurfaceVertex) point.manual = true;
+  if (!isSurfaceVertex) {
+    const section = courseGroup.course.sections.find((item) => item.knowledge?.includes(point));
+    materializeGeneratedKnowledge(section);
+    point.manual = true;
+  }
+  vectorToSource(localVector, point, radius);
   syncPointObjects(courseGroup, point);
   if (isSurfaceVertex) {
     invalidateCourseLayouts(courseGroup.course);
@@ -1701,6 +1716,14 @@ function handlePlacement(result) {
       cancelPlacement(false);
       return true;
     }
+    if (placementMode.regionType === 'section') {
+      const chapter = course.chapters.find((entry) => entry.id === region.chapterId);
+      const chapterBoundary = chapter ? sampleClosedBoundary(course, chapter, 8, 1) : [];
+      if (!chapter || !sphericalContains(direction, chapterBoundary)) {
+        showToast('小节边界点必须位于所属章节内');
+        return true;
+      }
+    }
     const before = snapshotConfig();
     const point = pointFromLocalVector(course, direction, 'vertex');
     const insertionIndex = closestBoundaryInsertionIndex(course, region, direction);
@@ -1781,6 +1804,7 @@ function deleteSelection() {
     locator = chapter ? { type: 'chapter', courseId: course.id, id: chapter.id } : locator;
     message = '小节已删除';
   } else if (item.type === 'knowledge') {
+    materializeGeneratedKnowledge(item.section);
     item.section.knowledge.splice(item.section.knowledge.indexOf(item.point), 1);
     locator = { type: 'section', courseId: course.id, id: item.section.id };
     message = '知识点已删除';
