@@ -389,6 +389,257 @@ def _unique_world_points(img_pts, world_pts):
     return img_pts[unique_idx], world_pts[unique_idx]
 
 
+def _prune_sparse_extra_strip_column(img_pts, world_pts, grid_spacing=15.0):
+    """Remove a sparse false third column beside a proven two-column strip.
+
+    The physical narrow targets have two columns, whereas a broad board has
+    many well-supported columns.  A 3 x N topology with two dense adjacent
+    columns and only a few responses in the third is therefore a growth leak,
+    not a real three-column board.  This uses only topology/support counts and
+    does not invent or move any saddle point.
+    """
+    if len(img_pts) < 10 or len(img_pts) != len(world_pts):
+        return img_pts, world_pts, 0
+    grid = np.round(np.asarray(world_pts, dtype=float) / grid_spacing).astype(int)
+    for axis in (0, 1):
+        units, counts = np.unique(grid[:, axis], return_counts=True)
+        other_units = np.unique(grid[:, 1 - axis])
+        if len(units) < 3 or len(units) > 5 or len(other_units) < 5:
+            continue
+        adjacent_pairs = []
+        for i in range(len(units) - 1):
+            if units[i + 1] - units[i] != 1:
+                continue
+            adjacent_pairs.append((
+                min(int(counts[i]), int(counts[i + 1])),
+                int(counts[i] + counts[i + 1]), i, i + 1))
+        if not adjacent_pairs:
+            continue
+        _, _, ia, ib = max(adjacent_pairs)
+        sparse_indices = [i for i in range(len(units)) if i not in (ia, ib)]
+        dense_min = min(int(counts[ia]), int(counts[ib]))
+        # Both retained columns must cover most observed rows; the discarded
+        # lines may have only fragmentary support.  hewei303 contains two
+        # genuine 10-point columns plus false outside fragments of 1 and 4
+        # points; a true 3--5-column board has comparable support in every
+        # column and cannot pass these gates.
+        if dense_min < max(5, int(np.ceil(0.60 * len(other_units)))):
+            continue
+        sparse_counts = [int(counts[i]) for i in sparse_indices]
+        if (max(sparse_counts, default=0) >
+                max(4, int(np.floor(0.45 * dense_min)))):
+            continue
+        if sum(sparse_counts) > max(5, int(np.floor(0.65 * dense_min))):
+            continue
+        keep_units = {int(units[ia]), int(units[ib])}
+        keep = np.asarray([int(value) in keep_units for value in grid[:, axis]])
+        removed = int(np.sum(~keep))
+        if removed:
+            print(f"  稀疏伪第三列剔除: {counts.tolist()} -> "
+                  f"保留{int(np.sum(keep))}个真实鞍点")
+            return img_pts[keep], world_pts[keep], removed
+    return img_pts, world_pts, 0
+
+
+def _recover_sparse_narrow_partner_column(img_pts, world_pts, candidate_pts,
+                                           grid_spacing=15.0):
+    """Replace a sparse false column beside one dense narrow-board column.
+
+    In hewei308 the accepted 2x10 model consisted of ten genuine points in one
+    column and only two floor/board-edge points about 90 px away in the other.
+    Because the topology still had exactly two columns, the existing
+    3--5-column leak pruner could not act.  Search the weak, geometry-only
+    response pool for a repeated partner-edge vector; at least four distinct
+    rows must agree.  If no coherent replacement exists, discard only a very
+    wide sparse column and keep the proven real column without inventing
+    points.
+    """
+    img_pts = np.asarray(img_pts, dtype=float)
+    world_pts = np.asarray(world_pts, dtype=float)
+    candidates = np.asarray(candidate_pts, dtype=float)
+    if (len(img_pts) < 7 or len(img_pts) != len(world_pts) or
+            len(candidates) < 4):
+        return img_pts, world_pts, 0
+    grid = np.round(world_pts / grid_spacing).astype(int)
+    axis_counts = [len(np.unique(grid[:, axis])) for axis in (0, 1)]
+    if 2 not in axis_counts:
+        return img_pts, world_pts, 0
+    col_axis = axis_counts.index(2)
+    row_axis = 1 - col_axis
+    col_units, counts = np.unique(grid[:, col_axis], return_counts=True)
+    dense_i = int(np.argmax(counts))
+    sparse_i = 1 - dense_i
+    dense_count = int(counts[dense_i])
+    sparse_count = int(counts[sparse_i])
+    row_count = len(np.unique(grid[:, row_axis]))
+    if (dense_count < max(5, int(np.ceil(0.60 * row_count))) or
+            sparse_count > max(2, int(np.floor(0.30 * dense_count)))):
+        return img_pts, world_pts, 0
+
+    dense_unit = int(col_units[dense_i])
+    sparse_unit = int(col_units[sparse_i])
+    dense_idx = np.where(grid[:, col_axis] == dense_unit)[0]
+    dense_idx = dense_idx[np.argsort(grid[dense_idx, row_axis])]
+    dense_rows = grid[dense_idx, row_axis]
+    dense_img = img_pts[dense_idx]
+    if len(dense_img) < 3:
+        return img_pts, world_pts, 0
+    row_gaps = np.diff(dense_rows).astype(float)
+    point_steps = np.diff(dense_img, axis=0)
+    valid_gap = row_gaps > 0
+    if not np.any(valid_gap):
+        return img_pts, world_pts, 0
+    per_row_steps = point_steps[valid_gap] / row_gaps[valid_gap, np.newaxis]
+    row_vec = np.median(per_row_steps, axis=0)
+    row_step = float(np.linalg.norm(row_vec))
+    if row_step < 8.0 or row_step > 100.0:
+        return img_pts, world_pts, 0
+    row_unit = row_vec / row_step
+
+    # Measure whether the currently sparse column is implausibly far away.
+    current_widths = []
+    for idx in np.where(grid[:, col_axis] == sparse_unit)[0]:
+        same_row = dense_idx[dense_rows == grid[idx, row_axis]]
+        if len(same_row):
+            delta = img_pts[idx] - img_pts[int(same_row[0])]
+            current_widths.append(abs(float(
+                row_vec[0] * delta[1] - row_vec[1] * delta[0])) /
+                max(row_step, 1e-9))
+    current_width = float(np.median(current_widths)) \
+        if current_widths else np.inf
+
+    tree_existing = KDTree(img_pts)
+    distance_existing, _ = tree_existing.query(candidates, k=1)
+    candidate_ids = np.where(distance_existing > 3.0)[0]
+    options = []
+    for local_row, (point_idx, row_value) in enumerate(
+            zip(dense_idx, dense_rows)):
+        p = img_pts[int(point_idx)]
+        for candidate_idx in candidate_ids:
+            candidate_idx = int(candidate_idx)
+            delta = candidates[candidate_idx] - p
+            length = float(np.linalg.norm(delta))
+            if length < 10.0 or length > 88.0:
+                continue
+            along = float(np.dot(delta, row_unit))
+            cross = float(row_vec[0] * delta[1] -
+                          row_vec[1] * delta[0])
+            width = abs(cross) / max(row_step, 1e-9)
+            if (12.0 <= width <= 75.0 and
+                    abs(along) <= max(5.0, 0.72 * row_step)):
+                options.append((local_row, int(row_value), candidate_idx,
+                                1 if cross > 0 else -1, width,
+                                abs(along), np.asarray(delta, dtype=float)))
+
+    best_group = None
+    vector_radius = max(6.0, 0.38 * row_step)
+    for center in options:
+        group = [option for option in options
+                 if option[3] == center[3] and
+                 np.linalg.norm(option[6] - center[6]) <= vector_radius]
+        unique_rows = len({option[1] for option in group})
+        unique_candidates = len({option[2] for option in group})
+        spread = float(np.median([
+            np.linalg.norm(option[6] - center[6]) for option in group])) \
+            if group else np.inf
+        score = (min(unique_rows, unique_candidates),
+                 unique_rows + unique_candidates, -spread)
+        if best_group is None or score > best_group[0]:
+            best_group = (score, group)
+
+    min_support = max(4, int(np.ceil(0.40 * dense_count)))
+    if best_group is None or best_group[0][0] < min_support:
+        if current_width > 78.0:
+            kept_img = dense_img.copy()
+            kept_world = world_pts[dense_idx].copy()
+            print(f"  [两列稀疏假列剔除] [{dense_count},{sparse_count}]，"
+                  f"假列宽度={current_width:.1f}px，仅保留{dense_count}个真实鞍点")
+            return kept_img, kept_world, sparse_count
+        return img_pts, world_pts, 0
+
+    group = best_group[1]
+    desired_vector = np.median(
+        np.asarray([option[6] for option in group]), axis=0)
+    proposals = []
+    for option in options:
+        if option[3] != group[0][3]:
+            continue
+        error = float(np.linalg.norm(option[6] - desired_vector))
+        if error <= 1.25 * vector_radius:
+            proposals.append((error + 0.12 * option[5], option))
+    used_rows, used_candidates = set(), set()
+    selected = []
+    for _, option in sorted(proposals, key=lambda item: item[0]):
+        row_value, candidate_idx = int(option[1]), int(option[2])
+        if row_value in used_rows or candidate_idx in used_candidates:
+            continue
+        used_rows.add(row_value)
+        used_candidates.add(candidate_idx)
+        selected.append(option)
+    if len(selected) < min_support:
+        return img_pts, world_pts, 0
+
+    out_img = list(dense_img)
+    out_world = list(world_pts[dense_idx])
+    for option in selected:
+        row_value, candidate_idx = int(option[1]), int(option[2])
+        world = np.zeros(2, dtype=float)
+        world[col_axis] = sparse_unit * grid_spacing
+        world[row_axis] = row_value * grid_spacing
+        out_img.append(candidates[candidate_idx])
+        out_world.append(world)
+    out_img = np.asarray(out_img, dtype=float)
+    out_world = np.asarray(out_world, dtype=float)
+    order = np.lexsort((out_world[:, col_axis], out_world[:, row_axis]))
+    print(f"  [两列弱响应列恢复] 密集列{dense_count}点 + "
+          f"弱响应伙伴{len(selected)}点")
+    return out_img[order], out_world[order], len(selected)
+
+
+def _prune_spatially_isolated_board_nodes(img_pts, world_pts, img_gray=None):
+    """Remove a tiny number of image-isolated nodes from an accepted board.
+
+    Homography propagation can occasionally attach a butterfly centre to a
+    distant broad-board boundary fragment (hewei207).  Its world label may be
+    adjacent even though the measured image point is more than ten local grid
+    steps away, which creates a very long red/blue edge and also suppresses the
+    genuine X mark.  This guard is intentionally local and conservative: an
+    outlier must be farther than both 45 px and four times the board's median
+    nearest-neighbour spacing, and no more than 15% of the board may be removed.
+    Missing rows or perspective compression therefore remain untouched.
+    """
+    img_pts = np.asarray(img_pts, dtype=float)
+    world_pts = np.asarray(world_pts, dtype=float)
+    if len(img_pts) < 6 or len(img_pts) != len(world_pts):
+        return img_pts, world_pts, 0
+    tree = KDTree(img_pts)
+    nn_dist, _ = tree.query(img_pts, k=2)
+    nearest = np.asarray(nn_dist[:, 1], dtype=float)
+    typical = float(np.median(nearest))
+    if not np.isfinite(typical) or typical <= 1e-6:
+        return img_pts, world_pts, 0
+    isolated = nearest > max(45.0, 4.0 * typical)
+    # A propagated butterfly centre can be only about three sparse-fragment
+    # steps away, so it may miss the generic 4x gate.  For the narrower 2.5x
+    # band require independent, strong multi-scale butterfly evidence before
+    # removing it from the board graph; an ordinary isolated saddle cannot
+    # satisfy this appearance condition.
+    if img_gray is not None:
+        appearance_band = nearest > max(60.0, 2.5 * typical)
+        for idx in np.where(appearance_band & ~isolated)[0]:
+            stability, peak = _butterfly_multiscale_stability(
+                img_gray, float(img_pts[int(idx), 0]),
+                float(img_pts[int(idx), 1]))
+            if stability >= 0.70 and peak >= 0.85:
+                isolated[int(idx)] = True
+    removed = int(np.sum(isolated))
+    if removed == 0 or removed > max(2, int(np.floor(0.15 * len(img_pts)))):
+        return img_pts, world_pts, 0
+    print(f"  [棋盘孤立节点剔除] {removed}点，最近邻="
+          f"{nearest[isolated].round(1).tolist()}px，局部步长={typical:.1f}px")
+    return img_pts[~isolated], world_pts[~isolated], removed
+
+
 def _bbox_overlap_ratio(a_pts, b_pts):
     if len(a_pts) == 0 or len(b_pts) == 0:
         return 0.0
@@ -543,7 +794,8 @@ def _is_broad_board_lattice_extension(point, existing_boards,
 
 
 def _is_near_broad_board_image_region(point, existing_boards,
-                                       margin_scale=3.0):
+                                       margin_scale=3.0, margin_cap=60.0,
+                                       min_margin=18.0):
     """Reject X candidates on or immediately beside a broad checkerboard."""
     p = np.asarray(point, dtype=float)
     for board in existing_boards:
@@ -561,7 +813,7 @@ def _is_near_broad_board_image_region(point, existing_boards,
             spacing = float(np.median(neighbour_dist[:, 1]))
         else:
             spacing = 20.0
-        margin = float(np.clip(margin_scale * spacing, 18.0, 60.0))
+        margin = float(np.clip(margin_scale * spacing, min_margin, margin_cap))
         if (np.min(img_pts[:, 0]) - margin <= p[0] <=
                 np.max(img_pts[:, 0]) + margin and
                 np.min(img_pts[:, 1]) - margin <= p[1] <=
@@ -584,6 +836,121 @@ def _merge_cleaned_broad_board_extensions(boards, grid_spacing=15.0):
     result = list(boards)
     removed = set()
 
+    def infer_shared_grid_transform(target_img, target_grid,
+                                    other_img, other_grid):
+        """Map a propagated local grid through exact shared image saddles.
+
+        A strong-perspective border strip can be two or three cells outside
+        the broad board.  Extrapolating the broad-board homography there is
+        less reliable than the shared physical saddles: both grids contain
+        the same image coordinates, but with different local origins.  Fit
+        only a signed axis permutation plus an integer translation from those
+        shared points.  Independent boards cannot pass this test because they
+        do not share several sub-pixel saddle coordinates.
+        """
+        if len(target_img) < 4 or len(other_img) < 3:
+            return None
+        distance, target_index = KDTree(target_img).query(other_img, k=1)
+        shared_index = np.where(distance <= 2.5)[0]
+        required_shared = max(4, int(np.ceil(0.18 * len(other_img))))
+        if len(shared_index) < required_shared:
+            return None
+
+        target_shared = target_grid[target_index[shared_index]]
+        other_shared = other_grid[shared_index]
+        transforms = [
+            np.array([[sx, 0], [0, sy]], dtype=int)
+            for sx in (-1, 1) for sy in (-1, 1)
+        ] + [
+            np.array([[0, sx], [sy, 0]], dtype=int)
+            for sx in (-1, 1) for sy in (-1, 1)
+        ]
+        def grid_axis_directions(img_points, grid_cells):
+            mapping = {tuple(cell): point
+                       for cell, point in zip(grid_cells, img_points)}
+            directions = []
+            for axis in (0, 1):
+                vectors = []
+                for cell, p0 in mapping.items():
+                    neighbour = list(cell)
+                    neighbour[axis] += 1
+                    p1 = mapping.get(tuple(neighbour))
+                    if p1 is None:
+                        continue
+                    vector = np.asarray(p1, dtype=float) - np.asarray(p0, dtype=float)
+                    norm = float(np.linalg.norm(vector))
+                    if norm > 1e-9:
+                        vectors.append(vector / norm)
+                if vectors:
+                    direction = np.median(np.asarray(vectors), axis=0)
+                    norm = float(np.linalg.norm(direction))
+                    directions.append(direction / norm if norm > 1e-9 else None)
+                else:
+                    directions.append(None)
+            return directions
+
+        target_directions = grid_axis_directions(target_img, target_grid)
+        other_directions = grid_axis_directions(other_img, other_grid)
+        best = None
+        for transform in transforms:
+            transformed = other_shared @ transform.T
+            offsets = target_shared - transformed
+            offset = np.rint(np.median(offsets, axis=0)).astype(int)
+            exact = np.all(transformed + offset == target_shared, axis=1)
+            support = int(np.sum(exact))
+            # Shared points may all lie on one physical column, leaving the
+            # sign of the across-column axis ambiguous.  Resolve ties with
+            # the observed +axis image directions of both grids.  This maps
+            # a genuine outer strip outside the target extent instead of onto
+            # already occupied cells (hewei272).
+            direction_score = 0.0
+            direction_terms = 0
+            for other_axis in (0, 1):
+                other_direction = other_directions[other_axis]
+                if other_direction is None:
+                    continue
+                column = transform[:, other_axis]
+                target_axis = int(np.argmax(np.abs(column)))
+                target_direction = target_directions[target_axis]
+                if target_direction is None:
+                    continue
+                sign = int(column[target_axis])
+                direction_score += float(np.dot(
+                    other_direction, sign * target_direction))
+                direction_terms += 1
+            if direction_terms:
+                direction_score /= direction_terms
+            rank = (support, direction_score)
+            if best is None or rank > best[0]:
+                best = (rank, support, transform, offset)
+        if best is None:
+            return None
+        _, support, transform, offset = best
+        if support < max(required_shared, int(np.ceil(0.80 * len(shared_index)))):
+            return None
+
+        mapped = other_grid @ transform.T + offset
+        grid_min = np.min(target_grid, axis=0)
+        grid_max = np.max(target_grid, axis=0)
+        # A propagated fragment may supply up to three omitted border columns,
+        # but it may extend on only one side of one physical axis.  This keeps
+        # a neighbouring independent board from being absorbed merely because
+        # a few endpoints are close.
+        if np.any(mapped < grid_min - 3) or np.any(mapped > grid_max + 3):
+            return None
+        outside_low = np.any(mapped < grid_min, axis=0)
+        outside_high = np.any(mapped > grid_max, axis=0)
+        outside_sides = int(np.sum(outside_low) + np.sum(outside_high))
+        if outside_sides > 1:
+            return None
+        if outside_sides == 1:
+            extension_axis = int(np.where(outside_low | outside_high)[0][0])
+            cross_axis = 1 - extension_axis
+            if (np.any(mapped[:, cross_axis] < grid_min[cross_axis]) or
+                    np.any(mapped[:, cross_axis] > grid_max[cross_axis])):
+                return None
+        return mapped
+
     for target_idx in range(len(result)):
         if target_idx in removed:
             continue
@@ -596,12 +963,60 @@ def _merge_cleaned_broad_board_extensions(boards, grid_spacing=15.0):
                 len(np.unique(target_grid[:, 1])) < 4):
             continue
 
-        for other_idx in range(len(result)):
+        # Merge the widest/most complete propagated fragments first.  A sparse
+        # one-column duplicate can then share points with the newly enlarged
+        # target and be removed in the same pass.
+        other_order = sorted(
+            range(len(result)),
+            key=lambda idx: len(result[idx][0]), reverse=True)
+        for other_idx in other_order:
             if other_idx == target_idx or other_idx in removed:
                 continue
-            other_img, _, _, other_used, _ = result[other_idx]
+            other_img, other_world, _, other_used, _ = result[other_idx]
             other_img = np.asarray(other_img, dtype=float)
+            other_world = np.asarray(other_world, dtype=float)
             if len(other_img) < 3:
+                continue
+            other_grid = np.round(other_world / grid_spacing).astype(int)
+
+            shared_mapping = infer_shared_grid_transform(
+                target_img, target_grid, other_img, other_grid)
+            if shared_mapping is not None:
+                occupied = {tuple(cell) for cell in target_grid}
+                selected = {}
+                for point_idx, cell_array in enumerate(shared_mapping):
+                    cell = tuple(cell_array)
+                    if cell in occupied:
+                        continue
+                    # Keep one actual/local node for each mapped world cell.
+                    selected.setdefault(cell, int(point_idx))
+                if selected:
+                    add_idx = list(selected.values())
+                    target_img = np.vstack([target_img, other_img[add_idx]])
+                    target_world = np.vstack([
+                        target_world,
+                        shared_mapping[add_idx].astype(float) * grid_spacing,
+                    ])
+                    target_img, target_world = _unique_world_points(
+                        target_img, target_world)
+                    target_grid = np.round(
+                        target_world / grid_spacing).astype(int)
+                    merged_H = compute_homography(target_world, target_img)
+                    if merged_H is not None:
+                        target_H = merged_H
+                    target_qual = max(
+                        target_qual,
+                        calculate_chessboard_quality(target_img, target_world))
+                    print(f"  [共享鞍点边界归并] 棋盘#{other_idx + 1} -> "
+                          f"棋盘#{target_idx + 1}: +{len(add_idx)}个网格节点")
+                else:
+                    print(f"  [共享鞍点重复棋盘删除] 棋盘#{other_idx + 1} -> "
+                          f"棋盘#{target_idx + 1}")
+                target_used = set(target_used) | set(other_used)
+                result[target_idx] = (
+                    target_img, target_world, target_H,
+                    target_used, target_qual)
+                removed.add(other_idx)
                 continue
 
             fitted_H = compute_homography(target_world, target_img)
@@ -947,7 +1362,15 @@ def detect_two_column_strip_fallback(points, existing_boards, min_pairs=4):
                     continue
                 delta = candidate['mid'] - cur['mid']
                 dy = float(delta[1])
-                if dy < 22.0 or dy > 75.0:
+                # The upper rows of a tilted narrow strip are farther apart
+                # than its middle/lower rows.  In hewei277 the two genuine
+                # upper row gaps are about 79 and 76 px; the former 75 px hard
+                # ceiling therefore started the chain two rows too late even
+                # though both saddles had strong detector scores.  86 px is
+                # still well below a skipped-row distance (roughly 140 px),
+                # so a missing/occluded physical row continues to break the
+                # chain instead of being bridged.
+                if dy < 22.0 or dy > 86.0:
                     continue
                 if abs(float(delta[0])) > 0.38 * dy + 3.0:
                     continue
@@ -1052,6 +1475,64 @@ def detect_one_sided_strip_fallback(points, existing_boards, min_chain=5,
     if len(ids) < min_chain + 1:
         return []
 
+    def extend_chain_with_local_perspective(chain_ids):
+        """Extend a proven column with smoothly changing one-row steps.
+
+        A projective strip is not equally spaced in the image.  Once a stable
+        five-point column has been established, continue it using the latest
+        local direction and scale instead of the original global affine step.
+        The 1.45-step ceiling deliberately refuses a skipped physical row.
+        """
+        chain_ids = list(chain_ids)
+
+        def extend_one_end(forward):
+            for _ in range(12):
+                if len(chain_ids) < 2:
+                    break
+                if forward:
+                    end_id, prev_id = chain_ids[-1], chain_ids[-2]
+                    direction_sign = 1.0
+                else:
+                    end_id, prev_id = chain_ids[0], chain_ids[1]
+                    direction_sign = -1.0
+                local_step = points[end_id] - points[prev_id]
+                step_len = float(np.linalg.norm(local_step))
+                if step_len < 1e-9:
+                    break
+                step_unit = local_step / step_len
+                predicted = points[end_id] + local_step
+                choices = []
+                chain_set = set(chain_ids)
+                for candidate_id in ids:
+                    candidate_id = int(candidate_id)
+                    if candidate_id in chain_set:
+                        continue
+                    delta = points[candidate_id] - points[end_id]
+                    # Preserve image-y ordering at each end of the chain.
+                    if direction_sign * float(delta[1]) <= 0.0:
+                        continue
+                    along = float(np.dot(delta, step_unit))
+                    cross = abs(float(step_unit[0] * delta[1] -
+                                      step_unit[1] * delta[0]))
+                    if (along < 0.68 * step_len or
+                            along > 1.45 * step_len or
+                            cross > max(4.5, 0.18 * step_len)):
+                        continue
+                    prediction_error = float(np.linalg.norm(
+                        points[candidate_id] - predicted))
+                    choices.append((prediction_error + 1.5 * cross,
+                                    candidate_id))
+                if not choices:
+                    break
+                _, candidate_id = min(choices)
+                if forward:
+                    chain_ids.append(candidate_id)
+                else:
+                    chain_ids.insert(0, candidate_id)
+        extend_one_end(True)
+        extend_one_end(False)
+        return chain_ids
+
     best = None
     for ai in range(len(ids)):
         i = int(ids[ai])
@@ -1062,8 +1543,20 @@ def detect_one_sided_strip_fallback(points, existing_boards, min_chain=5,
             step = points[j] - points[i]
             step_len = float(np.linalg.norm(step))
             if (step_len < 28.0 or step_len > 75.0 or
-                    abs(float(step[0])) > 0.35 * abs(float(step[1])) + 2.0):
+                    abs(float(step[0])) > 1.05 * abs(float(step[1])) + 2.0):
                 continue
+            strongly_oblique = (
+                abs(float(step[0])) > 0.35 * abs(float(step[1])) + 2.0)
+            if strongly_oblique:
+                # Avoid turning the relaxed-angle branch into an expensive
+                # all-pairs search through weak floor/skin responses.  The
+                # genuinely oblique hewei305 strip has strong 0.14--0.28
+                # responses in both columns; weak candidates remain eligible
+                # through the original near-vertical branch only.
+                if (point_scores is None or
+                        float(point_scores[i]) < 0.080 or
+                        float(point_scores[j]) < 0.080):
+                    continue
 
             tol = max(3.5, 0.13 * step_len)
             hits = {}
@@ -1078,14 +1571,36 @@ def detect_one_sided_strip_fallback(points, existing_boards, min_chain=5,
                 continue
 
             chain_ids = sorted(hits, key=lambda idx: points[idx, 1])
+            chain_ids = extend_chain_with_local_perspective(chain_ids)
             chain = points[chain_ids]
+            # The relaxed direction gate is needed for the strongly tilted
+            # central strip in hewei305 (|dx/dy| is about 0.8).  Long floor
+            # seams can have the same geometry, so only the newly admitted
+            # oblique case must also be a long chain of genuine, strong
+            # saddle responses.  The original near-vertical path is left
+            # unchanged for the older regression images.
+            if strongly_oblique:
+                if len(chain_ids) < max(7, min_chain + 1):
+                    continue
+                if point_scores is None:
+                    continue
+                chain_scores = np.asarray(
+                    [float(point_scores[idx]) for idx in chain_ids],
+                    dtype=float)
+                if (float(np.median(chain_scores)) < 0.045 or
+                        float(np.mean(chain_scores >= 0.025)) < 0.70):
+                    continue
             row_no = np.arange(len(chain), dtype=float)
-            fit_x = np.polyfit(row_no, chain[:, 0], 1)
-            fit_y = np.polyfit(row_no, chain[:, 1], 1)
+            # A quadratic is the smallest model that captures the gradual
+            # row-spacing expansion in hewei297 without allowing arbitrary
+            # bends.  Short chains retain the original straight-line fit.
+            fit_degree = 2 if len(chain) >= 6 else 1
+            fit_x = np.polyfit(row_no, chain[:, 0], fit_degree)
+            fit_y = np.polyfit(row_no, chain[:, 1], fit_degree)
             fitted = np.column_stack([np.polyval(fit_x, row_no),
                                       np.polyval(fit_y, row_no)])
             residual = np.linalg.norm(chain - fitted, axis=1)
-            row_vec = np.array([fit_x[0], fit_y[0]], dtype=float)
+            row_vec = np.median(np.diff(fitted, axis=0), axis=0)
             row_step = float(np.linalg.norm(row_vec))
             if (row_step < 28.0 or row_step > 75.0 or
                     np.percentile(residual, 90) > 3.5):
@@ -1096,11 +1611,11 @@ def detect_one_sided_strip_fallback(points, existing_boards, min_chain=5,
                      np.max(gaps) > 1.30 * row_step)):
                 continue
 
-            partners = []
+            partner_options = []
             chain_set = set(chain_ids)
+            row_unit = row_vec / max(row_step, 1e-9)
             for row, idx in enumerate(chain_ids):
                 p = points[idx]
-                choices = []
                 for other in ids:
                     other = int(other)
                     if other in chain_set:
@@ -1108,24 +1623,99 @@ def detect_one_sided_strip_fallback(points, existing_boards, min_chain=5,
                     if (point_scores is not None and
                             float(point_scores[other]) < 0.012):
                         continue
-                    dx, dy = points[other] - p
-                    width = abs(float(dx))
+                    delta_partner = points[other] - p
+                    # Under strong perspective a physical same-row edge need
+                    # not be image-horizontal.  hewei297's two genuine saddle
+                    # chains differ by roughly (+27,+30) px, so the old
+                    # |dy|<=0.18*|dx| rule split them into a two-column board
+                    # and an overlapping one-column board.  Resolve the edge
+                    # relative to the detected column direction instead:
+                    # ``along`` is the row-number offset and ``width`` is the
+                    # perpendicular separation between physical columns.
+                    along = float(np.dot(delta_partner, row_unit))
+                    cross = float(row_vec[0] * delta_partner[1] -
+                                  row_vec[1] * delta_partner[0])
+                    width = abs(cross) / max(row_step, 1e-9)
                     if (18.0 <= width <= 75.0 and
-                            abs(float(dy)) <= max(5.0, 0.18 * width)):
-                        choices.append((abs(float(dy)), width, other,
-                                        1 if dx > 0 else -1, row))
-                if choices:
-                    partners.append(min(choices))
-            if not partners:
+                            abs(along) <= max(5.0, 0.72 * row_step) and
+                            np.linalg.norm(delta_partner) <= 92.0):
+                        partner_options.append((
+                            abs(along), width, other,
+                            1 if cross > 0 else -1, row,
+                            np.asarray(delta_partner, dtype=float)))
+            if not partner_options:
                 continue
 
-            side = 1 if sum(p[3] > 0 for p in partners) >= \
-                        sum(p[3] < 0 for p in partners) else -1
-            same_side = [p for p in partners if p[3] == side]
-            width_med = float(np.median([p[1] for p in same_side]))
-            consistent = [p for p in same_side
-                          if 0.68 * width_med <= p[1] <= 1.38 * width_med]
+            # Vote once per chain row/side.  Counting every raw option lets a
+            # cluttered side win merely because it has more corner responses.
+            closest_by_row_side = {}
+            for option in partner_options:
+                key = (int(option[4]), int(option[3]))
+                if (key not in closest_by_row_side or
+                        option[0] < closest_by_row_side[key][0]):
+                    closest_by_row_side[key] = option
+            side_votes = {
+                sign: sum(key[1] == sign for key in closest_by_row_side)
+                for sign in (-1, 1)
+            }
+            side = 1 if side_votes[1] >= side_votes[-1] else -1
+            side_seed = [option for key, option in closest_by_row_side.items()
+                         if key[1] == side]
+            width_med = float(np.median([p[1] for p in side_seed]))
+            same_side = [p for p in partner_options
+                         if p[3] == side and
+                         0.68 * width_med <= p[1] <= 1.38 * width_med]
+            if not same_side:
+                continue
+
+            # Independent nearest-row decisions caused hewei298's second
+            # column to shift by one physical row after a missed response:
+            # each selected blue vector was locally plausible, but the vector
+            # jumped from roughly (-40,+10) to (-29,-30).  True same-row edge
+            # vectors form one compact cluster across the strip.  Select that
+            # cluster first, then perform a one-to-one row/candidate match.
+            vector_radius = max(7.0, 0.40 * row_step)
+            best_vector_group = None
+            for center_option in same_side:
+                group = [option for option in same_side
+                         if np.linalg.norm(option[5] - center_option[5]) <=
+                         vector_radius]
+                unique_rows = len({int(option[4]) for option in group})
+                unique_points = len({int(option[2]) for option in group})
+                spread = float(np.median([
+                    np.linalg.norm(option[5] - center_option[5])
+                    for option in group]))
+                group_score = (min(unique_rows, unique_points),
+                               unique_rows + unique_points, -spread)
+                if (best_vector_group is None or
+                        group_score > best_vector_group[0]):
+                    best_vector_group = (group_score, group)
+            vector_group = best_vector_group[1]
+            desired_vector = np.median(
+                np.asarray([option[5] for option in vector_group]), axis=0)
+            proposals = []
+            for option in same_side:
+                vector_error = float(np.linalg.norm(
+                    option[5] - desired_vector))
+                if vector_error > 1.25 * vector_radius:
+                    continue
+                cost = (vector_error + 0.12 * option[0] +
+                        0.08 * abs(option[1] - width_med))
+                proposals.append((cost, option))
+            used_rows, used_partners = set(), set()
+            consistent = []
+            for _, option in sorted(proposals, key=lambda item: item[0]):
+                row = int(option[4])
+                other = int(option[2])
+                if row in used_rows or other in used_partners:
+                    continue
+                used_rows.add(row)
+                used_partners.add(other)
+                consistent.append(option[:5])
             if not consistent:
+                continue
+            if (strongly_oblique and
+                    len(consistent) < max(2, int(np.ceil(0.25 * len(chain_ids))))):
                 continue
             score = 3.0 * len(chain_ids) + 2.0 * len(consistent) - \
                     float(np.mean(residual))
@@ -1260,7 +1850,46 @@ def detect_x_guided_single_column_fallback(points, existing_boards, img_gray,
     if best is None:
         return []
     _, chain_ids, row_ids, seed_idx, appearance = best
+    # Preserve the physical missing-row rule.  A later response after a row
+    # gap belongs to a separate visible fragment and must not make one long
+    # inferred column.  Floor seams in hewei298/303 produced widely separated
+    # row labels such as [0,4,6,7,11,12].
+    contiguous = 1
+    while (contiguous < len(row_ids) and
+           row_ids[contiguous] == row_ids[contiguous - 1] + 1):
+        contiguous += 1
+    chain_ids = chain_ids[:contiguous]
+    row_ids = row_ids[:contiguous]
+    if len(chain_ids) < 3:
+        return []
     img_pts = pts[chain_ids]
+    if point_scores is not None:
+        chain_scores = np.asarray(point_scores, dtype=float)[chain_ids]
+        strong_fraction = float(np.mean(chain_scores >= 0.012))
+        if (float(np.median(chain_scores)) < 0.012 or
+                strong_fraction < 0.70):
+            print(f"  [X引导单列回退] 拒绝低置信度直缝列: "
+                  f"中位分={np.median(chain_scores):.4f}, "
+                  f"强响应比例={strong_fraction:.2f}")
+            return []
+
+    # Angular contrast alone is insufficient: two crossing floor seams can
+    # score even higher than a printed mark.  Require the guiding seed to
+    # survive the same complete-lobe centring/filtering used for displayed Xs.
+    seed = pts[int(seed_idx)]
+    seed_trial = _refine_x_marks_multiscale(
+        [[1, float(seed[0]), float(seed[1])]], img_pts, img_gray,
+        min_center_score=0.50)
+    seed_trial = _filter_false_positive_x_corners(
+        seed_trial, img_pts, img_gray, min_dist_ratio=0.35)
+    if not seed_trial:
+        print("  [X引导单列回退] 引导种子无完整蝴蝶双瓣，拒绝直缝列")
+        return []
+    seed_center = np.asarray(seed_trial[0][1:3], dtype=float)
+    seed_stability, seed_peak = _butterfly_multiscale_stability(
+        img_gray, float(seed_center[0]), float(seed_center[1]))
+    if seed_stability < 0.68 or seed_peak < 0.80:
+        return []
     # The butterfly seed alone is not sufficient to prove a separate narrow
     # target.  On a severely tilted broad board an exposed outer checker
     # corner can have a high butterfly score while the following candidates
@@ -1283,6 +1912,151 @@ def detect_x_guided_single_column_fallback(points, existing_boards, img_gray,
     used_idx = set(int(idx) for idx in chain_ids)
     print(f"  [X引导单列回退] 恢复 {len(img_pts)} 个真实鞍点，"
           f"保留行号 {row_ids}，蝴蝶分={appearance:.3f}")
+    return [(img_pts, world_pts, None, used_idx)]
+
+
+def detect_cropped_top_row_fallback(points, existing_boards, img_shape,
+                                    point_scores=None, min_chain=6,
+                                    grid_spacing=15.0):
+    """Recover one real checker row clipped by the top image boundary.
+
+    A single visible row cannot provide the four-point seed required by a
+    homography board detector.  Restrict this fallback to the top 14% of the
+    image and to a mostly image-horizontal, regularly spaced run, so vertical
+    or diagonal floor seams elsewhere cannot create a board.
+    """
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < min_chain:
+        return []
+    h, w = img_shape[:2]
+    available = _available_strip_points_mask(pts, existing_boards, margin=12.0)
+    ids = np.where(available &
+                   (pts[:, 1] <= 0.14 * h) &
+                   (pts[:, 0] <= 0.72 * w))[0]
+    if len(ids) < min_chain:
+        return []
+
+    best = None
+    for ai in range(len(ids)):
+        i = int(ids[ai])
+        for aj in range(ai + 1, len(ids)):
+            j = int(ids[aj])
+            step = pts[j] - pts[i]
+            if step[0] < 0:
+                step *= -1.0
+            step_len = float(np.linalg.norm(step))
+            if (step_len < 18.0 or step_len > 85.0 or
+                    abs(float(step[1])) > 0.55 * abs(float(step[0]))):
+                continue
+            tolerance = max(4.0, 0.14 * step_len)
+            by_k = {}
+            for k in range(-18, 19):
+                target = pts[i] + k * step
+                distance = np.linalg.norm(pts[ids] - target, axis=1)
+                q = int(np.argmin(distance))
+                if distance[q] <= tolerance:
+                    candidate_id = int(ids[q])
+                    previous = by_k.get(k)
+                    if previous is None or distance[q] < previous[0]:
+                        by_k[k] = (float(distance[q]), candidate_id)
+            if len(by_k) < min_chain:
+                continue
+            keys = sorted(by_k)
+            runs, current = [], [keys[0]]
+            for key in keys[1:]:
+                if key == current[-1] + 1:
+                    current.append(key)
+                else:
+                    runs.append(current)
+                    current = [key]
+            runs.append(current)
+            run = max(runs, key=len)
+            if len(run) < min_chain:
+                continue
+            chain_ids = [by_k[key][1] for key in run]
+            chain = pts[chain_ids]
+            centered = chain - np.mean(chain, axis=0)
+            _, singular, vh = np.linalg.svd(centered, full_matrices=False)
+            residual = np.abs(centered @ np.array([-vh[0, 1], vh[0, 0]]))
+            if (len(singular) < 2 or singular[0] < 4.0 * max(singular[1], 1e-6) or
+                    np.percentile(residual, 90) > 4.0):
+                continue
+            if point_scores is not None:
+                scores = np.asarray(point_scores, dtype=float)[chain_ids]
+                if (float(np.median(scores)) < 0.012 or
+                        float(np.mean(scores >= 0.012)) < 0.75):
+                    continue
+            score = 5.0 * len(chain_ids) - float(np.mean(residual))
+            if best is None or score > best[0]:
+                best = (score, chain_ids)
+
+    # Strong perspective changes the cropped row spacing monotonically (in
+    # hewei298 it shrinks from about 39 px to 31 px), so no single affine step
+    # fits all six points within the tight target tolerance above.  Grow a
+    # second candidate with locally smooth direction/scale; skipped cells are
+    # still forbidden because each next step must stay within 0.65--1.45 of
+    # the immediately preceding one.
+    for start_id in ids:
+        chain_ids = [int(start_id)]
+        previous_step = None
+        for _ in range(20):
+            current = pts[chain_ids[-1]]
+            choices = []
+            for candidate_id in ids:
+                candidate_id = int(candidate_id)
+                if candidate_id in chain_ids:
+                    continue
+                step = pts[candidate_id] - current
+                if step[0] <= 0.0:
+                    continue
+                step_len = float(np.linalg.norm(step))
+                if (step_len < 18.0 or step_len > 85.0 or
+                        abs(float(step[1])) > 0.55 * abs(float(step[0]))):
+                    continue
+                if previous_step is None:
+                    cost = step_len
+                else:
+                    previous_len = float(np.linalg.norm(previous_step))
+                    ratio = step_len / max(previous_len, 1e-9)
+                    cosine = float(np.dot(step, previous_step) /
+                                   max(step_len * previous_len, 1e-9))
+                    if ratio < 0.65 or ratio > 1.45 or cosine < 0.94:
+                        continue
+                    cost = 30.0 * (1.0 - cosine) + 8.0 * abs(np.log(ratio))
+                choices.append((cost, candidate_id, step))
+            if not choices:
+                break
+            _, candidate_id, previous_step = min(choices)
+            chain_ids.append(candidate_id)
+        if len(chain_ids) < min_chain:
+            continue
+        chain = pts[chain_ids]
+        centered = chain - np.mean(chain, axis=0)
+        _, singular, vh = np.linalg.svd(centered, full_matrices=False)
+        residual = np.abs(centered @ np.array([-vh[0, 1], vh[0, 0]]))
+        if (len(singular) < 2 or singular[0] < 4.0 * max(singular[1], 1e-6) or
+                np.percentile(residual, 90) > 4.0):
+            continue
+        if point_scores is not None:
+            scores = np.asarray(point_scores, dtype=float)[chain_ids]
+            if (float(np.median(scores)) < 0.012 or
+                    float(np.mean(scores >= 0.012)) < 0.75):
+                continue
+        score = 5.0 * len(chain_ids) - float(np.mean(residual))
+        if best is None or score > best[0]:
+            best = (score, chain_ids)
+
+    if best is None:
+        return []
+    chain_ids = best[1]
+    chain_ids = sorted(chain_ids, key=lambda idx: float(pts[idx, 0]))
+    img_pts = pts[chain_ids]
+    world_pts = np.column_stack([
+        np.arange(len(img_pts), dtype=float) * grid_spacing,
+        np.zeros(len(img_pts), dtype=float),
+    ])
+    used_idx = set(int(idx) for idx in chain_ids)
+    print(f"  [顶部裁切单行回退] 恢复{len(img_pts)}个真实鞍点")
     return [(img_pts, world_pts, None, used_idx)]
 
 
@@ -1562,10 +2336,63 @@ def complete_chessboard_from_candidates(img_pts, world_pts, candidate_pts, min_p
     return best_img, best_world, H
 
 
-def adjust_skipped_grid_axis(img_pts, world_pts, candidate_pts, min_inside=4):
+def _trustworthy_small_seed_expansion(seed_img, seed_world,
+                                      expanded_img, expanded_world,
+                                      expanded_H):
+    """Accept real-candidate growth beyond a small seed's tight hull.
+
+    A 2xN edge seed or compact 3x3 seed can be only a visible sub-block of a
+    wider checkerboard.  Filtering the completed real responses back through
+    the seed convex hull deletes precisely the newly recovered rows/columns
+    (hewei303/305).  This predicate is intentionally strict and is used only
+    to decide whether that hull clipping may be skipped.
+    """
+    seed_img = np.asarray(seed_img, dtype=float)
+    seed_world = np.asarray(seed_world, dtype=float)
+    expanded_img = np.asarray(expanded_img, dtype=float)
+    expanded_world = np.asarray(expanded_world, dtype=float)
+    if (len(seed_img) < 6 or len(seed_img) > 12 or
+            len(expanded_img) < len(seed_img) + 4 or
+            len(expanded_img) != len(expanded_world)):
+        return False
+    seed_grid = np.round(seed_world / 15.0).astype(int)
+    expanded_grid = np.round(expanded_world / 15.0).astype(int)
+    seed_counts = (len(np.unique(seed_grid[:, 0])),
+                   len(np.unique(seed_grid[:, 1])))
+    expanded_counts = (len(np.unique(expanded_grid[:, 0])),
+                       len(np.unique(expanded_grid[:, 1])))
+    if (min(seed_counts) < 2 or
+            min(expanded_counts) < 3 or
+            any(new < old for new, old in zip(expanded_counts, seed_counts))):
+        return False
+    grid_cells = expanded_counts[0] * expanded_counts[1]
+    fill_ratio = len(expanded_img) / max(1, grid_cells)
+    # Low-resolution floor/board seams can satisfy a loose homography while
+    # occupying fewer than half of the proposed cells (hewei303: 17/35).
+    # Such a model adds isolated outer columns and produces a chaotic mesh.
+    # Prefer the smaller proven seed unless the expanded lattice is genuinely
+    # well occupied and its tail errors remain tight.
+    if fill_ratio < 0.55 or not _homography_has_grid_scale(
+            expanded_H, expanded_world):
+        return False
+    errors, mean_error = compute_reprojection_error(
+        expanded_H, expanded_world, expanded_img)
+    if (not np.isfinite(mean_error) or mean_error > 2.6 or
+            float(np.percentile(errors, 90)) > 4.0):
+        return False
+    centered = expanded_img - np.mean(expanded_img, axis=0)
+    singular = np.linalg.svd(centered, compute_uv=False)
+    if (len(singular) < 2 or singular[1] < 8.0 or
+            singular[0] / max(singular[1], 1e-9) > 8.0):
+        return False
+    return True
+
+
+def adjust_skipped_grid_axis(img_pts, world_pts, candidate_pts, min_inside=4,
+                             min_seed_points=9):
     img_pts, world_pts = _unique_world_points(img_pts, world_pts)
     candidate_pts = np.asarray(candidate_pts, dtype=float)
-    if len(img_pts) < 9 or len(candidate_pts) <= len(img_pts):
+    if len(img_pts) < min_seed_points or len(candidate_pts) <= len(img_pts):
         return img_pts, world_pts, compute_homography(world_pts, img_pts)
 
     polygon, _ = get_chessboard_polygon(img_pts)
@@ -1637,6 +2464,21 @@ def adjust_skipped_grid_axis(img_pts, world_pts, candidate_pts, min_inside=4):
                 axes_supported = False
                 break
         if axes_supported and close_count >= max(min_inside, int(len(unused) * 0.35)):
+            trial_grid = np.round(trial_units).astype(int)
+            trial_counts = (
+                int(np.ptp(trial_grid[:, 0])) + 1,
+                int(np.ptp(trial_grid[:, 1])) + 1,
+            )
+            potential_fill = ((len(img_pts) + close_count) /
+                              max(1, trial_counts[0] * trial_counts[1]))
+            # A few low-resolution responses can accidentally support x2/x3
+            # residues while expanding a compact board to an implausible
+            # 6x29 world lattice (hewei302).  Such sparse topology later makes
+            # the renderer join diagonal neighbours.  A real skipped-axis
+            # correction must have enough actual seed+unused responses to
+            # occupy a credible fraction of the proposed grid.
+            if potential_fill < 0.32:
+                continue
             # Prefer the simpler/smaller expansion when support is equal.
             complexity = (1.0 + 0.08 * (len(scaled_axes) - 1) +
                           0.05 * sum(scale - 2.0 for scale in scales if scale > 1.0))
@@ -2046,6 +2888,36 @@ def draw_chessboard_grid(ax, img_pts, world_pts, img_shape=None):
         n_cols = n_rows = 0
         fill_ratio = 0.0
 
+    # A broad board clipped by the image boundary can leave only one physical
+    # row.  Draw exact consecutive cells in blue; no second lattice direction
+    # is inferred and a missing response still breaks the row.
+    if n_rows == 1 and n_cols >= 3 and len(grid_to_img) >= 3:
+        centered = img_s - np.median(img_s, axis=0)
+        singular = np.linalg.svd(centered, compute_uv=False)
+        line_ratio = (float(singular[0]) /
+                      max(float(singular[1]) if len(singular) > 1 else 0.0,
+                          1e-6))
+        if line_ratio >= 4.0:
+            tree = KDTree(img_s)
+            nn_dist, _ = tree.query(img_s, k=2)
+            one_step = float(np.median(nn_dist[:, 1]))
+            drew_edge = False
+            for (col, row), p0 in grid_to_img.items():
+                p1 = grid_to_img.get((col + 1, row))
+                if p1 is None:
+                    continue
+                dx, dy = p1 - p0
+                length = float(np.hypot(dx, dy))
+                if (abs(dx) < 1e-6 or abs(dy) > 0.65 * abs(dx) or
+                        length < 0.50 * one_step or
+                        length > 1.55 * one_step):
+                    continue
+                ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
+                        color='#1f73d8', linewidth=2, alpha=0.9, zorder=4)
+                drew_edge = True
+            if drew_edge:
+                return
+
     # A board clipped by the image boundary can legitimately leave only one
     # detected column.  Such a point cloud has no horizontal pair from which
     # estimate_lattice_directions() can recover the second lattice axis, so
@@ -2081,6 +2953,169 @@ def draw_chessboard_grid(ax, img_pts, world_pts, img_shape=None):
                 drew_edge = True
             if drew_edge:
                 return
+
+    def draw_confirmed_world_topology_edges():
+        """Draw only exact adjacent world-grid edges.
+
+        The image-direction fallback is unsafe when a broad board is partly
+        occluded: row clustering can pair a point from the next column and
+        create diagonal/crossing red edges.  World labels are already assigned
+        during board growth, so use them as the graph topology and apply only
+        a local direction/length sanity check.  Missing labels naturally leave
+        a gap; no nearest-neighbour bridge is allowed.
+        """
+        if n_cols < 2 or n_rows < 2:
+            return False
+        horizontal, vertical = [], []
+        for (col, row), p0 in grid_to_img.items():
+            right = grid_to_img.get((col + 1, row))
+            down = grid_to_img.get((col, row + 1))
+            if right is not None:
+                horizontal.append((p0, right))
+            if down is not None:
+                vertical.append((p0, down))
+        if len(horizontal) < 2 and len(vertical) < 2:
+            return False
+
+        def robust_axis(edges, prefer):
+            if not edges:
+                return None
+            vectors = []
+            for p0, p1 in edges:
+                v = np.asarray(p1, dtype=float) - np.asarray(p0, dtype=float)
+                length = float(np.linalg.norm(v))
+                if length < 1e-6:
+                    continue
+                v /= length
+                if float(np.dot(v, prefer)) < 0.0:
+                    v *= -1.0
+                vectors.append(v)
+            if not vectors:
+                return None
+            axis = np.median(np.asarray(vectors), axis=0)
+            norm = float(np.linalg.norm(axis))
+            return axis / norm if norm > 1e-6 else None
+
+        h_axis = robust_axis(horizontal, np.array([1.0, 0.0]))
+        v_axis = robust_axis(vertical, np.array([0.0, 1.0]))
+
+        def adaptive_alignment_cos(edges, axis, min_angle=7.0):
+            """Return a robust angular gate for one physical lattice axis.
+
+            Perspective can fan the short horizontal edges across a fairly
+            wide angle, whereas true same-column edges on these tall boards
+            remain almost parallel.  A fixed loose dot-product threshold let
+            a few mislabeled diagonal red edges survive.  Estimate the gate
+            from the median angular deviation, with conservative bounds for
+            genuine perspective variation.
+            """
+            if axis is None or not edges:
+                return 1.0
+            deviations = []
+            for p0, p1 in edges:
+                vec = np.asarray(p1, dtype=float) - np.asarray(p0, dtype=float)
+                norm = float(np.linalg.norm(vec))
+                if norm <= 1e-9:
+                    continue
+                cosine = abs(float(np.dot(vec / norm, axis)))
+                deviations.append(float(np.degrees(
+                    np.arccos(np.clip(cosine, 0.0, 1.0)))))
+            if not deviations:
+                return 1.0
+            deviations = np.asarray(deviations, dtype=float)
+            median_dev = float(np.median(deviations))
+            mad = float(np.median(np.abs(deviations - median_dev)))
+            angle_limit = float(np.clip(
+                median_dev + 3.0 * max(mad, 1.0), min_angle, 30.0))
+            return float(np.cos(np.deg2rad(angle_limit)))
+
+        # Across-row blue edges fan markedly near the top vanishing region
+        # (hewei272/278): valid top-row edges can differ from the board median
+        # by 22--25 degrees.  Keep a 26-degree floor for horizontal edges.
+        # Red same-column edges remain under the strict 7-degree floor below.
+        h_alignment_cos = adaptive_alignment_cos(
+            horizontal, h_axis, min_angle=26.0)
+        v_alignment_cos = adaptive_alignment_cos(vertical, v_axis)
+        axis_separation_deg = 90.0
+        if h_axis is not None and v_axis is not None:
+            axis_separation_deg = float(np.degrees(np.arccos(np.clip(
+                abs(float(np.dot(h_axis, v_axis))), 0.0, 1.0))))
+        # Near a vanishing region the two projected checkerboard axes can be
+        # less than 30 degrees apart (hewei302 right board).  Requiring every
+        # exact world edge to be noticeably closer to its own axis than to the
+        # other then rejects genuine neighbours.  In this specific, sufficiently
+        # occupied broad-board topology, exact row/column labels plus the
+        # one-cell length gate are the decisive evidence; no diagonal nearest-
+        # neighbour substitution is allowed.
+        converged_world_axes = (
+            n_cols >= 4 and n_rows >= 4 and fill_ratio >= 0.55 and
+            axis_separation_deg <= 32.0)
+        h_lengths = np.asarray([np.linalg.norm(p1 - p0)
+                                for p0, p1 in horizontal], dtype=float)
+        v_lengths = np.asarray([np.linalg.norm(p1 - p0)
+                                for p0, p1 in vertical], dtype=float)
+        h_step = float(np.median(h_lengths)) if len(h_lengths) else 1.0
+        v_step = float(np.median(v_lengths)) if len(v_lengths) else 1.0
+        drew = 0
+        for p0, p1 in horizontal:
+            vec = np.asarray(p1) - np.asarray(p0)
+            length = float(np.linalg.norm(vec))
+            unit = vec / max(length, 1e-9)
+            own_alignment = (abs(float(np.dot(unit, h_axis)))
+                             if h_axis is not None else 0.0)
+            other_alignment = (abs(float(np.dot(unit, v_axis)))
+                               if v_axis is not None else 0.0)
+            aligned = (h_axis is not None and
+                       own_alignment >= h_alignment_cos and
+                       (converged_world_axes or
+                        own_alignment >= other_alignment + 0.08))
+            # On a reliable two-column strip there is exactly one blue edge
+            # per physical row.  Near the perspective vanishing end that edge
+            # may rotate much farther than the global horizontal median, even
+            # though its two exact world labels are unquestionably adjacent
+            # (hewei298).  In this narrow, well-filled topology accept the
+            # world edge when it remains clearly separated from the red/row
+            # direction.  Length and exact-label checks below still prohibit
+            # crossing a missed saddle or joining a non-adjacent row.
+            if (not aligned and n_cols == 2 and fill_ratio >= 0.75 and
+                    v_axis is not None):
+                aligned = other_alignment <= float(np.cos(np.deg2rad(25.0)))
+            if aligned and 0.45 * h_step <= length <= 1.65 * h_step:
+                ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
+                        color='#1f73d8', linewidth=2, alpha=0.9, zorder=4)
+                drew += 1
+        for p0, p1 in vertical:
+            vec = np.asarray(p1) - np.asarray(p0)
+            length = float(np.linalg.norm(vec))
+            unit = vec / max(length, 1e-9)
+            own_alignment = (abs(float(np.dot(unit, v_axis)))
+                             if v_axis is not None else 0.0)
+            other_alignment = (abs(float(np.dot(unit, h_axis)))
+                               if h_axis is not None else 0.0)
+            aligned = (v_axis is not None and
+                       own_alignment >= v_alignment_cos and
+                       (converged_world_axes or
+                        own_alignment >= other_alignment + 0.08))
+            if aligned and 0.45 * v_step <= length <= 1.65 * v_step:
+                ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
+                        color='#d83b32', linewidth=2, alpha=0.9, zorder=4)
+                drew += 1
+        return drew > 0
+
+    # A severely compressed/corrupted model such as hewei302 can label a
+    # compact 6-row board as 29 sparse world rows.  A handful of exact label
+    # adjacencies then suppresses the safer image-lattice fallback and leaves
+    # most points unconnected.  Trust the exact graph only when its occupied
+    # cell ratio is credible (or a narrow board is itself well supported).
+    credible_sparse_broad = (
+        n_cols >= 4 and n_rows >= 4 and len(grid_to_img) >= 20 and
+        fill_ratio >= 0.55 and
+        max(n_cols, n_rows) <= 3.5 * min(n_cols, n_rows))
+    trusted_world_graph = (
+        fill_ratio >= 0.72 or credible_sparse_broad or
+        (min(n_cols, n_rows) <= 2 and fill_ratio >= 0.65))
+    if trusted_world_graph and draw_confirmed_world_topology_edges():
+        return
 
     topology_consistent = False
     # Broad boards can lose several edge/interior saddles and still retain an
@@ -2331,7 +3366,12 @@ def draw_chessboard_grid(ax, img_pts, world_pts, img_shape=None):
                     if column_error > 0.45 * horizontal_step:
                         continue
                     dx, dy = img_s[j] - img_s[i]
-                    if dy <= 0.0 or abs(dx) > 0.45 * abs(dy):
+                    # In compact oblique boards (hewei302) a real physical
+                    # column can lean about 35--40 degrees in the image.  The
+                    # basis-coordinate half-column gate and one-to-one row
+                    # matching already prevent diagonal/crossing assignments,
+                    # so retain a wider image-slope allowance here.
+                    if dy <= 0.0 or abs(dx) > 0.85 * abs(dy):
                         continue
                     candidates.append((column_error, int(i), int(j)))
             # Greedy minimum-cost bipartite matching; the strong half-column
@@ -2346,7 +3386,21 @@ def draw_chessboard_grid(ax, img_pts, world_pts, img_shape=None):
                 ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
                         color='#d83b32', linewidth=2, alpha=0.9, zorder=4)
 
-    connect_columns_between_rows(row_axis, col_axis)
+    # On boards whose physical column axis remains close to image-vertical,
+    # direct nearest-neighbour tracing is both simpler and more complete.  The
+    # row-clustering matcher below is useful for strongly oblique strips, but
+    # on compact distant boards (hewei302) perspective makes the estimated row
+    # levels overlap and it drops many otherwise unambiguous vertical edges.
+    # ``connect_axis`` still enforces a one-cell spacing window and the hard
+    # red-slope guard, so a missed saddle leaves a gap and cannot be bridged.
+    direct_vertical = (
+        col_axis is not None and
+        abs(float(col_axis[0][0])) <= 0.45 * abs(float(col_axis[0][1])))
+    if direct_vertical:
+        connect_axis(col_axis, '#d83b32', angle_limit_deg=14.0,
+                     vertical_edge=False)
+    else:
+        connect_columns_between_rows(row_axis, col_axis)
     return
 
     # Legacy image-angle grouping retained below for reference only.
@@ -2698,6 +3752,166 @@ def _restore_complete_narrow_end_rows(filtered_img, filtered_world,
     return result_img, result_world, max(0, len(result_img) - before)
 
 
+def _restore_staggered_narrow_end_point(filtered_img, filtered_world,
+                                         completed_img, completed_world,
+                                         reference_world,
+                                         grid_spacing=15.0):
+    """Restore one measured saddle at the staggered end of a two-column strip.
+
+    Some physical narrow patterns start with one column and end one row later
+    in the opposite column.  Generic hull clipping removes that final singleton,
+    while ``_restore_complete_narrow_end_rows`` deliberately accepts only a
+    two-point row.  Admit the singleton only when the opposite end of the
+    original board is also a singleton in the other column and the measured
+    candidate agrees with a same-column linear extrapolation.  No image point
+    or world coordinate is synthesized.
+    """
+    filtered_img = np.asarray(filtered_img, dtype=float)
+    filtered_world = np.asarray(filtered_world, dtype=float)
+    completed_img = np.asarray(completed_img, dtype=float)
+    completed_world = np.asarray(completed_world, dtype=float)
+    reference_world = np.asarray(reference_world, dtype=float)
+    if (len(reference_world) < 8 or len(completed_img) == 0 or
+            len(completed_img) != len(completed_world)):
+        return filtered_img, filtered_world, 0
+
+    ref_grid = np.round(reference_world / grid_spacing).astype(int)
+    counts = [len(np.unique(ref_grid[:, axis])) for axis in (0, 1)]
+    if min(counts) != 2 or max(counts) < 6:
+        return filtered_img, filtered_world, 0
+    short_axis = int(np.argmin(counts))
+    long_axis = 1 - short_axis
+    short_values = np.unique(ref_grid[:, short_axis])
+    long_min = int(np.min(ref_grid[:, long_axis]))
+    long_max = int(np.max(ref_grid[:, long_axis]))
+    completed_grid = np.round(completed_world / grid_spacing).astype(int)
+
+    proposals = []
+    # A singleton at the minimum end proves the alternating column expected at
+    # max+1; the mirrored case is handled symmetrically.
+    for source_end, target_end, direction in (
+            (long_min, long_max + 1, 1),
+            (long_max, long_min - 1, -1)):
+        source_idx = np.where(ref_grid[:, long_axis] == source_end)[0]
+        if len(source_idx) != 1:
+            continue
+        source_short = int(ref_grid[int(source_idx[0]), short_axis])
+        opposite = [int(v) for v in short_values if int(v) != source_short]
+        if len(opposite) != 1:
+            continue
+        target_short = opposite[0]
+        target_all = np.where(
+            (completed_grid[:, long_axis] == target_end) &
+            np.isin(completed_grid[:, short_axis], short_values))[0]
+        match = target_all[
+            completed_grid[target_all, short_axis] == target_short]
+        # The new end row itself must be a measured singleton.  If both columns
+        # appear, the stricter complete-row restorer is authoritative.
+        if len(target_all) != 1 or len(match) != 1:
+            continue
+        candidate_idx = int(match[0])
+
+        same_col = np.where(
+            ref_grid[:, short_axis] == target_short)[0]
+        if len(same_col) < 3:
+            continue
+        row_values = ref_grid[same_col, long_axis].astype(float)
+        order = np.argsort(row_values)
+        same_col = same_col[order]
+        row_values = row_values[order]
+        if direction > 0:
+            fit_idx = same_col[-3:]
+            fit_rows = row_values[-3:]
+        else:
+            fit_idx = same_col[:3]
+            fit_rows = row_values[:3]
+        if len(np.unique(fit_rows)) < 2:
+            continue
+        # ``reference_world`` and the reference image positions share order;
+        # recover those image positions from the completed set by exact cells.
+        reference_img_for_fit = []
+        valid_rows = []
+        for ref_idx, row_value in zip(fit_idx, fit_rows):
+            cell = ref_grid[int(ref_idx)]
+            cell_match = np.where(np.all(completed_grid == cell, axis=1))[0]
+            if len(cell_match) != 1:
+                continue
+            reference_img_for_fit.append(completed_img[int(cell_match[0])])
+            valid_rows.append(float(row_value))
+        if len(reference_img_for_fit) < 2:
+            continue
+        reference_img_for_fit = np.asarray(reference_img_for_fit, dtype=float)
+        valid_rows = np.asarray(valid_rows, dtype=float)
+        predicted = np.array([
+            np.polyval(np.polyfit(valid_rows, reference_img_for_fit[:, axis], 1),
+                       float(target_end))
+            for axis in (0, 1)
+        ])
+        step = float(np.median(np.linalg.norm(
+            np.diff(reference_img_for_fit, axis=0), axis=1)))
+        error = float(np.linalg.norm(completed_img[candidate_idx] - predicted))
+        if error > max(5.0, 0.35 * step):
+            continue
+        proposals.append((error, candidate_idx))
+
+    if not proposals:
+        return filtered_img, filtered_world, 0
+    _, candidate_idx = min(proposals, key=lambda item: item[0])
+    out_img = np.vstack([filtered_img, completed_img[candidate_idx]])
+    out_world = np.vstack([filtered_world, completed_world[candidate_idx]])
+    before = len(filtered_img)
+    out_img, out_world = _unique_world_points(out_img, out_world)
+    return out_img, out_world, max(0, len(out_img) - before)
+
+
+def _restore_narrow_reference_responses(filtered_img, filtered_world,
+                                         reference_img, reference_world,
+                                        grid_spacing=15.0):
+    """Keep every proven original response of a two-column fallback board.
+
+    The polygon safety pass can drop a hull endpoint under strong perspective.
+    Replacing it later by a homography projection makes a synthetic display
+    point.  For a proven narrow topology, restore the original detected pixel
+    for each reference cell instead; missing cells remain missing.
+    """
+    filtered_img = np.asarray(filtered_img, dtype=float).copy()
+    filtered_world = np.asarray(filtered_world, dtype=float).copy()
+    reference_img = np.asarray(reference_img, dtype=float)
+    reference_world = np.asarray(reference_world, dtype=float)
+    if (len(reference_img) < 6 or len(reference_img) != len(reference_world)):
+        return filtered_img, filtered_world, 0
+    reference_grid = np.round(reference_world / grid_spacing).astype(int)
+    counts = [len(np.unique(reference_grid[:, axis])) for axis in (0, 1)]
+    if min(counts) != 2 or max(counts) < 4:
+        return filtered_img, filtered_world, 0
+
+    if len(filtered_world):
+        filtered_grid = np.round(filtered_world / grid_spacing).astype(int)
+        cell_to_index = {
+            tuple(cell): int(i) for i, cell in enumerate(filtered_grid)
+        }
+    else:
+        cell_to_index = {}
+    restored = 0
+    for point, world, cell in zip(reference_img, reference_world,
+                                  reference_grid):
+        key = tuple(cell)
+        if key in cell_to_index:
+            # The seed/fallback coordinate is an actual detector response and
+            # is more authoritative than a rematched or projected coordinate.
+            idx = cell_to_index[key]
+            filtered_img[idx] = point
+            filtered_world[idx] = world
+            continue
+        filtered_img = np.vstack([filtered_img, point]) if len(filtered_img) \
+            else np.asarray([point], dtype=float)
+        filtered_world = np.vstack([filtered_world, world]) if len(filtered_world) \
+            else np.asarray([world], dtype=float)
+        cell_to_index[key] = len(filtered_img) - 1
+        restored += 1
+    return filtered_img, filtered_world, restored
+
+
 def _butterfly_contrast_score(img_gray, cx, cy, radius):
     """Return an orientation-independent score for two opposite dark lobes.
 
@@ -2756,6 +3970,59 @@ def _butterfly_multiscale_stability(img_gray, cx, cy):
     return float(np.median(scores)), float(np.max(scores))
 
 
+def _refine_partial_butterfly_tip_center(img_gray, cx, cy, roi_radius=70):
+    """Locate the pointed waist when one butterfly lobe merges with an occluder.
+
+    In a partially covered mark the visible printed lobe remains a contained
+    dark component, while the opposite lobe merges into the foot and touches
+    the ROI boundary.  The true X centre is the visible component boundary
+    closest to that merged dark component, not either component's centroid.
+    """
+    h, w = img_gray.shape
+    r = int(np.clip(roi_radius, 45, 90))
+    x0, x1 = max(0, int(round(cx)) - r), min(w, int(round(cx)) + r + 1)
+    y0, y1 = max(0, int(round(cy)) - r), min(h, int(round(cy)) + r + 1)
+    patch = np.asarray(img_gray[y0:y1, x0:x1], dtype=float)
+    if patch.size < 400:
+        return None
+    p10, p45 = np.percentile(patch, [10, 45])
+    dark_cut = p10 + 0.42 * (p45 - p10)
+    labels, count = ndi_label(patch <= dark_cut)
+    components = []
+    for lab in range(1, count + 1):
+        yy, xx = np.where(labels == lab)
+        area = len(xx)
+        if area < max(80, 0.004 * patch.size) or area > 0.36 * patch.size:
+            continue
+        touches = (np.any(xx == 0) or np.any(yy == 0) or
+                   np.any(xx == patch.shape[1] - 1) or
+                   np.any(yy == patch.shape[0] - 1))
+        pts = np.column_stack([x0 + xx, y0 + yy]).astype(float)
+        components.append((touches, pts, np.mean(pts, axis=0)))
+    interior = [comp for comp in components if not comp[0]]
+    # Exactly one contained lobe is the distinctive partial-occlusion case.
+    if len(interior) != 1 or len(components) < 2:
+        return None
+    target = interior[0]
+    if np.linalg.norm(target[2] - np.array([cx, cy])) > 35.0:
+        return None
+    support_parts = [comp[1] for comp in components if comp is not target]
+    if not support_parts:
+        return None
+    support = np.vstack(support_parts)
+    distances, _ = KDTree(support).query(target[1], k=1)
+    min_distance = float(np.min(distances))
+    if not np.isfinite(min_distance) or min_distance > 8.0:
+        return None
+    near_tip = target[1][distances <= min_distance + 2.01]
+    if len(near_tip) < 3:
+        return None
+    tip = np.median(near_tip, axis=0)
+    if np.linalg.norm(tip - np.array([cx, cy])) > 35.0:
+        return None
+    return tip
+
+
 def _estimate_grid_spacing(img_pts):
     """Robust image-space cell spacing, ignoring duplicate/interpolated nodes."""
     if len(img_pts) < 2:
@@ -2808,7 +4075,16 @@ def _filter_false_positive_x_corners(jilu_b, img_b, img_gray, min_dist_ratio=0.3
         # Strong, complete two-lobe evidence is sufficient under cast shadow;
         # endpoint fallback still keeps the bright-board requirement, which
         # rejects occluding foot texture.
-        visible_butterfly = appearance >= 0.16 and (on_bright_board or appearance >= 0.80)
+        multi_stability, multi_peak = _butterfly_multiscale_stability(
+            img_gray, cx, cy)
+        shadow_complete = (appearance >= 0.70 and
+                           multi_stability >= 0.68 and multi_peak >= 0.78)
+        partial_upper = (cy <= 0.30 * h_img and
+                         multi_stability >= 0.45 and multi_peak >= 0.65)
+        visible_butterfly = (
+            appearance >= 0.16 and
+            (on_bright_board or appearance >= 0.80 or
+             partial_upper or shadow_complete))
         if d[0] >= min_dist and visible_butterfly:
             filtered.append(rec)
         else:
@@ -2993,17 +4269,41 @@ def _refine_x_marks_to_butterfly_centers(jilu_b, img_b, img_gray,
             appearance_radius = float(np.clip(0.28 * best[2], 14.0, 28.0))
             center_appearance = _butterfly_contrast_score(
                 img_gray, midpoint[0], midpoint[1], appearance_radius)
+            # A component midpoint can be pulled toward an occluding toe or a
+            # nearby checker edge.  Compare the endpoint prior and the shifted
+            # midpoint across several radii even when the latter only barely
+            # clears min_center_score (hewei263/264 upper-right marker).
+            raw_stability, raw_appearance = _butterfly_multiscale_stability(
+                img_gray, cx, cy)
+            midpoint_shift = float(np.linalg.norm(
+                midpoint - np.array([cx, cy])))
+            if (center_appearance < 0.65 and 0.45 <= raw_stability < 0.74 and
+                    raw_appearance >= 0.65):
+                tip_center = _refine_partial_butterfly_tip_center(
+                    img_gray, cx, cy)
+                if tip_center is not None:
+                    refined.append([int(rec[0]), float(tip_center[0]),
+                                    float(tip_center[1])])
+                    print(f"  [X遮挡尖端中心] ({cx:.1f},{cy:.1f}) -> "
+                          f"({tip_center[0]:.1f},{tip_center[1]:.1f}), "
+                          f"原始中位分={raw_stability:.3f}, "
+                          f"原始峰值={raw_appearance:.3f}")
+                    continue
+            if (center_appearance < 0.65 and midpoint_shift >= 4.0 and
+                    raw_appearance >= 0.80 and
+                    raw_stability >= 0.50 and
+                    raw_appearance >= center_appearance + 0.25):
+                refined.append([int(rec[0]), float(cx), float(cy)])
+                print(f"  [X原中心优先] ({cx:.1f},{cy:.1f}), "
+                      f"偏移={midpoint_shift:.1f}px, 原始中位分={raw_stability:.3f}, "
+                      f"原始峰值={raw_appearance:.3f}, "
+                      f"偏移中心分={center_appearance:.3f}")
+                continue
             # Revalidate at the refined centre.  A vertical run of checker
             # squares can have a narrow connected-component waist, but it
             # lacks two opposite dark lobes around that waist (hewei181).
             if center_appearance < min_center_score:
-                raw_scores = np.asarray([
-                    _butterfly_contrast_score(img_gray, cx, cy, radius)
-                    for radius in (8.0, 10.0, 12.0, 14.0,
-                                   16.0, 18.0, 22.0, 26.0)
-                ], dtype=float)
-                raw_appearance = float(np.max(raw_scores))
-                raw_stability = float(np.median(raw_scores))
+                # raw_stability/raw_appearance were computed above.
                 # A large ROI can select distant checker components and pull
                 # the midpoint away from an already excellent small-marker
                 # centre (hewei259).  Preserve the raw centre only when its
@@ -3192,10 +4492,31 @@ def _detect_butterfly_above_sparse_strip(candidate_pts, img_gray,
     """
     if len(candidate_pts) < 3:
         return []
+    # This is a recovery branch for the second/occluded narrow target, not a
+    # free image-wide X detector.  With no established two-column strip at
+    # all, a floor seam can supply both the false centre and the two false
+    # "support saddles" (hewei305).  Requiring one proven narrow target still
+    # allows recovery of its occluded neighbour while preventing a no-board
+    # frame from producing a standalone green mark.
+    has_proven_narrow_board = False
+    for board in existing_boards:
+        board_img = np.asarray(board[0], dtype=float)
+        board_world = np.asarray(board[1], dtype=float)
+        if len(board_img) < 4 or len(board_world) != len(board_img):
+            continue
+        board_grid = np.round(board_world / 15.0).astype(int)
+        board_counts = (len(np.unique(board_grid[:, 0])),
+                        len(np.unique(board_grid[:, 1])))
+        if min(board_counts) <= 2 and max(board_counts) >= 4:
+            has_proven_narrow_board = True
+            break
+    if not has_proven_narrow_board:
+        return []
     available = _available_strip_points_mask(candidate_pts, existing_boards)
     seed_ids = np.where(available)[0]
     if len(seed_ids) == 0:
         return []
+    available_points = np.asarray(candidate_pts, dtype=float)[available]
     existing_xy = np.asarray([m[1:3] for m in existing_marks], dtype=float) \
         if len(existing_marks) else np.empty((0, 2))
     image_median = float(np.median(img_gray))
@@ -3205,7 +4526,12 @@ def _detect_butterfly_above_sparse_strip(candidate_pts, img_gray,
          0 if float(mark[2]) < 0.5 * h else 1)
         for mark in existing_marks
     }
-    recovered = []
+    # Several saddle seeds can validate the same physical endpoint.  In a
+    # sparse/oblique strip one seed may be the genuine butterfly centre while
+    # another is an ordinary checker intersection farther down the board.  Do
+    # not keep candidates in traversal order: compete them within the four
+    # physical image slots and retain only the strongest centred response.
+    best_by_slot = {}
 
     for idx in seed_ids:
         seed = np.asarray(candidate_pts[int(idx)], dtype=float)
@@ -3215,11 +4541,19 @@ def _detect_butterfly_above_sparse_strip(candidate_pts, img_gray,
         # shape relaxation (hewei175), but can never be an X target here.
         if seed[0] < 0.18 * w or seed[0] > 0.92 * w:
             continue
+        # This recovery models an X *above* a sparse strip.  Lower endpoints
+        # have a separate board-corridor fallback.  Without this half-image
+        # guard, a floor-seam intersection below the target (hewei300/304)
+        # could validate itself with other seam responses and become X 1/2.
+        if seed[1] > 0.58 * h:
+            continue
         seed_slot = (0 if seed[0] < 0.5 * w else 1,
                      0 if seed[1] < 0.5 * h else 1)
         if seed_slot in existing_slots:
             continue
         if _is_broad_board_lattice_extension(seed, existing_boards):
+            continue
+        if _is_on_long_straight_response_chain(seed, available_points):
             continue
         if len(existing_xy) and np.min(np.linalg.norm(existing_xy - seed, axis=1)) < 45.0:
             continue
@@ -3234,7 +4568,12 @@ def _detect_butterfly_above_sparse_strip(candidate_pts, img_gray,
             continue
 
         delta = np.asarray(candidate_pts, dtype=float) - seed
-        below = np.where((delta[:, 1] >= 70.0) & (delta[:, 1] <= 430.0) &
+        # The support pair must still be unassigned.  Previously this search
+        # used every saddle in the image, so a floor-seam response above the
+        # broad right checkerboard (hewei289) borrowed two already-owned wide-
+        # board saddles below it and falsely became X corner 3.
+        below = np.where(available &
+                         (delta[:, 1] >= 70.0) & (delta[:, 1] <= 430.0) &
                          (np.abs(delta[:, 0]) <= 65.0))[0]
         if len(below) < 2:
             continue
@@ -3278,13 +4617,30 @@ def _detect_butterfly_above_sparse_strip(candidate_pts, img_gray,
                         0 if p[1] < 0.5 * h else 1)
             if rec_slot in existing_slots:
                 continue
-            known = list(existing_marks) + recovered
-            if known and min(np.linalg.norm(p - np.asarray(old[1:3], dtype=float))
-                             for old in known) < 35.0:
+            if (len(existing_marks) and
+                    min(np.linalg.norm(
+                        p - np.asarray(old[1:3], dtype=float))
+                        for old in existing_marks) < 35.0):
                 continue
-            recovered.append(rec)
-            print(f"  [稀疏条带X回退] 位置=({p[0]:.1f},{p[1]:.1f}), "
-                  f"蝴蝶分={appearance:.3f}")
+            stability, peak = _butterfly_multiscale_stability(
+                img_gray, float(p[0]), float(p[1]))
+            # The seed appearance separates a true printed butterfly from a
+            # checker response, while centred multi-scale evidence prevents a
+            # single favourable radius from winning.  Cap the peak so an
+            # exceptionally sharp floor/checker edge cannot dominate.
+            quality = (float(appearance) + 0.35 * float(stability) +
+                       0.10 * min(float(peak), 1.2))
+            previous = best_by_slot.get(rec_slot)
+            if previous is None or quality > previous[0]:
+                best_by_slot[rec_slot] = (
+                    quality, rec, float(appearance), stability, peak)
+
+    recovered = []
+    for _, rec, appearance, stability, peak in best_by_slot.values():
+        recovered.append(rec)
+        print(f"  [稀疏条带X回退] 位置=({rec[1]:.1f},{rec[2]:.1f}), "
+              f"蝴蝶分={appearance:.3f}, 稳定分={stability:.3f}, "
+              f"峰值={peak:.3f}")
     return recovered
 
 
@@ -3302,12 +4658,32 @@ def _detect_isolated_complete_butterflies(candidate_pts, img_gray,
         return []
     points = np.asarray(candidate_pts, dtype=float)
     available = _available_strip_points_mask(points, existing_boards, margin=14.0)
+    available_points = points[available]
     h, w = img_gray.shape
     image_median = float(np.median(img_gray))
     known_upper_sides = {
         0 if float(mark[1]) < 0.5 * w else 1
         for mark in existing_marks if float(mark[2]) <= 0.58 * h
     }
+    known_upper_y = [
+        float(mark[2]) for mark in existing_marks
+        if float(mark[2]) <= 0.58 * h
+    ]
+
+    def plausible_upper_height(y):
+        # The two physical upper butterflies can shift under perspective, but
+        # they remain in the same broad height band.  A floor-tile seam in
+        # hewei288 produced a very high angular score at y=114 while the proven
+        # upper butterfly was at y=568.  It had no narrow-strip endpoint
+        # support and was 454 px away vertically.  Keep a generous 20%-image
+        # band around any already proven upper mark.  In a strongly tilted
+        # frame the physical lower endpoint of the left strip can still lie in
+        # the upper image half while being about 0.24H below the right endpoint
+        # (hewei305).  The former 0.20H limit created a blind band between the
+        # upper and lower isolated-X searches.
+        if not known_upper_y:
+            return True
+        return abs(float(y) - float(np.median(known_upper_y))) <= 0.28 * h
     if len(known_upper_sides) >= 2:
         return []
     seeds = []
@@ -3319,17 +4695,36 @@ def _detect_isolated_complete_butterflies(candidate_pts, img_gray,
         if not (0.18 * w <= p[0] <= 0.92 * w and
                 0.04 * h <= p[1] <= 0.58 * h):
             continue
+        if not plausible_upper_height(p[1]):
+            continue
         if (_is_broad_board_lattice_extension(p, existing_boards) or
-                _is_near_broad_board_image_region(p, existing_boards)):
+                _is_near_broad_board_image_region(
+                    p, existing_boards, margin_scale=4.0, margin_cap=75.0,
+                    min_margin=75.0)):
+            continue
+        if _is_on_long_straight_response_chain(p, available_points):
             continue
         appearance = max(_butterfly_contrast_score(
             img_gray, p[0], p[1], radius) for radius in (14.0, 18.0, 22.0, 26.0))
         if appearance < 0.80:
             continue
+        seed_stability, seed_peak = _butterfly_multiscale_stability(
+            img_gray, float(p[0]), float(p[1]))
         bg_r = 30
         patch = img_gray[max(0, int(p[1]) - bg_r):min(h, int(p[1]) + bg_r + 1),
                          max(0, int(p[0]) - bg_r):min(w, int(p[0]) + bg_r + 1)]
-        if patch.size < 25 or float(np.percentile(patch, 75)) < image_median:
+        # A complete left marker can lie under the foot's cast shadow.  Its
+        # local bright percentile is then below the global image median even
+        # though the centre has exceptionally stable two-lobe evidence
+        # (hewei308 lower-left marker).  Admit only this strong, middle-height
+        # complete-marker case; ordinary dark foot texture still fails the
+        # multi-scale requirements.
+        strong_shadow_complete = (
+            0.38 * h <= float(p[1]) <= 0.50 * h and
+            seed_stability >= 0.80 and seed_peak >= 0.90)
+        if (patch.size < 25 or
+                (float(np.percentile(patch, 75)) < image_median and
+                 not strong_shadow_complete)):
             continue
         seeds.append((appearance, p))
 
@@ -3376,15 +4771,27 @@ def _detect_isolated_complete_butterflies(candidate_pts, img_gray,
             # Strong perspective can move the physical right endpoint close
             # to the image centre (hewei259 small upper-right butterfly).
             x_start, x_stop = int(0.46 * w), int(0.91 * w)
-        y_start, y_stop = int(0.10 * h), int(0.42 * h)
+        # Extend only to the image midline.  Complete butterflies in
+        # hewei305/hewei306 can fall at y≈0.44H; the lower fallback starts at
+        # 0.54H and also requires a surviving corner seed, so the old 0.42H
+        # stop skipped an otherwise strong, fully visible two-lobe centre.
+        y_start, y_stop = int(0.10 * h), int(0.50 * h)
         coarse_candidates = []
         for cy in range(y_start, y_stop + 1, 8):
             for cx in range(x_start, x_stop + 1, 8):
-                if any(x0 <= cx <= x1 and y0 <= cy <= y1
-                       for x0, x1, y0, y1 in broad_boxes):
+                if (any(x0 <= cx <= x1 and y0 <= cy <= y1
+                        for x0, x1, y0, y1 in broad_boxes) or
+                        _is_near_broad_board_image_region(
+                            np.array([cx, cy]), existing_boards,
+                            margin_scale=4.0, margin_cap=75.0,
+                            min_margin=75.0)):
                     continue
+                # A partly covered small butterfly can retain its strongest
+                # evidence at 8--12 px even when the large-radius response is
+                # below the complete-marker threshold (hewei266).
                 score = max(_butterfly_contrast_score(
-                    img_gray, cx, cy, radius) for radius in (18.0, 24.0))
+                    img_gray, cx, cy, radius)
+                    for radius in (8.0, 12.0, 18.0, 24.0))
                 if score >= 0.75:
                     coarse_candidates.append(
                         (score, np.array([float(cx), float(cy)])))
@@ -3400,37 +4807,60 @@ def _detect_isolated_complete_butterflies(candidate_pts, img_gray,
                                     for old in coarse_kept) < 24.0):
                 continue
             coarse_kept.append((score, point))
-            if len(coarse_kept) >= 8:
+            # The extended middle-height band contains several strong checker
+            # and foot-edge peaks.  Keeping only eight spatial maxima let all
+            # of them outrank the genuine shadowed butterfly in hewei305 before
+            # the authoritative complete-lobe refinement was reached.
+            if len(coarse_kept) >= 24:
                 break
 
         for coarse_score, coarse in coarse_kept:
-            best_score, best_point = float(coarse_score), coarse.copy()
+            best_stability, best_peak = _butterfly_multiscale_stability(
+                img_gray, coarse[0], coarse[1])
+            best_quality = best_stability + 0.15 * min(best_peak, 1.2)
+            best_point = coarse.copy()
             for cy in np.arange(coarse[1] - 8.0, coarse[1] + 8.1, 2.0):
                 for cx in np.arange(coarse[0] - 8.0, coarse[0] + 8.1, 2.0):
-                    score = max(_butterfly_contrast_score(
-                        img_gray, cx, cy, radius)
-                        for radius in (14.0, 18.0, 22.0, 26.0))
-                    if score > best_score:
-                        best_score = score
+                    stability, peak = _butterfly_multiscale_stability(
+                        img_gray, cx, cy)
+                    quality = stability + 0.15 * min(peak, 1.2)
+                    if quality > best_quality:
+                        best_quality = quality
+                        best_stability = stability
+                        best_peak = peak
                         best_point = np.array([float(cx), float(cy)])
-            if best_score < 0.95:
+            if best_stability < 0.58 or best_peak < 0.82:
+                continue
+            if not plausible_upper_height(best_point[1]):
                 continue
             if (_is_broad_board_lattice_extension(
                     best_point, existing_boards) or
                     _is_near_broad_board_image_region(
-                        best_point, existing_boards)):
+                        best_point, existing_boards,
+                        margin_scale=4.0, margin_cap=75.0,
+                        min_margin=75.0)):
+                continue
+            if _is_on_long_straight_response_chain(
+                    best_point, available_points):
                 continue
             bg_r = 30
             bx, by = best_point
             bg_patch = img_gray[
                 max(0, int(by) - bg_r):min(h, int(by) + bg_r + 1),
                 max(0, int(bx) - bg_r):min(w, int(bx) + bg_r + 1)]
-            # The central-left substrate can be slightly darker than the
-            # global median under the foot's cast shadow (hewei203).  A very
-            # strong score may proceed to the stricter complete-lobe test.
+            # The central-left substrate can be much darker than the global
+            # median under the foot's cast shadow.  A fully visible butterfly
+            # in hewei305 has stability≈0.85 and peak≈0.93 but was rejected
+            # here solely because its local p75 is about 123 versus a global
+            # median near 169.  Admit only strong, multi-scale-stable candidates
+            # in the newly covered middle-height band; they still must pass the
+            # complete two-lobe centring and final false-positive filters below.
+            strong_shadow_complete = (
+                0.38 * h <= by <= 0.50 * h and
+                best_stability >= 0.80 and best_peak >= 0.90)
             if (bg_patch.size < 25 or
-                    (float(np.percentile(bg_patch, 75)) < image_median and
-                     best_score < 1.10)):
+                 (float(np.percentile(bg_patch, 75)) < image_median and
+                       best_peak < 1.10 and not strong_shadow_complete)):
                 continue
             raw_type = 1 if side == 0 else 2
             trial = _refine_x_marks_multiscale(
@@ -3438,18 +4868,52 @@ def _detect_isolated_complete_butterflies(candidate_pts, img_gray,
                 min_center_score=0.50)
             if not trial:
                 continue
+            # Do the common grid-distance/two-lobe rejection before accepting
+            # this side and breaking the search.  Previously a checker point
+            # near the board at (586,678) passed the coarse search, triggered
+            # the break, and was rejected only later, so the genuine shadowed
+            # butterfly farther down the same side was never examined.
+            if existing_boards:
+                direct_support = np.vstack([
+                    np.asarray(board[0], dtype=float)
+                    for board in existing_boards if len(board[0])
+                ])
+            else:
+                direct_support = points
+            trial = _filter_false_positive_x_corners(
+                trial, direct_support, img_gray, min_dist_ratio=0.35)
+            if not trial:
+                continue
             centred = np.asarray(trial[0][1:3], dtype=float)
+            trial_center_score = _butterfly_contrast_score(
+                img_gray, centred[0], centred[1], 18.0)
+            partial_trial = (best_stability < 0.74 and
+                             trial_center_score < 0.75)
+            if partial_trial:
+                # Moderate partial evidence must either expose the geometric
+                # cusp (one lobe + occluder) or be at least as stable as the
+                # known hewei264 marker.  This rejects foot texture such as
+                # hewei278 while retaining hewei266 and hewei264.
+                tip_center = _refine_partial_butterfly_tip_center(
+                    img_gray, centred[0], centred[1])
+                if tip_center is None and best_stability < 0.66:
+                    continue
             if (_is_broad_board_lattice_extension(
                     centred, existing_boards) or
                     _is_near_broad_board_image_region(
-                        centred, existing_boards)):
+                        centred, existing_boards,
+                        margin_scale=4.0, margin_cap=75.0,
+                        min_margin=75.0)):
+                continue
+            if _is_on_long_straight_response_chain(
+                    centred, available_points):
                 continue
             # Give the proven centre priority over nearby unrefined saddle
             # seeds during the common NMS below.
-            seeds.append((10.0 + best_score, centred))
+            seeds.append((10.0 + best_stability, centred))
             print(f"  [完整蝴蝶直接搜索] 候选=({bx:.1f},{by:.1f}) -> "
                   f"中心=({centred[0]:.1f},{centred[1]:.1f}), "
-                  f"外观分={best_score:.3f}")
+                  f"稳定分={best_stability:.3f}, 峰值={best_peak:.3f}")
             break
     if not seeds:
         return []
@@ -3473,13 +4937,32 @@ def _detect_isolated_complete_butterflies(candidate_pts, img_gray,
         raw.append([ctype, float(p[0]), float(p[1])])
     refined = _refine_x_marks_multiscale(
         raw, support_img, img_gray, min_center_score=0.50)
+    # The common second refinement can move an already recovered partial-tip
+    # centre back into the visible lobe.  Reapply the cusp geometry once, just
+    # before final filtering, for moderate-stability upper candidates only.
+    tip_adjusted = []
+    for rec in refined:
+        stability, peak = _butterfly_multiscale_stability(
+            img_gray, float(rec[1]), float(rec[2]))
+        if (float(rec[2]) <= 0.30 * h and 0.45 <= stability < 0.74 and
+                peak >= 0.65):
+            tip_center = _refine_partial_butterfly_tip_center(
+                img_gray, float(rec[1]), float(rec[2]))
+            if tip_center is not None:
+                print(f"  [X遮挡尖端复核] ({rec[1]:.1f},{rec[2]:.1f}) -> "
+                      f"({tip_center[0]:.1f},{tip_center[1]:.1f})")
+                rec = [int(rec[0]), float(tip_center[0]), float(tip_center[1])]
+        tip_adjusted.append(rec)
+    refined = tip_adjusted
     refined = _filter_false_positive_x_corners(
         refined, support_img, img_gray, min_dist_ratio=0.35)
     clean_refined = []
     for rec in refined:
         p = np.asarray(rec[1:3], dtype=float)
         if (_is_broad_board_lattice_extension(p, existing_boards) or
-                _is_near_broad_board_image_region(p, existing_boards)):
+                _is_near_broad_board_image_region(
+                    p, existing_boards, margin_scale=4.0, margin_cap=75.0,
+                    min_margin=75.0)):
             print(f"  [X宽棋盘排除] 位置=({p[0]:.1f},{p[1]:.1f})")
             continue
         clean_refined.append(rec)
@@ -3493,7 +4976,9 @@ def _detect_isolated_complete_butterflies(candidate_pts, img_gray,
     for rec in refined:
         stability, peak = _butterfly_multiscale_stability(
             img_gray, float(rec[1]), float(rec[2]))
-        if stability < 0.74:
+        partial_upper = (float(rec[2]) <= 0.30 * h and
+                         stability >= 0.45 and peak >= 0.65)
+        if stability < 0.74 and not partial_upper:
             print(f"  [X棋格排除] 位置=({rec[1]:.1f},{rec[2]:.1f}), "
                   f"多尺度中位分={stability:.3f}, 峰值={peak:.3f}")
             continue
@@ -3525,24 +5010,413 @@ def _detect_isolated_complete_butterflies(candidate_pts, img_gray,
     return recovered
 
 
-def _normalize_physical_x_corner_types(records, img_shape):
-    """Map detected image positions to the target's physical corner numbers.
+def _is_on_long_straight_response_chain(point, candidate_pts,
+                                        max_radius=430.0, line_tolerance=4.5):
+    """Return True for a candidate lying on a long floor/board seam.
 
-    The physical definition used by this target is clockwise when viewed in
-    the normalized image: upper-left=4, upper-right=3, lower-left=1 and
-    lower-right=2.  Individual legacy detectors use different local numbering
-    conventions, so their raw type must not be used directly for display or
-    downstream results.
+    A printed butterfly is compact.  Floor seams instead generate many
+    refined corner responses along one straight line over hundreds of pixels.
+    Testing the still-unassigned response pool removes those sharp but
+    non-compact lower-X candidates without rejecting checkerboard-owned rows.
     """
-    h, w = img_shape[:2]
+    p = np.asarray(point, dtype=float)
+    pts = np.asarray(candidate_pts, dtype=float)
+    if len(pts) < 6:
+        return False
+    delta = pts - p
+    distance = np.linalg.norm(delta, axis=1)
+    neighbour_ids = np.where((distance >= 12.0) &
+                             (distance <= max_radius))[0]
+    if len(neighbour_ids) < 5:
+        return False
+    # Nearby directions are sufficient; testing every distant response would
+    # be unnecessarily expensive in low-clarity frames.
+    neighbour_ids = neighbour_ids[np.argsort(distance[neighbour_ids])[:36]]
+    for idx in neighbour_ids:
+        direction = delta[int(idx)] / max(distance[int(idx)], 1e-9)
+        along = delta @ direction
+        cross = np.abs(direction[0] * delta[:, 1] -
+                       direction[1] * delta[:, 0])
+        support = ((distance >= 8.0) & (distance <= max_radius) &
+                   (cross <= line_tolerance))
+        if np.sum(support) < 6:
+            continue
+        supported_along = along[support]
+        if float(np.ptp(supported_along)) >= 150.0:
+            return True
+    return False
+
+
+def _is_in_dense_unassigned_corner_cluster(point, candidate_pts,
+                                             radius=55.0,
+                                             min_neighbours=7):
+    """Reject an X candidate embedded in an unassigned checker response cloud.
+
+    A genuine butterfly centre is locally isolated once accepted board points
+    are removed.  If a distant/partly occluded broad checkerboard was not
+    established as a board, however, one of its intersections can mimic the
+    angular two-lobe score and become a lower X (hewei306).  The surrounding
+    2-D cluster of many real corner responses is decisive evidence that the
+    point belongs to checker texture rather than a butterfly marker.
+    """
+    p = np.asarray(point, dtype=float)
+    pts = np.asarray(candidate_pts, dtype=float)
+    if len(pts) < min_neighbours + 1:
+        return False
+    distance = np.linalg.norm(pts - p, axis=1)
+    local = pts[(distance >= 8.0) & (distance <= radius)]
+    if len(local) < min_neighbours:
+        return False
+    centered = local - np.mean(local, axis=0)
+    singular = np.linalg.svd(centered, compute_uv=False)
+    # A floor seam is handled by _is_on_long_straight_response_chain.  Here
+    # require genuine 2-D spread, characteristic of several checker rows and
+    # columns, so a few responses on one printed lobe are not over-rejected.
+    if len(singular) < 2 or singular[1] < 8.0:
+        return False
+    return bool(singular[0] / max(singular[1], 1e-9) <= 6.0)
+
+
+def _detect_isolated_complete_lower_butterflies(candidate_pts, img_gray,
+                                                  existing_boards,
+                                                  existing_marks):
+    """Recover independently visible lower butterflies below narrow strips.
+
+    The upper isolated fallback intentionally searches only the upper half.
+    When the foot hides the lower rows of a second narrow strip, its lower
+    butterfly can nevertheless remain fully visible and produce a genuine
+    refined corner response (hewei297).  Admit such a point only when a narrow
+    strip is established, it lies in the lower endpoint corridor, and its
+    two-lobe score is stable over many radii.  No inferred point is created.
+    """
+    if len(candidate_pts) == 0:
+        return []
+    points = np.asarray(candidate_pts, dtype=float)
+    h, w = img_gray.shape
+
+    narrow_boards = []
+    for board in existing_boards:
+        board_img = np.asarray(board[0], dtype=float)
+        board_world = np.asarray(board[1], dtype=float)
+        if len(board_img) < 4 or len(board_world) != len(board_img):
+            continue
+        grid = np.round(board_world / 15.0).astype(int)
+        counts = (len(np.unique(grid[:, 0])),
+                  len(np.unique(grid[:, 1])))
+        if min(counts) <= 2 and max(counts) >= 4:
+            narrow_boards.append(board)
+    if not narrow_boards:
+        return []
+
+    narrow_img = np.vstack([
+        np.asarray(board[0], dtype=float) for board in narrow_boards
+    ])
+    spacing = _estimate_grid_spacing(narrow_img)
+    x_margin = max(120.0, 4.0 * spacing)
+    x_min = float(np.min(narrow_img[:, 0]) - x_margin)
+    x_max = float(np.max(narrow_img[:, 0]) + x_margin)
+    y_min = max(0.54 * h, float(np.max(narrow_img[:, 1]) + 0.25 * spacing))
+    y_max = 0.86 * h
+    available = _available_strip_points_mask(
+        points, existing_boards, margin=14.0)
+    available_points = points[np.where(available)[0]]
+
+    known_lower = [
+        np.asarray(mark[1:3], dtype=float) for mark in existing_marks
+        if float(mark[2]) >= 0.50 * h
+    ]
+    if len(known_lower) >= 2:
+        return []
+
+    ranked = []
+    for idx in np.where(available)[0]:
+        p = points[int(idx)]
+        if not (max(0.05 * w, x_min) <= p[0] <= min(0.92 * w, x_max) and
+                y_min <= p[1] <= y_max):
+            continue
+        if (_is_broad_board_lattice_extension(p, existing_boards) or
+                _is_near_broad_board_image_region(
+                    p, existing_boards, margin_scale=4.0, margin_cap=75.0,
+                    min_margin=75.0)):
+            continue
+        if _is_on_long_straight_response_chain(p, available_points):
+            continue
+        if _is_in_dense_unassigned_corner_cluster(p, available_points):
+            print(f"  [X密集棋格排除] 候选=({p[0]:.1f},{p[1]:.1f})")
+            continue
+        stability, peak = _butterfly_multiscale_stability(
+            img_gray, float(p[0]), float(p[1]))
+        # Partly covered lower butterflies in hewei298 have a weaker seed than
+        # the fully visible hewei297 mark.  Let strict complete-centre
+        # refinement and the long-seam exclusion carry more of the decision.
+        if stability < 0.62 or peak < 0.78:
+            continue
+        trial = _refine_x_marks_multiscale(
+            [[1, float(p[0]), float(p[1])]], narrow_img, img_gray,
+            min_center_score=0.50)
+        if not trial:
+            continue
+        trial = _filter_false_positive_x_corners(
+            trial, narrow_img, img_gray, min_dist_ratio=0.35)
+        if not trial:
+            continue
+        centred = np.asarray(trial[0][1:3], dtype=float)
+        if not (max(0.05 * w, x_min) <= centred[0] <= min(0.92 * w, x_max) and
+                y_min <= centred[1] <= y_max):
+            continue
+        centred_stability, centred_peak = _butterfly_multiscale_stability(
+            img_gray, float(centred[0]), float(centred[1]))
+        if _is_in_dense_unassigned_corner_cluster(
+                centred, available_points):
+            print(f"  [X密集棋格排除] 中心=({centred[0]:.1f},"
+                  f"{centred[1]:.1f})")
+            continue
+        shift = float(np.linalg.norm(centred - p))
+        complete_multiscale = (centred_stability >= 0.74 and
+                               centred_peak >= 0.88)
+        # A single very sharp checker/floor edge can have an exceptional peak
+        # at one radius while its median multi-scale evidence stays poor
+        # (hewei304's false point at about (575,1105)).  Lower X points must be
+        # complete and stable; partially visible/occluded marks are not drawn.
+        if not complete_multiscale:
+            continue
+        quality = (centred_stability +
+                   0.15 * min(centred_peak, 1.2) - 0.002 * shift)
+        was_component_centred = shift >= 0.50
+        ranked.append((was_component_centred, quality,
+                       centred_stability, centred_peak, centred))
+
+    kept = []
+    for component_centred, quality, stability, peak, point in sorted(
+            ranked, key=lambda item: (item[0], item[1]), reverse=True):
+        if known_lower and min(np.linalg.norm(point - old)
+                               for old in known_lower) < 55.0:
+            continue
+        if kept and min(np.linalg.norm(point - old[4])
+                        for old in kept) < 55.0:
+            continue
+        kept.append((component_centred, quality, stability, peak, point))
+        if len(kept) >= max(0, 2 - len(known_lower)):
+            break
+
+    if not kept:
+        return []
+    all_lower_x = [float(p[0]) for p in known_lower] + [
+        float(item[4][0]) for item in kept
+    ]
+    split_x = float(np.median(all_lower_x)) if len(all_lower_x) >= 2 else 0.5 * w
+    recovered = []
+    for _, _, stability, peak, point in kept:
+        mark_type = 1 if point[0] <= split_x else 2
+        recovered.append([mark_type, float(point[0]), float(point[1])])
+        print(f"  [下端完整蝴蝶回退] type={mark_type}, "
+              f"位置=({point[0]:.1f},{point[1]:.1f}), "
+              f"稳定分={stability:.3f}, 峰值={peak:.3f}")
+    return recovered
+
+
+def _mean_gray_disk(img_gray, point, radius):
+    """Mean grey level in a small circular probe around ``point``."""
+    h, w = img_gray.shape
+    cx, cy = float(point[0]), float(point[1])
+    radius = max(1.5, float(radius))
+    x0 = max(0, int(np.floor(cx - radius)))
+    x1 = min(w, int(np.ceil(cx + radius)) + 1)
+    y0 = max(0, int(np.floor(cy - radius)))
+    y1 = min(h, int(np.ceil(cy + radius)) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return np.nan
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius ** 2
+    if not np.any(mask):
+        return np.nan
+    return float(np.mean(np.asarray(img_gray[y0:y1, x0:x1], dtype=float)[mask]))
+
+
+def _classify_x_corner_by_board_tone(record, board_img_pts, img_gray):
+    """Classify one butterfly mark using the 4-29 S1--S4 tone convention.
+
+    The direction from the mark to the nearest end of its two-column board is
+    used as ``u``.  Four opposite probe axes reproduce the old grey relation:
+
+      S1: perpendicular to the board direction
+      S2: mark-to-board direction
+      S3/S4: the two diagonals pointing towards the board
+
+    The darker straight pair selects type 3/4 (S1<S2 -> 3, otherwise 4);
+    the darker diagonal pair selects type 1/2 (S3<S4 -> 2, otherwise 1).
+    Thus, in particular, type 3 is white towards the board and type 4 is black
+    towards the board.  Smaller S means darker, as in the 4-29 implementation.
+    """
+    raw_type = int(record[0]) if len(record) >= 1 else 0
+    point = np.asarray(record[1:3], dtype=float)
+    board = np.asarray(board_img_pts, dtype=float)
+    if (len(board) < 2 or not np.all(np.isfinite(point)) or
+            board.ndim != 2 or board.shape[1] < 2):
+        return raw_type, None
+    board = board[:, :2]
+    board = board[np.all(np.isfinite(board), axis=1)]
+    if len(board) < 2:
+        return raw_type, None
+
+    spacing = _estimate_grid_spacing(board)
+    distances = np.linalg.norm(board - point, axis=1)
+    order = np.argsort(distances)
+    nearest_distance = float(distances[order[0]])
+    # The closest two points normally form the end row of a two-column strip.
+    # Include similarly close points but not the following rows deep in the
+    # board, so the direction points to the endpoint centre rather than one
+    # checker corner.
+    support_idx = order[distances[order] <= nearest_distance + 0.72 * spacing]
+    support_idx = support_idx[:4]
+    if len(support_idx) < 2:
+        support_idx = order[:min(2, len(order))]
+    endpoint = np.mean(board[support_idx], axis=0)
+    toward_direct = endpoint - point
+    toward_norm = float(np.linalg.norm(toward_direct))
+    if toward_norm < 1e-6:
+        return raw_type, None
+    u_direct = toward_direct / toward_norm
+
+    # If this mark belongs to a parallel strip that is itself hidden, the
+    # nearest proven strip may sit far to one side.  Pointing directly to that
+    # other strip rotates S1--S4 and can turn a vertical type-4 butterfly into
+    # a diagonal type 1/2.  Use the proven strip's longitudinal PCA axis when
+    # the direct endpoint vector differs markedly from the strip direction.
+    centered_board = board - np.mean(board, axis=0)
+    try:
+        _, _, vh = np.linalg.svd(centered_board, full_matrices=False)
+        long_axis = np.asarray(vh[0], dtype=float)
+    except np.linalg.LinAlgError:
+        long_axis = u_direct.copy()
+    if np.dot(long_axis, np.mean(board, axis=0) - point) < 0:
+        long_axis = -long_axis
+    long_norm = float(np.linalg.norm(long_axis))
+    if long_norm > 1e-6:
+        long_axis /= long_norm
+    else:
+        long_axis = u_direct.copy()
+    axis_alignment = abs(float(np.dot(u_direct, long_axis)))
+    u = long_axis if axis_alignment < 0.88 else u_direct
+    # This perpendicular convention matches numm1/S1 in the 4-29 code.  For
+    # an upward board direction it points to the image-left side.
+    v = np.array([u[1], -u[0]], dtype=float)
+    diag3 = (u + v) / np.sqrt(2.0)
+    diag4 = (u - v) / np.sqrt(2.0)
+    axes = (v, u, diag3, diag4)
+
+    # Marker size is not reliably proportional to the nearest-node distance:
+    # recovered/sparse boards can make the latter much too small.  At 6 px a
+    # wide black half-disc darkens both its true axis and the adjacent diagonal
+    # (hewei305/hewei308), making type 4 look like type 1/2.  Evaluate several
+    # radii and retain the one with the clearest four-axis separation.
+    max_probe_distance = float(np.clip(0.80 * spacing, 20.0, 32.0))
+    distance_candidates = np.unique(np.clip(np.concatenate([
+        np.array([6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 28.0]),
+        spacing * np.array([0.22, 0.35, 0.50, 0.65, 0.78]),
+    ]), 6.0, max_probe_distance))
+    best_probe = None
+    for candidate_distance in distance_candidates:
+        probe_radius = float(np.clip(0.18 * candidate_distance, 2.0, 6.0))
+        candidate_tones = []
+        for axis in axes:
+            samples = []
+            # A genuine butterfly contains two opposite black half-discs.
+            # Average both sides and a narrow radial band to resist blur and
+            # a one-pixel centre error without mixing adjacent sectors.
+            for factor in (0.88, 1.0, 1.12):
+                delta = factor * candidate_distance * axis
+                for sign in (-1.0, 1.0):
+                    value = _mean_gray_disk(
+                        img_gray, point + sign * delta, probe_radius)
+                    if np.isfinite(value):
+                        samples.append(value)
+            candidate_tones.append(
+                float(np.median(samples)) if samples else np.nan)
+        candidate_tones = np.asarray(candidate_tones, dtype=float)
+        if not np.all(np.isfinite(candidate_tones)):
+            continue
+        separation = float(np.max(candidate_tones) -
+                           np.min(candidate_tones))
+        if best_probe is None or separation > best_probe[0]:
+            best_probe = (separation, float(candidate_distance),
+                          candidate_tones)
+    if best_probe is None:
+        return raw_type, None
+    _, probe_distance, tones = best_probe
+
+    if not np.all(np.isfinite(tones)):
+        return raw_type, None
+    S1, S2, S3, S4 = tones
+    straight_dark = min(S1, S2)
+    diagonal_dark = min(S3, S4)
+    if diagonal_dark < straight_dark:
+        mark_type = 2 if S3 < S4 else 1
+        within_pair_gap = abs(S3 - S4)
+    else:
+        mark_type = 3 if S1 < S2 else 4
+        within_pair_gap = abs(S1 - S2)
+
+    y0 = max(0, int(round(point[1])) - int(max(12, probe_distance * 1.6)))
+    y1 = min(img_gray.shape[0], int(round(point[1])) + int(max(12, probe_distance * 1.6)) + 1)
+    x0 = max(0, int(round(point[0])) - int(max(12, probe_distance * 1.6)))
+    x1 = min(img_gray.shape[1], int(round(point[0])) + int(max(12, probe_distance * 1.6)) + 1)
+    local = np.asarray(img_gray[y0:y1, x0:x1], dtype=float)
+    local_span = float(np.percentile(local, 90) - np.percentile(local, 10)) \
+        if local.size else 0.0
+    pair_gap = abs(straight_dark - diagonal_dark)
+    confidence = min(pair_gap, within_pair_gap) / max(local_span, 1e-6)
+
+    # When the black/white sectors are inseparable (strong blur or clipping),
+    # do not replace a valid 4-29 raw decision with numerical noise.  Fallback
+    # detections still receive the tone result because their old number was
+    # only an image-quadrant placeholder.
+    if confidence < 0.025 and raw_type in (1, 2, 3, 4):
+        mark_type = raw_type
+    details = {
+        'S1': S1, 'S2': S2, 'S3': S3, 'S4': S4,
+        'confidence': confidence, 'spacing': spacing,
+        'probe_distance': probe_distance,
+    }
+    return int(mark_type), details
+
+
+def _normalize_physical_x_corner_types(records, img_shape, img_gray=None,
+                                        board_sets=None):
+    """Unify X numbers by marker/board black-white relation, not image slots.
+
+    ``board_sets`` contains one or more detected two-column board point sets.
+    Each mark is associated with the nearest board and classified with the
+    4-29 S1--S4 rule.  If no board support is available, preserve the detector's
+    raw number instead of inventing a number from the image quadrant.
+    """
+    del img_shape  # retained in the signature for compatibility with callers
     normalized = []
+    valid_boards = []
+    for board in board_sets or []:
+        pts = np.asarray(board, dtype=float)
+        if pts.ndim == 2 and pts.shape[1] >= 2 and len(pts) >= 2:
+            valid_boards.append(pts[:, :2])
+
     for rec in records:
+        raw_type = int(rec[0])
         cx, cy = float(rec[1]), float(rec[2])
-        if cy < 0.5 * h:
-            mark_type = 4 if cx < 0.5 * w else 3
-        else:
-            mark_type = 1 if cx < 0.5 * w else 2
-        normalized.append([mark_type, cx, cy])
+        mark_type = raw_type
+        details = None
+        if img_gray is not None and valid_boards:
+            point = np.array([cx, cy], dtype=float)
+            board = min(
+                valid_boards,
+                key=lambda pts: float(np.min(np.linalg.norm(pts - point, axis=1))))
+            mark_type, details = _classify_x_corner_by_board_tone(
+                [raw_type, cx, cy], board, img_gray)
+        normalized.append([int(mark_type), cx, cy])
+        if details is not None:
+            print(f"  [X黑白判号] ({cx:.1f},{cy:.1f}) raw={raw_type} -> "
+                  f"type={int(mark_type)}, S1={details['S1']:.1f}, "
+                  f"S2={details['S2']:.1f}, S3={details['S3']:.1f}, "
+                  f"S4={details['S4']:.1f}, d={details['probe_distance']:.1f}, "
+                  f"conf={details['confidence']:.3f}")
     return normalized
 
 
@@ -3561,6 +5435,61 @@ def validate_chessboard_grid_alignment(world_pts, max_deviation=1.5):
     if len(ux) < 2 or len(uy) < 2:
         return False, median_dev
     return True, median_dev
+
+
+def _compact_small_board_rescue_quality(img_pts, world_pts):
+    """Score a dense 3x3-ish seed whose lines contain fewer than four points.
+
+    ``chessboard_line_residual_summary`` deliberately evaluates only grid
+    lines with at least four samples.  Consequently a geometrically excellent
+    3x3-minus-one seed receives the sentinel residual and quality zero.  In a
+    very blurred frame this can be the only seed for the distant right board
+    (hewei305).  Reprojection, fill, 2-D span and axis separation provide the
+    missing proof without relaxing normal large-board scoring.
+    """
+    img_pts = np.asarray(img_pts, dtype=float)
+    world_pts = np.asarray(world_pts, dtype=float)
+    if len(img_pts) < 7 or len(img_pts) > 20 or len(world_pts) != len(img_pts):
+        return 0.0
+    grid = np.round(world_pts / 15.0).astype(int)
+    counts = (len(np.unique(grid[:, 0])), len(np.unique(grid[:, 1])))
+    if min(counts) < 3 or max(counts) > 5:
+        return 0.0
+    fill_ratio = len(img_pts) / max(1, counts[0] * counts[1])
+    if fill_ratio < 0.65:
+        return 0.0
+    H = compute_homography(world_pts, img_pts)
+    if H is None or not _homography_has_grid_scale(H, world_pts):
+        return 0.0
+    errors, mean_error = compute_reprojection_error(H, world_pts, img_pts)
+    if (not np.isfinite(mean_error) or mean_error > 2.2 or
+            float(np.percentile(errors, 90)) > 3.2):
+        return 0.0
+    centered = img_pts - np.mean(img_pts, axis=0)
+    singular = np.linalg.svd(centered, compute_uv=False)
+    if (len(singular) < 2 or singular[1] < 12.0 or
+            singular[0] / max(singular[1], 1e-9) > 5.0):
+        return 0.0
+    center_world = np.median(world_pts, axis=0)
+    probes = np.asarray([
+        center_world,
+        center_world + [15.0, 0.0],
+        center_world + [0.0, 15.0],
+    ], dtype=float)
+    projected = _project_world_points(H, probes)
+    if projected is None or not np.isfinite(projected).all():
+        return 0.0
+    axis_x = projected[1] - projected[0]
+    axis_y = projected[2] - projected[0]
+    denom = float(np.linalg.norm(axis_x) * np.linalg.norm(axis_y))
+    if denom <= 1e-9:
+        return 0.0
+    axis_angle = float(np.degrees(np.arccos(np.clip(
+        abs(float(np.dot(axis_x, axis_y))) / denom, 0.0, 1.0))))
+    if axis_angle < 22.0:
+        return 0.0
+    return float(len(img_pts) * (0.70 + 0.30 * fill_ratio) *
+                 np.exp(-0.5 * (mean_error / 2.2) ** 2))
 
 
 
@@ -3869,8 +5798,23 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     img_gray = imread_gray(img_path)
     img_gray = gaussian_filter(img_gray, sigma=0.5)
     blur_var = measure_blur_level(img_gray)
-    tau_nms = 0.015 if blur_var < 50 else 0.02
-    tau_score = 0.01 if blur_var < 50 else 0.015
+    # Very low-gradient frames (strong blur/occlusion) lose genuine saddle
+    # responses before board growing starts.  Lower the detector thresholds
+    # only for this narrow blur regime; normal images keep the established
+    # thresholds so clutter is not promoted globally.
+    if blur_var < 20:
+        # In the most blurred frames the broad checkerboard commonly retains
+        # only every second physical saddle row at 0.006.  Those omitted
+        # responses are still genuine refined corner candidates (typically
+        # 0.003--0.006), and the downstream homography/grid-consistency tests
+        # are considerably more selective than this first scalar score.  Keep
+        # the relaxation confined to this extreme-blur regime so ordinary
+        # images do not acquire extra clutter candidates.
+        tau_nms, tau_score = 0.010, 0.003
+    elif blur_var < 50:
+        tau_nms, tau_score = 0.015, 0.01
+    else:
+        tau_nms, tau_score = 0.02, 0.015
     print(f"  模糊度={blur_var:.1f}, NMS阈值={tau_nms}, 评分阈值={tau_score}")
     h, w = img_gray.shape
     nn = [h, w]
@@ -3921,6 +5865,44 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     final_v1 = dirs_array[:, 0]
     final_v2 = dirs_array[:, 1]
     final_v1, final_v2 = adjust_orientation_handedness(final_v1, final_v2)
+
+    # Keep a second, geometry-gated support pool for extremely blurred
+    # frames.  The ordinary ``final_points`` pool remains authoritative for
+    # seeding boards and detecting X marks; the weaker pool is used only after
+    # a board homography/topology has been established.  Thus every recovered
+    # display point still comes from an actual refined image response, while
+    # low-score clutter cannot independently create a board or an X mark.
+    board_candidate_points = final_points.copy()
+    narrow_recovery_points = board_candidate_points
+    if blur_var < 20:
+        support_keep = scores >= 0.001
+        support_dirs = np.stack(
+            [refined_v1[support_keep], refined_v2[support_keep]], axis=1)
+        board_candidate_points, _ = merge_close_points(
+            refined_p[support_keep], support_dirs, scores[support_keep],
+            dist_thresh=5.0, ratio=0.5)
+        print(f"  低清晰度棋盘几何候选池: {len(final_points)} -> "
+              f"{len(board_candidate_points)} 个真实响应")
+        # A proven narrow strip may still need responses below 0.001 to
+        # recover its weak second column.  Keep this deeper pool isolated from
+        # generic board seeding/completion; it is consumed only by the
+        # dense-column partner reconstruction below.
+        narrow_keep = scores >= 0.0003
+        narrow_dirs = np.stack(
+            [refined_v1[narrow_keep], refined_v2[narrow_keep]], axis=1)
+        narrow_recovery_points, _ = merge_close_points(
+            refined_p[narrow_keep], narrow_dirs, scores[narrow_keep],
+            dist_thresh=5.0, ratio=0.5)
+    elif blur_var < 30:
+        # Moderate blur (hewei308) keeps the strong pool at the established
+        # 0.01 threshold, but exposes 0.003--0.01 responses solely to an
+        # already accepted one-column geometry.
+        narrow_keep = scores >= 0.003
+        narrow_dirs = np.stack(
+            [refined_v1[narrow_keep], refined_v2[narrow_keep]], axis=1)
+        narrow_recovery_points, _ = merge_close_points(
+            refined_p[narrow_keep], narrow_dirs, scores[narrow_keep],
+            dist_thresh=5.0, ratio=0.5)
     print(f"鞍点检测耗时: {time.time() - t0:.2f} 秒")
     corner = {'v1': final_v1, 'v2': final_v2}
     xcsp = np.round(final_points[:, 0]).astype(int) * h + np.round(final_points[:, 1]).astype(int)
@@ -3983,7 +5965,13 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     scored_boards = []
     for img_pts, world_pts, H, used_idx in found_chessboards_raw:
         img_pts, world_pts, H = prepare_chessboard_candidate(
-            img_pts, world_pts, final_points, H)
+            img_pts, world_pts, board_candidate_points, H)
+        img_pts, world_pts, pruned_sparse = \
+            _prune_sparse_extra_strip_column(img_pts, world_pts)
+        if pruned_sparse:
+            H_candidate = compute_homography(world_pts, img_pts)
+            if H_candidate is not None:
+                H = H_candidate
         if len(img_pts) < 4:
             continue
         world_pts = world_pts - np.min(world_pts, axis=0)
@@ -3994,7 +5982,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         # (hewei185).  complete_chessboard_from_candidates matches only actual
         # saddle candidates, so no synthetic display point is introduced here.
         preview_img, preview_world, preview_H = complete_chessboard_from_candidates(
-            img_pts, world_pts, final_points, expand_margin=1)
+            img_pts, world_pts, board_candidate_points, expand_margin=1)
         preview_img, preview_world = _filter_points_inside_polygon(
             preview_img, preview_world, img_pts, expand_ratio=0.06)
         if len(preview_img) > len(img_pts):
@@ -4010,6 +5998,13 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         if not valid and len(img_pts) < 6:
             pass  # 小板宽容
         quality = calculate_chessboard_quality(img_pts, world_pts)
+        if quality < 0.5 and blur_var < 20:
+            rescue_quality = _compact_small_board_rescue_quality(
+                img_pts, world_pts)
+            if rescue_quality > 0.0:
+                quality = rescue_quality
+                print(f"  [低清晰度紧凑小棋盘救援] {len(img_pts)}点，"
+                      f"几何质量={quality:.2f}")
         p90_line, worst_line, bad_groups = chessboard_line_residual_summary(img_pts, world_pts)
         print(
             f"  候选棋盘: 点数 {len(img_pts)}, 线残差p90 {p90_line:.2f}, "
@@ -4111,6 +6106,21 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
             s_quality = 0.85 * len(s_img)
             final_two.append((s_img, s_world, s_H, s_used, s_quality))
             print(f"  [X引导单列回退] 已加入棋盘候选，质量={s_quality:.2f}")
+            if len(final_two) >= MAX_BOARDS:
+                break
+
+    # A broad checkerboard clipped to one top image row has no 2-D seed and
+    # cannot enter the normal homography growth.  Recover only a strong,
+    # regular boundary row; it is rendered as blue same-row adjacency.
+    if len(final_two) < MAX_BOARDS:
+        cropped_rows = detect_cropped_top_row_fallback(
+            points, final_two, img_gray.shape, point_scores=final_scores)
+        for s_img, s_world, s_H, s_used in cropped_rows:
+            # A single row has no 2-D homography, so its generic quality is
+            # undefined/NaN.  Its evidence is the regular real-response chain.
+            s_quality = 0.90 * len(s_img)
+            final_two.append((s_img, s_world, s_H, s_used, s_quality))
+            print(f"  [顶部裁切单行回退] 已加入棋盘候选，质量={s_quality:.2f}")
             if len(final_two) >= MAX_BOARDS:
                 break
 
@@ -4391,19 +6401,79 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
 
     cleaned_final_two = []
     for img_pts, world_pts, H, used_idx, qual in final_two:
+        # Extremely blurred narrow strips can retain only every second physical
+        # row in the strong pool (hewei307: an apparent 2x4 model although weak
+        # refined responses exist between those rows).  Re-run the skipped-axis
+        # test with the isolated deep response pool, but only for an already
+        # accepted two-column board.  The operation merely re-labels its scale;
+        # subsequent completion may add only measured image responses.
+        deep_skipped_axis = False
+        grid_before = np.round(np.asarray(world_pts, dtype=float) / 15.0).astype(int)
+        counts_before = [len(np.unique(grid_before[:, axis])) for axis in (0, 1)]
+        if (blur_var < 20 and min(counts_before) == 2 and
+                max(counts_before) >= 3):
+            adj_img, adj_world, adj_H = adjust_skipped_grid_axis(
+                img_pts, world_pts, narrow_recovery_points, min_inside=3,
+                min_seed_points=6)
+            grid_after = np.round(np.asarray(adj_world, dtype=float) / 15.0).astype(int)
+            counts_after = [len(np.unique(grid_after[:, axis])) for axis in (0, 1)]
+            span_before = np.ptp(grid_before, axis=0)
+            span_after = np.ptp(grid_after, axis=0)
+            if np.any(span_after > span_before):
+                img_pts, world_pts = adj_img, adj_world
+                if adj_H is not None:
+                    H = adj_H
+                deep_skipped_axis = True
+                print(f"  [低清晰度窄棋盘跳格恢复] {counts_before} -> "
+                      f"{counts_after}，仅启用真实弱响应补点")
+        # A two-column narrow model may contain one well-supported real column
+        # and only one or two outside clutter points labelled as its partner
+        # (hewei308).  Before generic completion, replace that false column
+        # only when at least four rows agree on actual weak image responses;
+        # otherwise remove the implausibly wide sparse column.  No interpolated
+        # coordinate is ever introduced.
+        sparse_partner_change = 0
+        has_deeper_narrow_pool = (
+            blur_var < 29.0 and
+            len(narrow_recovery_points) > len(board_candidate_points))
+        if has_deeper_narrow_pool:
+            img_pts, world_pts, sparse_partner_change = \
+                _recover_sparse_narrow_partner_column(
+                    img_pts, world_pts, narrow_recovery_points)
+        if sparse_partner_change:
+            H_candidate = compute_homography(world_pts, img_pts)
+            if H_candidate is not None:
+                H = H_candidate
+        img_pts, world_pts, pruned_sparse = \
+            _prune_sparse_extra_strip_column(img_pts, world_pts)
+        if pruned_sparse:
+            H_candidate = compute_homography(world_pts, img_pts)
+            if H_candidate is not None:
+                H = H_candidate
         orig_img = img_pts.copy()
         stable_H = H if _homography_has_grid_scale(H, world_pts) else None
 
         # 外扩 margin=4：单应投影外扩4格以捕获生长遗漏的边界/角落鞍点
+        completion_pool = (narrow_recovery_points if deep_skipped_axis
+                           else board_candidate_points)
         clean_img, clean_world, clean_H = complete_chessboard_from_candidates(
-            img_pts, world_pts, final_points, expand_margin=4)
+            img_pts, world_pts, completion_pool, expand_margin=4)
         if not _homography_has_grid_scale(clean_H, clean_world):
             clean_H = stable_H
         completed_img = clean_img.copy()
         completed_world = clean_world.copy()
-        # 仅小幅外扩：足够容纳亚像素误差，同时避免吸入相邻棋盘。
-        clean_img, clean_world = _filter_points_inside_polygon(
-            clean_img, clean_world, orig_img, expand_ratio=0.06)
+        preserve_small_seed_growth = _trustworthy_small_seed_expansion(
+            orig_img, world_pts, completed_img, completed_world, clean_H)
+        if preserve_small_seed_growth:
+            # Every point came from board_candidate_points and the expanded
+            # homography is independently tight.  Clipping back to the small
+            # seed hull would erase the recovered width of the right board.
+            print(f"  小种子真实网格扩展保留: {len(orig_img)} -> "
+                  f"{len(clean_img)} 个真实鞍点")
+        else:
+            # 仅小幅外扩：足够容纳亚像素误差，同时避免吸入相邻棋盘。
+            clean_img, clean_world = _filter_points_inside_polygon(
+                clean_img, clean_world, orig_img, expand_ratio=0.06)
         clean_img, clean_world, restored_end = _restore_complete_narrow_end_rows(
             clean_img, clean_world, completed_img, completed_world, world_pts)
         if restored_end > 0:
@@ -4412,30 +6482,43 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
                 clean_H = candidate_H
             print(f"  两列棋盘端行恢复: +{restored_end}个真实鞍点 -> {len(clean_img)}点")
 
-        before_fill = len(clean_img)
-        snapped = np.round(clean_world / 15.0).astype(int)
-        grid_cells = len(np.unique(snapped[:, 0])) * len(np.unique(snapped[:, 1]))
-        fill_ratio = len(clean_img) / max(1, grid_cells)
-        min_n = 0 if fill_ratio > 0.70 else 2
-        clean_img, clean_world = interpolate_missing_grid_points(clean_img, clean_world, min_neighbors=min_n)
+        clean_img, clean_world, restored_staggered = \
+            _restore_staggered_narrow_end_point(
+                clean_img, clean_world, completed_img, completed_world,
+                world_pts)
+        if restored_staggered:
+            candidate_H = compute_homography(clean_world, clean_img)
+            if _homography_has_grid_scale(candidate_H, clean_world):
+                clean_H = candidate_H
+            print(f"  两列棋盘交替单点端部恢复: +{restored_staggered}个真实鞍点 "
+                  f"-> {len(clean_img)}点")
 
-        if len(clean_img) != before_fill:
-            print(f"  网格插值填补: {before_fill} -> {len(clean_img)} 个交叉点")
+        clean_img, clean_world, restored_reference = \
+            _restore_narrow_reference_responses(
+                clean_img, clean_world, orig_img, world_pts)
+        if restored_reference:
+            print(f"  两列棋盘原始响应恢复: +{restored_reference}个真实鞍点 "
+                  f"-> {len(clean_img)}点")
             candidate_H = compute_homography(clean_world, clean_img)
             if _homography_has_grid_scale(candidate_H, clean_world):
                 clean_H = candidate_H
 
+        # Do not synthesize missing display saddles from the homography.  Every
+        # white cross and every red/blue edge endpoint must originate from an
+        # actual refined image response.  Consequently an occluded/missed cell
+        # stays absent and breaks adjacency instead of being interpolated.
+
         # ---- 鞍点吸附：将棋盘格附近的孤立鞍点附加进来 ----
         if clean_H is not None and len(clean_img) >= 4:
             tree_board = KDTree(clean_img)
-            dist_to_board, _ = tree_board.query(final_points, k=1)
+            dist_to_board, _ = tree_board.query(board_candidate_points, k=1)
             # 只在一个典型网格步长内吸附，避免跨到邻近棋盘。
             _, nn_idx = tree_board.query(clean_img, k=2)
             local_spacing = float(np.median(np.linalg.norm(
                 clean_img - clean_img[nn_idx[:, 1]], axis=1)))
             attach_radius = float(np.clip(0.80 * local_spacing, 8.0, 32.0))
             orphan_mask = (dist_to_board > 3.0) & (dist_to_board < attach_radius)
-            orphan_pts = final_points[orphan_mask]
+            orphan_pts = board_candidate_points[orphan_mask]
             if len(orphan_pts) > 0:
                 # 用单应投影验证：将孤立点投影到世界坐标，检查是否接近网格位置
                 ones = np.ones((len(orphan_pts), 1))
@@ -4475,12 +6558,36 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
 
         # ---- 近邻吸附：将棋盘格附近的孤立鞍点纳入 ----
         clean_img, clean_world, n_filled = fill_missing_saddles_by_proximity(
-            clean_img, clean_world, final_points)
+            clean_img, clean_world, board_candidate_points)
         if n_filled > 0:
             candidate_H = compute_homography(clean_world, clean_img)
             if _homography_has_grid_scale(candidate_H, clean_world):
                 clean_H = candidate_H
             print(f"  近邻吸附: +{n_filled}个鞍点 -> {len(clean_img)}点")
+
+        # Completion and the two attachment passes can independently snap two
+        # nearby image responses onto the same world cell (hewei305 row 7).
+        # Keeping both makes the displayed point set look like a diagonal
+        # misconnection even though the edge map uses only the first cell.
+        # Enforce one measured response per world node before X filtering and
+        # rendering; no coordinate is synthesized or moved.
+        before_unique = len(clean_img)
+        clean_img, clean_world = _unique_world_points(clean_img, clean_world)
+        duplicate_world_removed = before_unique - len(clean_img)
+        if duplicate_world_removed:
+            print(f"  [重复世界节点剔除] {duplicate_world_removed}个 -> "
+                  f"{len(clean_img)}点")
+            candidate_H = compute_homography(clean_world, clean_img)
+            if _homography_has_grid_scale(candidate_H, clean_world):
+                clean_H = candidate_H
+
+        clean_img, clean_world, isolated_removed = \
+            _prune_spatially_isolated_board_nodes(
+                clean_img, clean_world, img_gray=img_gray)
+        if isolated_removed:
+            candidate_H = compute_homography(clean_world, clean_img)
+            if _homography_has_grid_scale(candidate_H, clean_world):
+                clean_H = candidate_H
 
         cleaned_final_two.append((clean_img, clean_world, clean_H if clean_H is not None else H, used_idx, qual))
 
@@ -4490,7 +6597,7 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     # as a separate board and loses its red/blue neighbours.
     final_two = _merge_cleaned_broad_board_extensions(cleaned_final_two)
     final_two = _rebuild_broad_board_from_complete_image_rows(
-        final_two, final_points)
+        final_two, board_candidate_points)
     # 提取各棋盘格数据（支持任意数量）
     board_results = []  # [(xy, uv, jilu), ...]
     for (img_b, world_b, H_b, _, _) in final_two:
@@ -4498,7 +6605,13 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         world_n = world_b - np.min(world_b, axis=0)
         swapped_axes = False
         max_r = np.max(world_n, axis=0)
-        if max_r[0] > max_r[1]:
+        pre_grid = np.round(world_n / 15.0).astype(int)
+        pre_counts = [len(np.unique(pre_grid[:, axis])) for axis in (0, 1)]
+        image_span = np.ptp(np.asarray(img_b, dtype=float), axis=0)
+        keep_cropped_image_row = (
+            pre_counts[0] >= 3 and pre_counts[1] == 1 and
+            image_span[0] >= image_span[1])
+        if max_r[0] > max_r[1] and not keep_cropped_image_row:
             world_n = world_n[:, [1, 0]]
             world_n[:, 0] = 15.0 - world_n[:, 0]
             swapped_axes = True
@@ -4529,6 +6642,13 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
                 img_n, world_n, H_n, img_gray, normal_marks)
             fallback_marks = _refine_x_marks_multiscale(
                 fallback_marks, img_n, img_gray, min_center_score=0.50)
+            # Endpoint recovery's 1/2 value is only an image-position
+            # placeholder.  Mark it as tone-only so low-confidence handling
+            # cannot preserve that placeholder over the 4-29 S1--S4 result.
+            fallback_marks = [
+                [0, float(rec[1]), float(rec[2])]
+                for rec in fallback_marks
+            ]
 
             # One common post-condition for both sources: centre is outside
             # the saddle grid, on the board substrate, and has butterfly
@@ -4549,6 +6669,35 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
             print(f"  [X跳过] 当前棋盘为 {n_grid_columns} 列，仅两列棋盘允许检测X角点")
         board_results.append((xy_b, uv_b, jilu_b))
 
+    # A one-sided/two-column fallback can be grown from two columns that are
+    # actually part of the adjacent broad checkerboard.  Marks produced from
+    # such a board must be removed before they occupy the right-upper slot and
+    # suppress the real narrow-strip butterfly search (hewei263).
+    broad_context = []
+    for board in final_two:
+        b_img = np.asarray(board[0], dtype=float)
+        b_world = np.asarray(board[1], dtype=float)
+        if len(b_img) < 12 or len(b_world) != len(b_img):
+            continue
+        b_grid = np.round(b_world / 15.0).astype(int)
+        if (len(np.unique(b_grid[:, 0])) >= 4 and
+                len(np.unique(b_grid[:, 1])) >= 4):
+            broad_context.append(board)
+    if broad_context:
+        cleaned_board_results = []
+        for xy_b, uv_b, marks in board_results:
+            kept_marks = []
+            for rec in marks:
+                p = np.asarray(rec[1:3], dtype=float)
+                if _is_near_broad_board_image_region(
+                        p, broad_context, margin_scale=4.0, margin_cap=75.0,
+                        min_margin=75.0):
+                    print(f"  [X宽棋盘全局排除] 位置=({p[0]:.1f},{p[1]:.1f})")
+                    continue
+                kept_marks.append(rec)
+            cleaned_board_results.append((xy_b, uv_b, kept_marks))
+        board_results = cleaned_board_results
+
 
     # A nearly fully occluded narrow strip may not have enough row pairs to
     # enter board_results.  Recover only butterflies that are independently
@@ -4559,19 +6708,58 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
     isolated_marks = _detect_isolated_complete_butterflies(
         final_points, img_gray, final_two,
         list(board_marks) + list(sparse_strip_marks))
+    lower_isolated_marks = _detect_isolated_complete_lower_butterflies(
+        final_points, img_gray, final_two,
+        list(board_marks) + list(sparse_strip_marks) + list(isolated_marks))
 
-    # All detector branches now share one physical numbering convention.
-    board_results = [
-        (xy_b, uv_b, _normalize_physical_x_corner_types(marks, img_gray.shape))
-        for xy_b, uv_b, marks in board_results
+    # All detector branches now share the 4-29 black/white numbering rule.
+    # Keep the board associated with each normal detector result; for recovery
+    # branches choose the nearest proven two-column strip inside the classifier.
+    numbering_board_sets = []
+    for b_img, b_world, _, _, _ in final_two:
+        b_grid = np.round(np.asarray(b_world, dtype=float) / 15.0).astype(int)
+        b_counts = (len(np.unique(b_grid[:, 0])),
+                    len(np.unique(b_grid[:, 1])))
+        if min(b_counts) == 2 and max(b_counts) >= 3:
+            numbering_board_sets.append(np.asarray(b_img, dtype=float))
+
+    renumbered_board_results = []
+    for board_idx, (xy_b, uv_b, marks) in enumerate(board_results):
+        own_support = []
+        if board_idx < len(final_two):
+            own_support = [np.asarray(final_two[board_idx][0], dtype=float)]
+        numbered = _normalize_physical_x_corner_types(
+            marks, img_gray.shape, img_gray=img_gray,
+            board_sets=own_support or numbering_board_sets)
+        renumbered_board_results.append((xy_b, uv_b, numbered))
+    board_results = renumbered_board_results
+    # These recovery branches also create provisional numbers from image
+    # position or left/right ordering.  Their final number must come solely
+    # from the marker-to-board black/white relationship.
+    sparse_strip_marks = [
+        [0, float(rec[1]), float(rec[2])] for rec in sparse_strip_marks
+    ]
+    isolated_marks = [
+        [0, float(rec[1]), float(rec[2])] for rec in isolated_marks
+    ]
+    lower_isolated_marks = [
+        [0, float(rec[1]), float(rec[2])] for rec in lower_isolated_marks
     ]
     sparse_strip_marks = _normalize_physical_x_corner_types(
-        sparse_strip_marks, img_gray.shape)
+        sparse_strip_marks, img_gray.shape, img_gray=img_gray,
+        board_sets=numbering_board_sets)
     isolated_marks = _normalize_physical_x_corner_types(
-        isolated_marks, img_gray.shape)
+        isolated_marks, img_gray.shape, img_gray=img_gray,
+        board_sets=numbering_board_sets)
+    lower_isolated_marks = _normalize_physical_x_corner_types(
+        lower_isolated_marks, img_gray.shape, img_gray=img_gray,
+        board_sets=numbering_board_sets)
 
     # 收集所有棋盘格实际检测到的X角点（不仅限于中央棋盘格，用于可视化）
-    all_detected = list(sparse_strip_marks) + list(isolated_marks)
+    # Every source, including lower isolated recovery, has now passed the same
+    # marker-to-board tone classifier.
+    all_detected = (list(sparse_strip_marks) + list(isolated_marks) +
+                    list(lower_isolated_marks))
     for (_, _, jilu_b) in board_results:
         all_detected.extend([rec for rec in jilu_b])
     if len(all_detected) > 0:
@@ -4702,15 +6890,24 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
 
     # “鞍点”只显示真正归属于某个棋盘网格的检测响应，不再显示
     # 棋盘附近的任意角点候选。插值点不再作为白色网格点或连线节点。
-    board_detected = np.zeros(len(points), dtype=bool)
+    # In the extreme-blur path this includes the weaker responses admitted
+    # only by an already confirmed board geometry.  Matching them back to the
+    # cleaned board nodes below still removes all interpolation-only nodes.
+    # ``narrow_recovery_points`` contains additional low-score *real* refined
+    # responses used only after a narrow board has been geometrically proven.
+    # Rendering still selects points by a <=2.5 px match to cleaned board
+    # nodes, so exposing this pool here makes recovered saddles visible without
+    # drawing any unassigned weak response or synthetic/interpolated point.
+    render_saddle_points = narrow_recovery_points
+    board_detected = np.zeros(len(render_saddle_points), dtype=bool)
     confirmed_boards = []
-    if len(points) > 0:
+    if len(render_saddle_points) > 0:
         for im, wo, _, _, _ in final_two:
             if len(im) == 0:
                 confirmed_boards.append((np.empty((0, 2)), np.empty((0, 2))))
                 continue
             board_tree = KDTree(im)
-            dist, node_idx = board_tree.query(points, k=1)
+            dist, node_idx = board_tree.query(render_saddle_points, k=1)
             mask = dist <= 2.5
             point_idx = np.where(mask)[0]
             # One original detection per board node; keep the closest match.
@@ -4722,15 +6919,18 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
             selected_nodes = sorted(best_by_node)
             selected_points = [best_by_node[ni][0] for ni in selected_nodes]
             board_detected[selected_points] = True
-            confirmed_boards.append((points[selected_points], wo[selected_nodes]))
+            confirmed_boards.append(
+                (render_saddle_points[selected_points], wo[selected_nodes]))
     else:
         confirmed_boards = [(np.empty((0, 2)), np.empty((0, 2))) for _ in final_two]
 
     plt.figure(figsize=(14, 12))
     ax = plt.gca()
     ax.imshow(img_gray, cmap='gray')
-    ax.plot(points[board_detected, 0], points[board_detected, 1], 'yo', markersize=3,
-            alpha=0.4, label=f'棋盘鞍点({np.sum(board_detected)}/{len(points)})')
+    ax.plot(render_saddle_points[board_detected, 0],
+            render_saddle_points[board_detected, 1], 'yo', markersize=3,
+            alpha=0.4,
+            label=f'棋盘鞍点({np.sum(board_detected)}/{len(render_saddle_points)})')
     for idx, (im, wo) in enumerate(confirmed_boards):
         draw_chessboard_grid(ax, im, wo, img_shape=img_gray.shape)
         ax.plot(im[:, 0], im[:, 1], 'w+', markersize=9, markeredgewidth=1.6,
@@ -4764,8 +6964,10 @@ def process_single_image(img_path, divide_n=2, show=True, save_dir=None):
         if 'refined_p' in locals() and len(refined_p) > 0:
             ax_dbg.plot(refined_p[:, 0], refined_p[:, 1], 'co', markersize=2,
                         alpha=0.25, label=f'精化后({len(refined_p)})')
-        ax_dbg.plot(points[board_detected, 0], points[board_detected, 1], 'yo', markersize=3,
-                    alpha=0.5, label=f'棋盘归属({np.sum(board_detected)}/{len(points)})')
+        ax_dbg.plot(render_saddle_points[board_detected, 0],
+                    render_saddle_points[board_detected, 1], 'yo', markersize=3,
+                    alpha=0.5,
+                    label=f'棋盘归属({np.sum(board_detected)}/{len(render_saddle_points)})')
         for idx, (im, wo) in enumerate(confirmed_boards):
             ax_dbg.plot(im[:, 0], im[:, 1], 'w+', markersize=10, markeredgewidth=2.0,
                         label=f'棋盘格{idx + 1}({len(im)})', zorder=8)
