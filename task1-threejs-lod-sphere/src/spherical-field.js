@@ -214,17 +214,6 @@ export function findRegionAtDirection(course, regions, direction) {
       bestDot = siteDot;
     }
   }
-  // 与语义场保持一致：数据存在细小空隙时按最近区域中心补齐归属。
-  if (!bestRegion) {
-    candidates.forEach((region) => {
-      const site = regionLayout(course, region).anchor;
-      const siteDot = direction.dot(site);
-      if (siteDot > bestDot) {
-        bestRegion = region;
-        bestDot = siteDot;
-      }
-    });
-  }
   return bestRegion;
 }
 
@@ -401,20 +390,6 @@ function buildRegionInfos(course, regions) {
   });
 }
 
-function nearestRegionIndex(infos, px, py, pz, candidateIndices) {
-  let bestIndex = candidateIndices[0];
-  let bestDot = -Infinity;
-  for (const index of candidateIndices) {
-    const site = infos[index].site;
-    const dot = px * site.x + py * site.y + pz * site.z;
-    if (dot > bestDot) {
-      bestDot = dot;
-      bestIndex = index;
-    }
-  }
-  return bestIndex;
-}
-
 function chooseRegionIndex(infos, directions, offset, candidateIndices) {
   const px = directions[offset];
   const py = directions[offset + 1];
@@ -447,9 +422,9 @@ function chooseRegionIndex(infos, directions, offset, candidateIndices) {
     }
   }
 
-  return matchedRegion >= 0
-    ? matchedRegion
-    : nearestRegionIndex(infos, px, py, pz, candidateIndices);
+  // 没有落入任何边界时保留 -1，球面上的真实空白区域不能再按最近中心
+  // 强行归入某个章节或小节。
+  return matchedRegion;
 }
 
 function smoothRegionIdEdges(sourceIds, passes = 2) {
@@ -460,6 +435,9 @@ function smoothRegionIdEdges(sourceIds, passes = 2) {
       for (let x = 0; x < FIELD_WIDTH; x += 1) {
         const pixel = y * FIELD_WIDTH + x;
         const ownId = current[pixel];
+        // -1 表示不属于任何区域。边缘平滑只能清理已有区域的单像素毛刺，
+        // 不能把真实空白填成周围区域的颜色。
+        if (ownId < 0) continue;
         const left = current[y * FIELD_WIDTH + ((x - 1 + FIELD_WIDTH) % FIELD_WIDTH)];
         const right = current[y * FIELD_WIDTH + ((x + 1) % FIELD_WIDTH)];
         const up = current[Math.max(0, y - 1) * FIELD_WIDTH + x];
@@ -528,7 +506,7 @@ function mergeSmallRegionIdIslands(sourceIds, regionCount) {
 
     componentRegions.push(regionId);
     componentSizes.push(tail);
-    if (tail > largestSizes[regionId]) {
+    if (regionId >= 0 && tail > largestSizes[regionId]) {
       largestSizes[regionId] = tail;
       largestComponents[regionId] = componentId;
     }
@@ -538,7 +516,9 @@ function mergeSmallRegionIdIslands(sourceIds, regionCount) {
   // 连通块，既去掉重叠边界产生的浮岛，也保留主体和真实的窄区域。
   const maximumIslandSize = Math.max(12, Math.round(sourceIds.length * 0.001));
   const borderCounts = componentSizes.map((size, componentId) => (
-    componentId !== largestComponents[componentRegions[componentId]] && size <= maximumIslandSize
+    componentRegions[componentId] >= 0
+      && componentId !== largestComponents[componentRegions[componentId]]
+      && size <= maximumIslandSize
       ? new Map()
       : null
   ));
@@ -671,14 +651,17 @@ function buildField(course, regions, level, ids = buildSphericalIds(course, regi
   const colorImage = colorContext.createImageData(FIELD_WIDTH, FIELD_HEIGHT);
   const heightImage = heightContext.createImageData(FIELD_WIDTH, FIELD_HEIGHT);
   const palette = regions.map((region) => colorBytes(region.__color || new THREE.Color(course.color)));
+  const baseColor = colorBytes(lighten(course.color, 0.44));
   const seamWidth = level === 'chapter' ? 9 : 4.5;
   for (let pixel = 0; pixel < pixelCount; pixel += 1) {
     const offset = pixel * 4;
-    const [red, green, blue] = palette[ids[pixel]];
+    const regionId = ids[pixel];
+    const [red, green, blue] = regionId >= 0 ? palette[regionId] : baseColor;
     colorImage.data[offset] = red;
     colorImage.data[offset + 1] = green;
     colorImage.data[offset + 2] = blue;
-    colorImage.data[offset + 3] = 255;
+    // 颜色纹理的 alpha 同时作为区域掩码。空白像素保持球体底色。
+    colorImage.data[offset + 3] = regionId >= 0 ? 255 : 0;
     const normalizedDistance = THREE.MathUtils.clamp((distance[pixel] - 0.4) / seamWidth, 0, 1);
     const eased = normalizedDistance * normalizedDistance * (3 - 2 * normalizedDistance);
     const heightValue = Math.round(12 + eased * 243);
@@ -696,13 +679,15 @@ function buildField(course, regions, level, ids = buildSphericalIds(course, regi
   };
 }
 
-function createSolidField(color) {
+function createSolidField(color, assigned = true) {
   const colorCanvas = createCanvas();
   const heightCanvas = createCanvas();
   const colorContext = colorCanvas.getContext('2d');
   const heightContext = heightCanvas.getContext('2d');
-  colorContext.fillStyle = color;
-  colorContext.fillRect(0, 0, FIELD_WIDTH, FIELD_HEIGHT);
+  if (assigned) {
+    colorContext.fillStyle = color;
+    colorContext.fillRect(0, 0, FIELD_WIDTH, FIELD_HEIGHT);
+  }
   heightContext.fillStyle = '#ffffff';
   heightContext.fillRect(0, 0, FIELD_WIDTH, FIELD_HEIGHT);
   return {
@@ -714,8 +699,8 @@ function createSolidField(color) {
 export function createSemanticFields(course) {
   if (!course.chapters.length) {
     return {
-      chapter: createSolidField(course.color),
-      section: createSolidField(course.color)
+      chapter: createSolidField(course.color, false),
+      section: createSolidField(course.color, false)
     };
   }
   const chapterIds = buildSphericalIds(course, course.chapters);
@@ -727,7 +712,7 @@ export function createSemanticFields(course) {
     chapter: buildField(course, course.chapters, 'chapter', chapterIds),
     section: sectionRegions.length
       ? buildField(course, sectionRegions, 'section', sectionIds)
-      : createSolidField(course.color)
+      : createSolidField(course.color, false)
   };
 }
 
@@ -814,12 +799,20 @@ export function createSemanticMaterial(fields, courseColor) {
       }
 
       void main() {
-        vec3 chapterColor = srgbToLinear(texture2D(uChapterMap, vUvField).rgb);
-        vec3 sectionColor = srgbToLinear(texture2D(uSectionMap, vUvField).rgb);
+        vec4 chapterSample = texture2D(uChapterMap, vUvField);
+        vec4 sectionSample = texture2D(uSectionMap, vUvField);
+        vec3 chapterColor = srgbToLinear(chapterSample.rgb);
+        vec3 sectionColor = srgbToLinear(sectionSample.rgb);
+        float chapterMask = chapterSample.a;
+        float sectionMask = sectionSample.a;
         float chapterHeight = texture2D(uChapterHeight, vUvField).r;
         float sectionHeight = texture2D(uSectionHeight, vUvField).r;
-        vec3 surfaceColor = mix(uBaseColor, chapterColor, uRegionReveal);
-        surfaceColor = mix(surfaceColor, sectionColor, uRegionReveal * uSectionBlend);
+        vec3 surfaceColor = mix(uBaseColor, chapterColor, uRegionReveal * chapterMask);
+        surfaceColor = mix(
+          surfaceColor,
+          sectionColor,
+          uRegionReveal * uSectionBlend * sectionMask
+        );
 
         float chapterSeam = (1.0 - smoothstep(0.22, 0.86, chapterHeight)) * uRegionReveal;
         float sectionSeam = (1.0 - smoothstep(0.12, 0.72, sectionHeight))

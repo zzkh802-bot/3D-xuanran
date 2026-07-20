@@ -119,7 +119,7 @@ const expandedIds = new Set();
 
 const outerGeometry = new THREE.SphereGeometry(0.17, 18, 14);
 const handleGeometry = new THREE.SphereGeometry(0.22, 18, 14);
-const knowledgeGeometry = new THREE.SphereGeometry(0.12, 16, 12);
+const knowledgeGeometry = new THREE.SphereGeometry(0.17, 18, 14);
 const knowledgeLabelCache = new Map();
 const surfaceLabelColor = '#ffffff';
 
@@ -374,7 +374,16 @@ function buildHandles(courseGroup) {
 
 function ensureKnowledge(section, course) {
   if (!Array.isArray(section.knowledge)) section.knowledge = [];
-  if (!section.knowledge.length) return;
+  // 内置课程的源表只有章/节边界，没有独立的知识点记录。沿用展示版行为，
+  // 为这类小节生成三个仅运行时存在的球面知识点；序列化时 generated 点会被过滤，
+  // 因而不会污染用户导出的课程配置。
+  if (!section.knowledge.length) {
+    section.knowledge = [0, 1, 2].map((index) => ({
+      id: `${section.id}-knowledge-${index + 1}`,
+      label: `K${index + 1}`,
+      generated: true
+    }));
+  }
   const layout = regionLayout(course, section);
   const boundary = sampleClosedBoundary(course, section, 6, 1);
   section.knowledge.forEach((point, index) => {
