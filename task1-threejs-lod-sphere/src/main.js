@@ -29,6 +29,11 @@ import {
   updateMaterialFields,
   vectorToSource
 } from './spherical-field.js';
+import {
+  constrainKnowledgeDirection,
+  findClosestSharedBoundary,
+  sharedBoundaryNeighbors
+} from './editor-constraints.js';
 import './styles.css';
 
 const sceneEl = document.querySelector('#scene');
@@ -114,6 +119,7 @@ let rebuildTimer = null;
 let placementMode = null;
 let toastTimer = null;
 let sliderBefore = null;
+let sliderLimited = false;
 let savedSnapshot = serializeConfig(data, 0);
 const undoStack = [];
 const redoStack = [];
@@ -1048,7 +1054,7 @@ function appendInspectorField(labelText, value, onChange, options = {}) {
   const label = document.createElement('label');
   label.textContent = labelText;
   const input = options.multiline ? document.createElement('textarea') : document.createElement('input');
-  input.type = options.type || 'text';
+  if (!options.multiline) input.type = options.type || 'text';
   input.value = value ?? '';
   if (options.step) input.step = options.step;
   if (options.min !== undefined) input.min = options.min;
@@ -1136,6 +1142,7 @@ function addAction(label, handler, options = {}) {
   const button = document.createElement('button');
   button.type = 'button';
   button.textContent = label;
+  if (options.title) button.title = options.title;
   if (options.danger) button.classList.add('danger');
   button.addEventListener('click', handler);
   selectionActionsEl.appendChild(button);
@@ -1150,11 +1157,29 @@ function renderSelectionActions() {
     addAction('删除课程', () => deleteSelection(), { danger: true });
   } else if (item.type === 'chapter') {
     addAction('＋新建小节', () => startBoundaryDraft('section', item.course, item.chapter));
-    addAction('＋边界点', () => startBoundaryPointPlacement('chapter', item.course, item.chapter));
+    addAction(
+      '＋单区域边界点',
+      () => startBoundaryPointPlacement('chapter', item.course, item.chapter, 'single'),
+      { title: '只向当前章节边界添加一个点' }
+    );
+    addAction(
+      '＋相邻共同点',
+      () => startBoundaryPointPlacement('chapter', item.course, item.chapter, 'shared'),
+      { title: '在当前章节与相邻章节的共同边界上添加共享点' }
+    );
     addAction('删除章', () => deleteSelection(), { danger: true });
   } else if (item.type === 'section') {
     addAction('＋知识点', () => startKnowledgePlacement(item.course, item.section));
-    addAction('＋边界点', () => startBoundaryPointPlacement('section', item.course, item.section));
+    addAction(
+      '＋单区域边界点',
+      () => startBoundaryPointPlacement('section', item.course, item.section, 'single'),
+      { title: '只向当前小节边界添加一个点' }
+    );
+    addAction(
+      '＋相邻共同点',
+      () => startBoundaryPointPlacement('section', item.course, item.section, 'shared'),
+      { title: '在当前小节与相邻小节的共同边界上添加共享点' }
+    );
     addAction('删除小节', () => deleteSelection(), { danger: true });
   } else if (item.type === 'knowledge') {
     addAction('删除知识点', () => deleteSelection(), { danger: true });
@@ -1284,13 +1309,25 @@ function renderEditorUI() {
         return;
       }
       const locator = selectionLocator(item);
+      const courseGroup = courseGroups.find((entry) => entry.course === item.course);
+      if (!courseGroup) return;
+      const candidate = pointFromAngles(
+        item.point.id,
+        item.point.label,
+        nextPhi,
+        nextPsi,
+        radius
+      );
+      let wasLimited = false;
       mutateAndRebuild(() => {
-        if (item.type === 'knowledge') materializeGeneratedKnowledge(item.section);
-        Object.assign(
+        const result = applyPointMove(
+          courseGroup,
           item.point,
-          pointFromAngles(item.point.id, item.point.label, nextPhi, nextPsi, radius)
+          sourceToVector(candidate, radius)
         );
+        wasLimited = result.limited;
       }, locator, '坐标已更新');
+      if (wasLimited) showToast('知识点不能移出所属小节，已限制在小节边界内');
     };
     phi.onchange = commitCoordinates;
     psi.onchange = commitCoordinates;
@@ -1397,19 +1434,36 @@ function syncPointObjects(courseGroup, point) {
 
 function applyPointMove(courseGroup, point, localVector, queueRebuild = false) {
   const isSurfaceVertex = courseGroup.course.__vertexMap.has(point.id);
+  let nextVector = localVector.clone().normalize().multiplyScalar(radius);
+  let limited = false;
+  if (!isSurfaceVertex) {
+    const section = courseGroup.course.sections.find((item) => item.knowledge?.includes(point));
+    if (section) {
+      const constrained = constrainKnowledgeDirection(
+        courseGroup.course,
+        section,
+        sourceToVector(point, 1),
+        nextVector
+      );
+      nextVector = constrained.direction.multiplyScalar(radius);
+      limited = constrained.limited;
+    }
+  }
+  const changed = sourceToVector(point, 1).angleTo(nextVector) > 1e-7;
+  if (!changed) return { surfaceChanged: false, changed: false, limited };
   if (!isSurfaceVertex) {
     const section = courseGroup.course.sections.find((item) => item.knowledge?.includes(point));
     materializeGeneratedKnowledge(section);
     point.manual = true;
   }
-  vectorToSource(localVector, point, radius);
+  vectorToSource(nextVector, point, radius);
   syncPointObjects(courseGroup, point);
   if (isSurfaceVertex) {
     invalidateCourseLayouts(courseGroup.course);
     updatePreview(courseGroup);
     if (queueRebuild) queueCourseRebuild(courseGroup);
   }
-  return isSurfaceVertex;
+  return { surfaceChanged: isSurfaceVertex, changed: true, limited };
 }
 
 function setEditMode(next) {
@@ -1455,8 +1509,11 @@ function renderPlacementUI() {
     draftNameInput.value = placementMode.title;
     placementHint.textContent = `依次点击现有顶点或球面空白处，当前 ${placementMode.vertexIds.length} 个点`;
   } else if (placementMode.type === 'boundary-point') {
-    placementTitle.textContent = '向边界添加顶点';
-    placementHint.textContent = '点击球面，新点会插入最近的边界线段';
+    const isShared = placementMode.boundaryScope === 'shared';
+    placementTitle.textContent = isShared ? '添加相邻区域共同边界点' : '添加单区域边界点';
+    placementHint.textContent = isShared
+      ? '点击当前区域与相邻区域的共同边界线，新点会吸附到边界并同时加入两个区域'
+      : '点击球面，新点只会插入当前区域最近的边界线段';
   } else if (placementMode.type === 'knowledge') {
     placementTitle.textContent = '新建知识点';
     placementHint.textContent = '请在目标小节区域内点击球面';
@@ -1544,7 +1601,15 @@ function startBoundaryDraft(regionType, course, chapter = null) {
   renderDraft();
 }
 
-function startBoundaryPointPlacement(regionType, course, region) {
+function startBoundaryPointPlacement(regionType, course, region, boundaryScope = 'single') {
+  const regions = regionType === 'chapter' ? course.chapters : course.sections;
+  if (
+    boundaryScope === 'shared'
+    && sharedBoundaryNeighbors(region, regions).length === 0
+  ) {
+    showToast('当前区域没有可添加共同点的相邻区域');
+    return;
+  }
   cancelPlacement(false);
   focusCourse(course.id);
   setEditMode(true);
@@ -1552,7 +1617,8 @@ function startBoundaryPointPlacement(regionType, course, region) {
     type: 'boundary-point',
     regionType,
     courseId: course.id,
-    regionId: region.id
+    regionId: region.id,
+    boundaryScope
   };
   renderPlacementUI();
 }
@@ -1716,26 +1782,48 @@ function handlePlacement(result) {
       cancelPlacement(false);
       return true;
     }
+    const isShared = placementMode.boundaryScope === 'shared';
+    const sharedMatch = isShared
+      ? findClosestSharedBoundary(course, region, regions, direction)
+      : null;
+    if (isShared && (!sharedMatch || sharedMatch.distance > 0.16)) {
+      showToast('请点击当前区域与相邻区域的共同边界线');
+      return true;
+    }
+    const pointDirection = sharedMatch?.direction || direction;
+    const affectedRegions = sharedMatch ? [region, sharedMatch.neighbor] : [region];
     if (placementMode.regionType === 'section') {
-      const chapter = course.chapters.find((entry) => entry.id === region.chapterId);
-      const chapterBoundary = chapter ? sampleClosedBoundary(course, chapter, 8, 1) : [];
-      if (!chapter || !sphericalContains(direction, chapterBoundary)) {
-        showToast('小节边界点必须位于所属章节内');
+      const outsideParent = affectedRegions.some((affectedRegion) => {
+        const chapter = course.chapters.find((entry) => entry.id === affectedRegion.chapterId);
+        const chapterBoundary = chapter ? sampleClosedBoundary(course, chapter, 8, 1) : [];
+        return !chapter || !sphericalContains(pointDirection, chapterBoundary);
+      });
+      if (outsideParent) {
+        showToast(isShared
+          ? '共同边界点必须同时位于两个小节所属章节内'
+          : '小节边界点必须位于所属章节内');
         return true;
       }
     }
     const before = snapshotConfig();
-    const point = pointFromLocalVector(course, direction, 'vertex');
-    const insertionIndex = closestBoundaryInsertionIndex(course, region, direction);
+    const point = pointFromLocalVector(course, pointDirection, 'vertex');
     course.vertices.push(point);
-    region.vertexIds.splice(insertionIndex, 0, point.id);
+    if (sharedMatch) {
+      region.vertexIds.splice(sharedMatch.regionInsertionIndex, 0, point.id);
+      sharedMatch.neighbor.vertexIds.splice(sharedMatch.neighborInsertionIndex, 0, point.id);
+    } else {
+      const insertionIndex = closestBoundaryInsertionIndex(course, region, pointDirection);
+      region.vertexIds.splice(insertionIndex, 0, point.id);
+    }
     const locator = {
       type: placementMode.regionType,
       courseId: course.id,
       id: region.id
     };
     cancelPlacement(false);
-    commitHistory(before, '边界顶点已添加');
+    commitHistory(before, sharedMatch
+      ? `已添加与“${sharedMatch.neighbor.title}”共用的边界点`
+      : '单区域边界顶点已添加');
     rebuildSingleCourse(course.id, locator);
     return true;
   }
@@ -1846,6 +1934,7 @@ renderer.domElement.addEventListener('pointerdown', (event) => {
       point: item.point,
       startVector: sourceToVector(item.point, radius),
       surfaceChanged: false,
+      limited: false,
       before: snapshotConfig()
     };
     controls.enabled = false;
@@ -1865,7 +1954,9 @@ renderer.domElement.addEventListener('pointermove', (event) => {
   const local = event.shiftKey
     ? slerpUnit(draggingPoint.startVector, localTarget, 0.18).multiplyScalar(radius)
     : localTarget;
-  draggingPoint.surfaceChanged = applyPointMove(draggingPoint.courseGroup, draggingPoint.point, local) || draggingPoint.surfaceChanged;
+  const result = applyPointMove(draggingPoint.courseGroup, draggingPoint.point, local);
+  draggingPoint.surfaceChanged = result.surfaceChanged || draggingPoint.surfaceChanged;
+  draggingPoint.limited = result.limited || draggingPoint.limited;
   phiInput.value = draggingPoint.point.phi;
   psiInput.value = draggingPoint.point.psi;
 });
@@ -1874,6 +1965,7 @@ function finishPointerDrag(event) {
   if (!draggingPoint) return;
   if (draggingPoint.surfaceChanged) rebuildCourseVisuals(draggingPoint.courseGroup);
   commitHistory(draggingPoint.before, draggingPoint.surfaceChanged ? '边界顶点已移动' : '知识点已移动');
+  if (draggingPoint.limited) showToast('知识点不能移出所属小节，已限制在小节边界内');
   renderEditorUI();
   draggingPoint = null;
   controls.enabled = true;
@@ -1884,10 +1976,13 @@ renderer.domElement.addEventListener('pointerup', finishPointerDrag);
 renderer.domElement.addEventListener('pointercancel', finishPointerDrag);
 
 function updateSelectedPoint() {
-  if (!selectedNode?.point || !selectedNode?.course) return;
-  if (!sliderBefore) sliderBefore = snapshotConfig();
+  if (!selectedNode?.point || !selectedNode?.course) return null;
+  if (!sliderBefore) {
+    sliderBefore = snapshotConfig();
+    sliderLimited = false;
+  }
   const courseGroup = courseGroups.find((item) => item.course === selectedNode.course);
-  if (!courseGroup) return;
+  if (!courseGroup) return null;
   const phi = Number(phiInput.value);
   const psi = Number(psiInput.value);
   const cp = Math.cos(psi);
@@ -1896,7 +1991,13 @@ function updateSelectedPoint() {
     radius * Math.sin(psi),
     radius * cp * Math.sin(phi)
   );
-  applyPointMove(courseGroup, selectedNode.point, local, true);
+  const result = applyPointMove(courseGroup, selectedNode.point, local, true);
+  sliderLimited = result.limited || sliderLimited;
+  if (result.limited) {
+    phiInput.value = selectedNode.point.phi;
+    psiInput.value = selectedNode.point.psi;
+  }
+  return result;
 }
 
 function importConfigFile(file) {
@@ -2000,20 +2101,26 @@ draftNameInput.addEventListener('input', () => {
 });
 phiInput.addEventListener('pointerdown', () => {
   sliderBefore = snapshotConfig();
+  sliderLimited = false;
 });
 psiInput.addEventListener('pointerdown', () => {
   sliderBefore = snapshotConfig();
+  sliderLimited = false;
 });
 phiInput.addEventListener('input', updateSelectedPoint);
 psiInput.addEventListener('input', updateSelectedPoint);
 phiInput.addEventListener('change', () => {
   if (sliderBefore) commitHistory(sliderBefore, '坐标已更新');
+  if (sliderLimited) showToast('知识点不能移出所属小节，已限制在小节边界内');
   sliderBefore = null;
+  sliderLimited = false;
   renderEditorUI();
 });
 psiInput.addEventListener('change', () => {
   if (sliderBefore) commitHistory(sliderBefore, '坐标已更新');
+  if (sliderLimited) showToast('知识点不能移出所属小节，已限制在小节边界内');
   sliderBefore = null;
+  sliderLimited = false;
   renderEditorUI();
 });
 document.querySelectorAll('[data-nudge]').forEach((button) => {
@@ -2025,9 +2132,11 @@ document.querySelectorAll('[data-nudge]').forEach((button) => {
     if (button.dataset.nudge === 'right') phiInput.value = Number(phiInput.value) + step;
     if (button.dataset.nudge === 'up') psiInput.value = Number(psiInput.value) + step;
     if (button.dataset.nudge === 'down') psiInput.value = Number(psiInput.value) - step;
-    updateSelectedPoint();
+    const result = updateSelectedPoint();
     commitHistory(before, '坐标已微调');
+    if (result?.limited) showToast('知识点不能移出所属小节，已限制在小节边界内');
     sliderBefore = null;
+    sliderLimited = false;
     renderEditorUI();
   });
 });
