@@ -180,6 +180,23 @@ export function sphericalContains(point, boundary) {
   return result.winding * interiorSign > Math.PI;
 }
 
+export function slerpWithinBoundary(start, end, amount, boundary) {
+  let blend = amount;
+  while (blend >= 1 / 128) {
+    const candidate = slerpUnit(start, end, blend);
+    if (sphericalContains(candidate, boundary)) return candidate;
+    blend *= 0.5;
+  }
+  return start.clone().normalize();
+}
+
+export function sphericalContainsSources(point, boundaryPoints) {
+  return sphericalContains(
+    sourceToVector(point, 1),
+    boundaryPoints.map((boundaryPoint) => sourceToVector(boundaryPoint, 1))
+  );
+}
+
 function chapterRegionFromField(course, regions, direction) {
   const ids = course.__chapterRegionIds;
   if (regions !== course.chapters || ids?.length !== FIELD_WIDTH * FIELD_HEIGHT) return null;

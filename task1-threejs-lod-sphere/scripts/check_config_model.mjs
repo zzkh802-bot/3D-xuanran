@@ -4,10 +4,18 @@ import { fileURLToPath } from 'node:url';
 import {
   ConfigValidationError,
   createEmptyCourse,
+  materializeGeneratedKnowledge,
   normalizeConfig,
   pointFromAngles,
   serializeConfig
 } from '../src/config-model.js';
+import {
+  prepareCourse,
+  regionLayout,
+  sampleClosedBoundary,
+  slerpWithinBoundary,
+  vectorToSource
+} from '../src/spherical-field.js';
 
 const dataUrl = new URL('../src/data/course-data.json', import.meta.url);
 const source = JSON.parse(fs.readFileSync(fileURLToPath(dataUrl), 'utf8'));
@@ -49,5 +57,53 @@ assert.throws(
   () => normalizeConfig({ schema: 4, radius: 0, courses: [] }),
   ConfigValidationError
 );
+assert.throws(
+  () => normalizeConfig({ schema: 999, radius: 10, courses: [] }),
+  ConfigValidationError
+);
+assert.throws(
+  () => normalizeConfig({ radius: 10, courses: [] }),
+  ConfigValidationError
+);
+
+const invalidCoordinate = structuredClone(emptyConfig);
+invalidCoordinate.courses[0].vertices[0].phi = null;
+assert.throws(() => normalizeConfig(invalidCoordinate), ConfigValidationError);
+
+const runtimeSection = {
+  knowledge: [
+    { id: 'generated-1', generated: true },
+    { id: 'generated-2', generated: true }
+  ]
+};
+assert.equal(materializeGeneratedKnowledge(runtimeSection), true);
+assert.equal(runtimeSection.knowledge.every((point) => point.manual && !point.generated), true);
+
+const materializedConfig = structuredClone(normalized.config);
+materializedConfig.courses.forEach((course) => {
+  prepareCourse(course);
+  course.sections.forEach((section) => {
+    if (section.knowledge.length) return;
+    const layout = regionLayout(course, section);
+    const boundary = sampleClosedBoundary(course, section, 6, 1);
+    section.knowledge = [0, 1, 2].map((index) => {
+      const target = boundary[
+        Math.floor(((index + 0.65) / 3) * boundary.length) % boundary.length
+      ];
+      const direction = target
+        ? slerpWithinBoundary(layout.anchor, target, index === 0 ? 0.18 : 0.34, boundary)
+        : layout.anchor;
+      const point = {
+        id: `${section.id}-knowledge-${index + 1}`,
+        label: `K${index + 1}`,
+        generated: true
+      };
+      vectorToSource(direction.multiplyScalar(materializedConfig.radius), point, materializedConfig.radius);
+      return point;
+    });
+    materializeGeneratedKnowledge(section);
+  });
+});
+assert.doesNotThrow(() => normalizeConfig(materializedConfig));
 
 console.log('配置模型检查通过：兼容升级、清理、空课程和非法引用校验正常。');

@@ -98,4 +98,12 @@ const duplicateId = structuredClone(source);
 duplicateId.courses[0].chapters[1].id = duplicateId.courses[0].chapters[0].id;
 assert.throws(() => normalizeConfig(duplicateId), ConfigValidationError);
 
+const invalidContainment = structuredClone(source);
+const firstSection = invalidContainment.courses[0].sections[0];
+const foreignSection = invalidContainment.courses[0].sections.find(
+  (section) => section.chapterId !== firstSection.chapterId
+);
+firstSection.vertexIds = [...foreignSection.vertexIds];
+assert.throws(() => normalizeConfig(invalidContainment), ConfigValidationError);
+
 console.log('模板配置检查通过：结构、ID、坐标、引用、球面包含关系和异常配置校验正常。');
