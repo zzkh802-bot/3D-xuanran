@@ -13,9 +13,17 @@ import {
   prepareCourse,
   regionLayout,
   sampleClosedBoundary,
+  slerpUnit,
   slerpWithinBoundary,
+  sourceToVector,
+  sphericalContains,
   vectorToSource
 } from '../src/spherical-field.js';
+import {
+  constrainKnowledgeDirection,
+  findClosestSharedBoundary,
+  sharedBoundaryNeighbors
+} from '../src/editor-constraints.js';
 
 const dataUrl = new URL('../src/data/course-data.json', import.meta.url);
 const source = JSON.parse(fs.readFileSync(fileURLToPath(dataUrl), 'utf8'));
@@ -106,4 +114,56 @@ materializedConfig.courses.forEach((course) => {
 });
 assert.doesNotThrow(() => normalizeConfig(materializedConfig));
 
-console.log('配置模型检查通过：兼容升级、清理、空课程和非法引用校验正常。');
+const editorConfig = structuredClone(normalized.config);
+const editorCourse = editorConfig.courses[0];
+prepareCourse(editorCourse);
+const editorSection = editorCourse.sections[0];
+const editorBoundary = sampleClosedBoundary(editorCourse, editorSection, 8, 1);
+const editorStart = regionLayout(editorCourse, editorSection).anchor;
+const outsideTarget = editorCourse.sections
+  .map((section) => regionLayout(editorCourse, section).anchor)
+  .find((direction) => !sphericalContains(direction, editorBoundary))
+  || editorStart.clone().negate();
+const constrained = constrainKnowledgeDirection(
+  editorCourse,
+  editorSection,
+  editorStart,
+  outsideTarget
+);
+assert.equal(constrained.limited, true);
+assert.equal(sphericalContains(constrained.direction, editorBoundary), true);
+
+const neighbors = sharedBoundaryNeighbors(editorSection, editorCourse.sections);
+assert.ok(neighbors.length > 0);
+const neighbor = neighbors[0];
+const neighborEdges = new Set(neighbor.vertexIds.map((startId, index) => (
+  [startId, neighbor.vertexIds[(index + 1) % neighbor.vertexIds.length]].sort().join('|')
+)));
+const sharedEdgeIndex = editorSection.vertexIds.findIndex((startId, index) => (
+  neighborEdges.has([
+    startId,
+    editorSection.vertexIds[(index + 1) % editorSection.vertexIds.length]
+  ].sort().join('|'))
+));
+assert.ok(sharedEdgeIndex >= 0);
+const sharedStart = editorCourse.__vertexMap.get(editorSection.vertexIds[sharedEdgeIndex]);
+const sharedEnd = editorCourse.__vertexMap.get(
+  editorSection.vertexIds[(sharedEdgeIndex + 1) % editorSection.vertexIds.length]
+);
+const sharedMidpoint = slerpUnit(
+  sourceToVector(sharedStart, 1),
+  sourceToVector(sharedEnd, 1),
+  0.5
+);
+const sharedMatch = findClosestSharedBoundary(
+  editorCourse,
+  editorSection,
+  editorCourse.sections,
+  sharedMidpoint
+);
+assert.ok(sharedMatch);
+assert.ok(sharedMatch.distance < 1e-6);
+assert.ok(sharedMatch.regionInsertionIndex > 0);
+assert.ok(sharedMatch.neighborInsertionIndex > 0);
+
+console.log('配置模型检查通过：兼容升级、清理、区域约束、共享边界和非法引用校验正常。');
