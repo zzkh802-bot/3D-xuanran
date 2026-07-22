@@ -66,6 +66,18 @@ const draftNameInput = document.querySelector('#draftNameInput');
 const finishPlacementBtn = document.querySelector('#finishPlacementBtn');
 const cancelPlacementBtn = document.querySelector('#cancelPlacementBtn');
 const toastEl = document.querySelector('#toast');
+const outlineSearch = document.querySelector('#outlineSearch');
+const lodHint = document.querySelector('#lodHint');
+const lodProgress = document.querySelector('#lodProgress');
+const sceneStatus = document.querySelector('#sceneStatus');
+const libraryPanel = document.querySelector('#libraryPanel');
+const inspectorPanel = document.querySelector('#panel');
+const hideLibraryBtn = document.querySelector('#hideLibraryBtn');
+const hideInspectorBtn = document.querySelector('#hideInspectorBtn');
+const showLibraryBtn = document.querySelector('#showLibraryBtn');
+const showInspectorBtn = document.querySelector('#showInspectorBtn');
+const helpBtn = document.querySelector('#helpBtn');
+const helpDialog = document.querySelector('#helpDialog');
 
 const initialConfig = normalizeConfig(data);
 replaceConfig(data, initialConfig.config);
@@ -76,12 +88,17 @@ const overviewSpacing = 26.5;
 const focusDistance = 55;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xeef2f7);
+scene.background = null;
 
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1200);
 camera.position.set(0, 10, currentOverviewDistance());
 
-const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+const renderer = new THREE.WebGLRenderer({
+  antialias: true,
+  alpha: true,
+  powerPreference: 'high-performance'
+});
+renderer.setClearColor(0x000000, 0);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -103,6 +120,43 @@ scene.add(keyLight);
 const rimLight = new THREE.DirectionalLight(0xc6f2ff, 0.9);
 rimLight.position.set(-30, 16, -24);
 scene.add(rimLight);
+
+// 轻量的程序化星尘让课程球更像一个可探索的知识空间，且不依赖外部图片资源。
+function createStarField() {
+  let seed = 42689;
+  const random = () => {
+    seed = (seed * 16807) % 2147483647;
+    return (seed - 1) / 2147483646;
+  };
+  const positions = [];
+  for (let index = 0; index < 520; index += 1) {
+    const distance = 170 + random() * 310;
+    const theta = random() * Math.PI * 2;
+    const phi = Math.acos(2 * random() - 1);
+    positions.push(
+      distance * Math.sin(phi) * Math.cos(theta),
+      distance * Math.cos(phi),
+      distance * Math.sin(phi) * Math.sin(theta)
+    );
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  const material = new THREE.PointsMaterial({
+    color: 0x93b9e8,
+    size: 0.42,
+    sizeAttenuation: true,
+    transparent: true,
+    opacity: 0.34,
+    depthWrite: false,
+    toneMapped: false
+  });
+  const stars = new THREE.Points(geometry, material);
+  stars.renderOrder = -10;
+  scene.add(stars);
+  return stars;
+}
+
+const starField = createStarField();
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
@@ -569,7 +623,7 @@ function buildCourse(course, index) {
   knowledgeMaterial.userData.sharedMaterial = true;
   knowledgeMaterial.userData.baseOpacity = 1;
 
-  const title = makeBillboardLabel(course.title, '#101820', 1.55, false);
+  const title = makeBillboardLabel(course.title, '#ffffff', 1.55, false);
   title.position.set(0, radius * 1.52, 0);
   title.userData = { type: 'course', course };
   group.add(title);
@@ -790,6 +844,15 @@ function setLod(level) {
   if (currentLodLevel === level && lodLabel.textContent === `LOD ${level}`) return;
   currentLodLevel = level;
   lodLabel.textContent = `LOD ${level}`;
+  const levelNames = ['课程总览', '章节脉络', '小节结构', '知识节点'];
+  lodHint.textContent = levelNames[level];
+  lodProgress.querySelectorAll('span').forEach((dot, index) => {
+    dot.classList.toggle('active', index === level);
+    dot.classList.toggle('passed', index < level);
+  });
+  sceneStatus.textContent = selectedCourse
+    ? `${selectedCourse.course.title} · ${levelNames[level]}`
+    : '课程宇宙总览';
 }
 
 function updateLayerBlend(distance) {
@@ -883,6 +946,7 @@ function focusCourse(courseId) {
   });
   if (selectedCourse) {
     courseTitle.textContent = selectedCourse.course.title;
+    sceneStatus.textContent = `${selectedCourse.course.title} · ${lodHint.textContent}`;
     if (changed) {
       const targetY = isMobileView() ? -3.2 : 0;
       controls.target.set(0, targetY, 0);
@@ -896,6 +960,7 @@ function focusCourse(courseId) {
   } else {
     courseTitle.textContent = `${data.courses.length} 门课程`;
     selectionText.textContent = '未选择节点';
+    sceneStatus.textContent = '课程宇宙总览';
     if (changed) {
       controls.target.set(0, 0, 0);
       camera.position.set(0, 10, currentOverviewDistance());
@@ -1035,6 +1100,35 @@ function renderOutline() {
     }
     outlineEl.appendChild(courseTree.details);
   });
+  applyOutlineFilter(outlineSearch.value);
+}
+
+function applyOutlineFilter(value) {
+  const query = String(value || '').trim().toLocaleLowerCase('zh-CN');
+
+  function filterItem(element) {
+    if (element.matches('button.outline-button')) {
+      const matches = !query || element.textContent.toLocaleLowerCase('zh-CN').includes(query);
+      element.classList.toggle('search-hidden', !matches);
+      return matches;
+    }
+    if (!element.matches('details')) return false;
+
+    const ownButton = element.querySelector(':scope > summary > .outline-button');
+    const ownMatches = !query || ownButton?.textContent.toLocaleLowerCase('zh-CN').includes(query);
+    const children = element.querySelector(':scope > .outline-children');
+    let descendantMatches = false;
+    Array.from(children?.children || []).forEach((child) => {
+      if (filterItem(child)) descendantMatches = true;
+    });
+    const matches = ownMatches || descendantMatches;
+    element.classList.toggle('search-hidden', !matches);
+    ownButton?.classList.remove('search-hidden');
+    if (query && descendantMatches) element.open = true;
+    return matches;
+  }
+
+  Array.from(outlineEl.children).forEach(filterItem);
 }
 
 function updateConfigSummary() {
@@ -2070,6 +2164,19 @@ function addCourse() {
   rebuildAllCourses({ type: 'course', courseId: course.id }, course.id);
 }
 
+function setPanelCollapsed(panel, revealButton, collapsed) {
+  panel.classList.toggle('is-collapsed', collapsed);
+  revealButton.classList.toggle('visible', collapsed);
+  revealButton.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+}
+
+hideLibraryBtn.addEventListener('click', () => setPanelCollapsed(libraryPanel, showLibraryBtn, true));
+showLibraryBtn.addEventListener('click', () => setPanelCollapsed(libraryPanel, showLibraryBtn, false));
+hideInspectorBtn.addEventListener('click', () => setPanelCollapsed(inspectorPanel, showInspectorBtn, true));
+showInspectorBtn.addEventListener('click', () => setPanelCollapsed(inspectorPanel, showInspectorBtn, false));
+helpBtn.addEventListener('click', () => helpDialog.showModal());
+outlineSearch.addEventListener('input', () => applyOutlineFilter(outlineSearch.value));
+
 overviewBtn.addEventListener('click', () => {
   cancelPlacement(false);
   selectedNode = null;
@@ -2149,6 +2256,12 @@ window.addEventListener('keydown', (event) => {
     cancelPlacement();
     return;
   }
+  if (!editingText && !event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'f') {
+    event.preventDefault();
+    outlineSearch.focus();
+    outlineSearch.select();
+    return;
+  }
   if (editingText || !(event.ctrlKey || event.metaKey)) return;
   if (event.key.toLowerCase() === 'z') {
     event.preventDefault();
@@ -2186,6 +2299,7 @@ window.addEventListener('beforeunload', (event) => {
 
 function animate() {
   requestAnimationFrame(animate);
+  starField.rotation.y += 0.000035;
   courseGroups.forEach((item) => {
     const target = item.group.userData.target || item.group.position;
     item.group.position.lerp(target, 0.08);
