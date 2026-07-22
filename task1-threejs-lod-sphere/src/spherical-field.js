@@ -747,7 +747,8 @@ export function createSemanticMaterial(fields, courseColor) {
       uSectionMap: { value: fields.section.color },
       uChapterHeight: { value: fields.chapter.height },
       uSectionHeight: { value: fields.section.height },
-      uBaseColor: { value: lighten(courseColor, 0.44) },
+      uBaseColor: { value: lighten(courseColor, 0.24) },
+      uCourseColor: { value: new THREE.Color(courseColor) },
       uRegionReveal: { value: 0 },
       uSectionBlend: { value: 0 },
       uDisplacement: { value: 0.046 },
@@ -763,6 +764,7 @@ export function createSemanticMaterial(fields, courseColor) {
       varying vec2 vUvField;
       varying vec3 vWorldPosition;
       varying vec3 vWorldNormal;
+      varying vec3 vObjectPosition;
 
       float combinedHeight(float chapterHeight, float sectionHeight) {
         float chapterGroove = 1.0 - chapterHeight;
@@ -780,6 +782,7 @@ export function createSemanticMaterial(fields, courseColor) {
         vUvField = uv;
         vWorldPosition = worldPosition.xyz;
         vWorldNormal = normalize(mat3(modelMatrix) * normal);
+        vObjectPosition = transformed;
         gl_Position = projectionMatrix * viewMatrix * worldPosition;
       }
     `,
@@ -789,6 +792,7 @@ export function createSemanticMaterial(fields, courseColor) {
       uniform sampler2D uChapterHeight;
       uniform sampler2D uSectionHeight;
       uniform vec3 uBaseColor;
+      uniform vec3 uCourseColor;
       uniform float uRegionReveal;
       uniform float uSectionBlend;
       uniform float uBumpStrength;
@@ -796,6 +800,7 @@ export function createSemanticMaterial(fields, courseColor) {
       varying vec2 vUvField;
       varying vec3 vWorldPosition;
       varying vec3 vWorldNormal;
+      varying vec3 vObjectPosition;
 
       vec3 srgbToLinear(vec3 value) {
         vec3 low = value / 12.92;
@@ -811,8 +816,36 @@ export function createSemanticMaterial(fields, courseColor) {
         return 1.0 - max(chapterGroove, sectionGroove);
       }
 
-      float surfaceNoise(vec3 point) {
-        return fract(sin(dot(point, vec3(12.9898, 78.233, 41.164))) * 43758.5453);
+      float hash31(vec3 point) {
+        point = fract(point * 0.1031);
+        point += dot(point, point.yzx + 33.33);
+        return fract((point.x + point.y) * point.z);
+      }
+
+      float valueNoise(vec3 point) {
+        vec3 cell = floor(point);
+        vec3 blend = fract(point);
+        blend = blend * blend * (3.0 - 2.0 * blend);
+        return mix(
+          mix(
+            mix(hash31(cell), hash31(cell + vec3(1.0, 0.0, 0.0)), blend.x),
+            mix(hash31(cell + vec3(0.0, 1.0, 0.0)), hash31(cell + vec3(1.0, 1.0, 0.0)), blend.x),
+            blend.y
+          ),
+          mix(
+            mix(hash31(cell + vec3(0.0, 0.0, 1.0)), hash31(cell + vec3(1.0, 0.0, 1.0)), blend.x),
+            mix(hash31(cell + vec3(0.0, 1.0, 1.0)), hash31(cell + vec3(1.0, 1.0, 1.0)), blend.x),
+            blend.y
+          ),
+          blend.z
+        );
+      }
+
+      float mineralNoise(vec3 point) {
+        float broad = valueNoise(point * 0.31);
+        float medium = valueNoise(point * 0.83 + vec3(7.2, 3.1, 5.4));
+        float fine = valueNoise(point * 3.8 + vec3(1.7, 9.2, 2.8));
+        return broad * 0.56 + medium * 0.30 + fine * 0.14;
       }
 
       void main() {
@@ -837,11 +870,24 @@ export function createSemanticMaterial(fields, courseColor) {
         float chapterCore = (1.0 - smoothstep(0.05, 0.30, chapterHeight)) * uRegionReveal;
         float sectionCore = (1.0 - smoothstep(0.05, 0.27, sectionHeight))
           * uRegionReveal * uSectionBlend * (1.0 - chapterCore * 0.82);
+        float chapterLip = smoothstep(0.12, 0.38, chapterHeight)
+          * (1.0 - smoothstep(0.38, 0.70, chapterHeight)) * uRegionReveal;
+        float sectionLip = smoothstep(0.10, 0.34, sectionHeight)
+          * (1.0 - smoothstep(0.34, 0.66, sectionHeight))
+          * uRegionReveal * uSectionBlend * (1.0 - chapterSeam * 0.72);
         float seam = max(chapterSeam, sectionSeam);
         surfaceColor *= mix(1.0, 0.93, sectionSeam);
         surfaceColor *= mix(1.0, 0.82, chapterSeam);
         surfaceColor = mix(surfaceColor, vec3(0.035, 0.050, 0.065), sectionCore * 0.12);
         surfaceColor = mix(surfaceColor, vec3(0.025, 0.038, 0.052), chapterCore * 0.30);
+        surfaceColor += vec3(0.56, 0.72, 0.92) * chapterLip * 0.055;
+        surfaceColor += vec3(0.62, 0.78, 0.96) * sectionLip * 0.036;
+
+        // 连续的多尺度纹理比逐像素颗粒更接近矿物釉面，也不会产生闪烁噪点。
+        float mineral = mineralNoise(normalize(vObjectPosition) * 12.0);
+        float vein = smoothstep(0.66, 0.88, mineral) * (1.0 - seam * 0.82);
+        surfaceColor *= 0.965 + mineral * 0.07;
+        surfaceColor = mix(surfaceColor, surfaceColor + uCourseColor * 0.045, vein * 0.32);
 
         float hLeft = fieldHeightAt(vUvField - vec2(uTexel.x, 0.0));
         float hRight = fieldHeightAt(vUvField + vec2(uTexel.x, 0.0));
@@ -862,14 +908,20 @@ export function createSemanticMaterial(fields, courseColor) {
         float fill = max(dot(normal, fillDirection), 0.0);
         float hemisphere = normal.y * 0.5 + 0.5;
         vec3 halfDirection = normalize(keyDirection + viewDirection);
-        float specular = pow(max(dot(normal, halfDirection), 0.0), 34.0) * (1.0 - seam * 0.7);
-        float rim = pow(1.0 - max(dot(normal, viewDirection), 0.0), 2.4);
-        float grain = (surfaceNoise(vWorldPosition * 18.0) - 0.5) * 0.004;
+        float normalToView = max(dot(normal, viewDirection), 0.0);
+        float broadSpecular = pow(max(dot(normal, halfDirection), 0.0), 18.0)
+          * (1.0 - seam * 0.62);
+        float sharpSpecular = pow(max(dot(normal, halfDirection), 0.0), 82.0)
+          * (1.0 - seam * 0.78);
+        float rim = pow(1.0 - normalToView, 2.65);
+        float softFresnel = pow(1.0 - normalToView, 1.35);
 
-        float light = 0.74 + key * 0.24 + fill * 0.07 + hemisphere * 0.04;
-        vec3 finalColor = surfaceColor * (light + grain);
-        finalColor += vec3(1.0, 0.96, 0.90) * specular * 0.09;
-        finalColor += vec3(0.30, 0.54, 0.70) * rim * 0.035;
+        float light = 0.70 + key * 0.27 + fill * 0.08 + hemisphere * 0.055;
+        vec3 finalColor = surfaceColor * light;
+        finalColor += vec3(0.72, 0.86, 1.0) * broadSpecular * 0.055;
+        finalColor += vec3(1.0, 0.96, 0.91) * sharpSpecular * 0.13;
+        finalColor += mix(uCourseColor, vec3(0.34, 0.62, 0.86), 0.46) * rim * 0.095;
+        finalColor += vec3(0.18, 0.31, 0.48) * softFresnel * 0.022;
         gl_FragColor = vec4(finalColor, 1.0);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>

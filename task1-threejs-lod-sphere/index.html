@@ -3,83 +3,185 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>球面知识地图编辑器</title>
+    <meta name="theme-color" content="#07101f" />
+    <meta name="description" content="在三维球面上设计、组织与探索课程知识结构。" />
+    <title>Sphere Studio · 球面课程设计台</title>
   </head>
   <body>
     <main id="app">
-      <section id="scene"></section>
-      <aside id="libraryPanel" class="floating-panel">
-        <div class="brand">
-          <div>
-            <strong>球面知识地图编辑器</strong>
-            <small>配置驱动 · Schema v4</small>
-          </div>
-          <span id="dirtyBadge" class="status-badge">已保存</span>
+      <section id="scene" aria-label="三维课程球面画布"></section>
+
+      <header id="canvasTopbar" class="canvas-topbar" aria-live="polite">
+        <div class="canvas-status">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span id="sceneStatus">课程宇宙总览</span>
         </div>
-        <div class="toolbar toolbar-grid">
-          <button id="importBtn" type="button">导入</button>
-          <button id="exportBtn" type="button">导出</button>
-          <button id="undoBtn" type="button" title="撤销（Ctrl+Z）">撤销</button>
-          <button id="redoBtn" type="button" title="重做（Ctrl+Shift+Z）">重做</button>
+        <div id="lodProgress" class="lod-progress" aria-label="当前内容层级">
+          <span class="active"></span><span></span><span></span><span></span>
+        </div>
+        <button id="helpBtn" class="icon-button ghost-button" type="button" aria-label="查看操作帮助" title="操作帮助">?</button>
+      </header>
+
+      <aside id="libraryPanel" class="floating-panel workspace-panel">
+        <div class="panel-brand">
+          <div class="brand-mark" aria-hidden="true"><span></span></div>
+          <div class="brand-copy">
+            <span class="eyebrow">SPHERE STUDIO</span>
+            <strong>球面课程设计台</strong>
+          </div>
+          <button id="hideLibraryBtn" class="icon-button quiet-button panel-close" type="button" aria-label="收起内容面板" title="收起面板">‹</button>
+        </div>
+
+        <div class="workspace-status">
+          <div>
+            <span class="status-label">当前工作区</span>
+            <strong>数学课程知识地图</strong>
+          </div>
+          <span id="dirtyBadge" class="status-badge"><i></i>已保存</span>
+        </div>
+
+        <div class="primary-actions">
+          <button id="importBtn" class="button-with-icon" type="button">
+            <span aria-hidden="true">↥</span>导入配置
+          </button>
+          <button id="exportBtn" class="button-with-icon primary-button" type="button">
+            <span aria-hidden="true">↧</span>导出成果
+          </button>
+        </div>
+        <div class="history-bar" aria-label="编辑历史">
+          <button id="undoBtn" class="quiet-button" type="button" title="撤销（Ctrl+Z）"><span aria-hidden="true">↶</span> 撤销</button>
+          <button id="redoBtn" class="quiet-button" type="button" title="重做（Ctrl+Shift+Z）"><span aria-hidden="true">↷</span> 重做</button>
+          <span class="shortcut-hint">⌘ S 快速导出</span>
         </div>
         <input id="fileInput" type="file" accept="application/json,.json" hidden />
+
         <div class="section-heading">
-          <span>内容结构</span>
-          <button id="addCourseBtn" class="compact-button" type="button">＋课程</button>
+          <div>
+            <span class="eyebrow">CONTENT</span>
+            <strong>课程结构</strong>
+          </div>
+          <button id="addCourseBtn" class="compact-button soft-button" type="button">＋ 新建课程</button>
         </div>
+        <label class="search-box" for="outlineSearch">
+          <span aria-hidden="true">⌕</span>
+          <input id="outlineSearch" type="search" placeholder="搜索课程、章节或知识点" autocomplete="off" />
+          <kbd>F</kbd>
+        </label>
         <div id="outline" class="outline" aria-label="课程内容结构"></div>
-        <p id="configSummary" class="panel-note"></p>
+        <div class="panel-footer">
+          <p id="configSummary" class="panel-note"></p>
+          <span class="schema-chip">SCHEMA V4</span>
+        </div>
       </aside>
-      <aside id="panel">
-        <div class="brand">
-          <strong>课程球面 LOD</strong>
-          <span id="lodLabel">LOD 0</span>
+
+      <button id="showLibraryBtn" class="panel-reveal panel-reveal-left" type="button" aria-label="展开内容面板">结构 <span>›</span></button>
+
+      <aside id="panel" class="floating-panel inspector-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="eyebrow">NAVIGATE & EDIT</span>
+            <strong>探索与编辑</strong>
+          </div>
+          <button id="hideInspectorBtn" class="icon-button quiet-button panel-close" type="button" aria-label="收起属性面板" title="收起面板">›</button>
         </div>
+
+        <div class="lod-card">
+          <div>
+            <span id="lodLabel" class="lod-label">LOD 0</span>
+            <strong id="lodHint">课程总览</strong>
+            <small>缩放画布自动深入内容层级</small>
+          </div>
+          <div class="orbit-glyph" aria-hidden="true"><span></span></div>
+        </div>
+
+        <div class="subsection-label">快速定位课程</div>
         <div id="courseTabs" class="tabs"></div>
-        <div class="row">
-          <button id="overviewBtn" type="button">总览</button>
-          <button id="editBtn" type="button">微调</button>
-          <button id="addVertexBtn" type="button">新建顶点</button>
+        <div class="view-actions">
+          <button id="overviewBtn" class="button-with-icon" type="button"><span aria-hidden="true">◫</span>全部课程</button>
+          <button id="editBtn" class="button-with-icon" type="button"><span aria-hidden="true">✦</span>微调模式</button>
+          <button id="addVertexBtn" class="button-with-icon" type="button"><span aria-hidden="true">＋</span>新建顶点</button>
         </div>
-        <div class="meta">
+
+        <div class="selection-card">
+          <span class="eyebrow">CURRENT SELECTION</span>
           <p id="courseTitle">课程总览</p>
           <p id="selectionText">未选择节点</p>
         </div>
         <div id="selectionActions" class="selection-actions"></div>
         <section id="inspector" class="inspector">
-          <p class="empty-state">从左侧结构树或球面选择一个对象。</p>
+          <div class="empty-state">
+            <span class="empty-glyph" aria-hidden="true">◎</span>
+            <strong>选择一个内容节点</strong>
+            <p>从左侧结构树或球面开始编辑</p>
+          </div>
         </section>
         <div id="editor" class="editor hidden">
+          <div class="subsection-label">球面坐标微调</div>
           <label>
-            phi
+            <span>经度 <small>phi</small></span>
             <input id="phiInput" type="range" min="-3.1416" max="3.1416" step="0.01" value="0" />
           </label>
           <label>
-            psi
+            <span>纬度 <small>psi</small></span>
             <input id="psiInput" type="range" min="-1.5708" max="1.5708" step="0.01" value="0" />
           </label>
-          <div class="pad">
-            <button data-nudge="up" type="button" aria-label="向上微调" title="向上微调">&uarr;</button>
-            <button data-nudge="left" type="button" aria-label="向左微调" title="向左微调">&larr;</button>
-            <button data-nudge="right" type="button" aria-label="向右微调" title="向右微调">&rarr;</button>
-            <button data-nudge="down" type="button" aria-label="向下微调" title="向下微调">&darr;</button>
+          <div class="pad" aria-label="坐标方向微调">
+            <button data-nudge="up" type="button" aria-label="向上微调" title="向上微调">↑</button>
+            <button data-nudge="left" type="button" aria-label="向左微调" title="向左微调">←</button>
+            <button data-nudge="right" type="button" aria-label="向右微调" title="向右微调">→</button>
+            <button data-nudge="down" type="button" aria-label="向下微调" title="向下微调">↓</button>
           </div>
         </div>
       </aside>
+
+      <button id="showInspectorBtn" class="panel-reveal panel-reveal-right" type="button" aria-label="展开属性面板"><span>‹</span> 属性</button>
+
+      <div class="canvas-guide" aria-label="画布操作说明">
+        <span><i class="mouse-icon"></i>拖拽旋转</span>
+        <span><i class="scroll-icon"></i>滚轮缩放</span>
+        <span><i class="click-icon"></i>点击选择</span>
+      </div>
+
       <section id="placementBar" class="placement-bar hidden" aria-live="polite">
-        <div>
-          <strong id="placementTitle">放置模式</strong>
-          <span id="placementHint">点击球面放置点</span>
+        <div class="placement-copy">
+          <span class="placement-pulse" aria-hidden="true"></span>
+          <div>
+            <strong id="placementTitle">放置模式</strong>
+            <span id="placementHint">点击球面放置点</span>
+          </div>
         </div>
         <label id="draftNameField" class="draft-name hidden">
           名称
           <input id="draftNameInput" type="text" />
         </label>
         <div class="row">
-          <button id="finishPlacementBtn" type="button">完成</button>
-          <button id="cancelPlacementBtn" type="button">取消</button>
+          <button id="cancelPlacementBtn" class="quiet-button" type="button">取消</button>
+          <button id="finishPlacementBtn" class="primary-button" type="button">完成边界</button>
         </div>
       </section>
+
+      <dialog id="helpDialog" class="help-dialog">
+        <form method="dialog">
+          <div class="dialog-heading">
+            <div>
+              <span class="eyebrow">QUICK START</span>
+              <h2>三步开始设计</h2>
+            </div>
+            <button class="icon-button quiet-button" type="submit" aria-label="关闭帮助">×</button>
+          </div>
+          <div class="help-steps">
+            <article><span>01</span><div><strong>选择课程</strong><p>点击球体或课程标签，进入一门课程的知识空间。</p></div></article>
+            <article><span>02</span><div><strong>缩放探索</strong><p>逐步拉近会从章节、小节深入到具体知识点。</p></div></article>
+            <article><span>03</span><div><strong>开始编辑</strong><p>从结构树选择内容，右侧修改属性；开启微调可拖动球面坐标。</p></div></article>
+          </div>
+          <div class="shortcut-grid">
+            <span><kbd>拖拽</kbd> 旋转视角</span><span><kbd>滚轮</kbd> 缩放层级</span>
+            <span><kbd>⌘ Z</kbd> 撤销</span><span><kbd>⌘ S</kbd> 导出配置</span>
+          </div>
+          <button class="primary-button dialog-cta" type="submit">开始探索</button>
+        </form>
+      </dialog>
+
       <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
     </main>
     <script type="module" src="/src/main.js"></script>
