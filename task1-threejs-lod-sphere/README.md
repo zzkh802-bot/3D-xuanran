@@ -23,6 +23,16 @@ http://127.0.0.1:5173/?course=gaoshu-xia
 npm run build
 ```
 
+## GitHub Pages 部署
+
+仓库的 `main` 分支更新任务一代码后，GitHub Actions 会自动构建并发布站点：
+
+```text
+https://jielosc.github.io/3D-xuanran/
+```
+
+也可以在 GitHub 的 Actions 页面手动运行 `Deploy task1 to GitHub Pages` 工作流。
+
 配置模型检查：
 
 ```powershell
