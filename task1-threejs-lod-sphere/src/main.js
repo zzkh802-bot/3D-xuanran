@@ -360,6 +360,55 @@ function makeShadowTexture() {
 
 const shadowTexture = makeShadowTexture();
 
+function makeAtmosphere(courseColor) {
+  const material = new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: new THREE.Color(courseColor) },
+      uIntensity: { value: 0.72 }
+    },
+    vertexShader: `
+      varying vec3 vWorldNormal;
+      varying vec3 vWorldPosition;
+
+      void main() {
+        vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+        vWorldPosition = worldPosition.xyz;
+        vWorldNormal = normalize(mat3(modelMatrix) * normal);
+        gl_Position = projectionMatrix * viewMatrix * worldPosition;
+      }
+    `,
+    fragmentShader: `
+      uniform vec3 uColor;
+      uniform float uIntensity;
+      varying vec3 vWorldNormal;
+      varying vec3 vWorldPosition;
+
+      void main() {
+        vec3 viewDirection = normalize(cameraPosition - vWorldPosition);
+        float fresnel = pow(1.0 - max(dot(normalize(vWorldNormal), viewDirection), 0.0), 3.15);
+        float halo = smoothstep(0.04, 0.98, fresnel);
+        vec3 glowColor = mix(uColor, vec3(0.36, 0.68, 1.0), 0.38);
+        gl_FragColor = vec4(glowColor * (0.52 + halo * 0.48), halo * 0.16 * uIntensity);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+    side: THREE.FrontSide,
+    transparent: true,
+    depthTest: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    toneMapped: true
+  });
+  const atmosphere = new THREE.Mesh(
+    new THREE.SphereGeometry(radius + 0.56, 96, 64),
+    material
+  );
+  atmosphere.renderOrder = 2;
+  atmosphere.userData.isAtmosphere = true;
+  return atmosphere;
+}
+
 function clearDynamicGroup(group) {
   while (group.children.length) {
     const child = group.children.pop();
@@ -579,6 +628,9 @@ function buildCourse(course, index) {
   base.userData = { type: 'course', course };
   group.add(base);
 
+  const atmosphere = makeAtmosphere(course.color);
+  group.add(atmosphere);
+
   const shadowMaterial = new THREE.MeshBasicMaterial({
     map: shadowTexture,
     transparent: true,
@@ -632,6 +684,7 @@ function buildCourse(course, index) {
     course,
     group,
     base,
+    atmosphere,
     material,
     fields,
     shadow,
@@ -940,6 +993,7 @@ function focusCourse(courseId) {
   const changed = previousId !== (selectedCourse?.course.id || null);
   courseGroups.forEach((item, index) => {
     item.group.visible = !selectedCourse || item === selectedCourse;
+    item.atmosphere.material.uniforms.uIntensity.value = selectedCourse && item === selectedCourse ? 1.08 : 0.72;
     item.group.userData.target = selectedCourse
       ? new THREE.Vector3(item === selectedCourse ? 0 : (index < 2 ? -82 : 82), 0, item === selectedCourse ? 0 : -34)
       : overviewPosition(index);
